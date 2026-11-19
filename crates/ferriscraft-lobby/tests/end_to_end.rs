@@ -15,7 +15,10 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use rspigot_core::config::{GameConfig, LevelData};
-use rspigot_core::events::{ClientEvent, EntityKind, Hand, Inbound, MetadataValue, PlayerInput};
+use rspigot_core::events::{
+    ClickInput, ClientEvent, ContainerClick, EntityKind, Hand, HashedSlot, Inbound, MetadataValue,
+    PlayerInput,
+};
 use rspigot_core::ports::{ChunkGenerator, ChunkStore, ClientLink, EntityStore, StoreError};
 use rspigot_core::server::Server;
 use rspigot_core::status::StatusBoard;
@@ -23,7 +26,9 @@ use rspigot_domain::chunk::ChunkColumn;
 use rspigot_domain::player::{ClientSettings, GameProfile, PlayerId};
 use rspigot_domain::text::Component;
 use rspigot_domain::world::Dimension;
-use rspigot_domain::{BiomeId, BlockPos, BlockStateId, ChunkPos, EntityId, Identifier, Vec3};
+use rspigot_domain::{
+    BiomeId, BlockPos, BlockStateId, ChunkPos, EntityId, Identifier, Rotation, Vec3,
+};
 use rspigot_nbt::Compound;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -219,6 +224,65 @@ impl TestPlayer {
         self.drain_into_log()
             .iter()
             .any(|event| matches!(event, ClientEvent::PlayerChat { .. }))
+    }
+
+    fn log_cursor(&mut self) -> usize {
+        self.drain_into_log().len()
+    }
+
+    fn latest_screen_after(&mut self, cursor: usize, title_part: &str) -> Option<(i32, i32)> {
+        let log = self.drain_into_log();
+        let window = log[cursor..].iter().rev().find_map(|event| match event {
+            ClientEvent::OpenScreen { window, title, .. }
+                if title.plain_text().contains(title_part) =>
+            {
+                Some(*window)
+            }
+            _ => None,
+        })?;
+        let state_id = log[cursor..].iter().rev().find_map(|event| match event {
+            ClientEvent::ContainerContent {
+                window: w,
+                state_id,
+                ..
+            } if *w == window => Some(*state_id),
+            _ => None,
+        })?;
+        Some((window, state_id))
+    }
+
+    fn abilities_after(
+        &mut self,
+        cursor: usize,
+        pred: impl Fn(&rspigot_core::events::Abilities) -> bool,
+    ) -> bool {
+        self.drain_into_log()[cursor..]
+            .iter()
+            .any(|event| matches!(event, ClientEvent::Abilities(ab) if pred(ab)))
+    }
+
+    fn has_velocity_after(&mut self, cursor: usize) -> bool {
+        self.drain_into_log()[cursor..]
+            .iter()
+            .any(|event| matches!(event, ClientEvent::EntityVelocity { .. }))
+    }
+
+    fn has_particle_after(&mut self, cursor: usize) -> bool {
+        self.drain_into_log()[cursor..]
+            .iter()
+            .any(|event| matches!(event, ClientEvent::Particle(_)))
+    }
+
+    fn has_sheep_spawn_after(&mut self, cursor: usize) -> bool {
+        self.drain_into_log()[cursor..].iter().any(|event| {
+            matches!(
+                event,
+                ClientEvent::SpawnEntity {
+                    kind: EntityKind::Other(_),
+                    ..
+                }
+            )
+        })
     }
 }
 
@@ -836,6 +900,178 @@ fn lobby_spawns_pedestals_living_npcs_rich_chat_and_per_player_ferriskey_capitai
     assert_eq!(mock.lock().unwrap().chat_bearers, vec![alice_jwt]);
     assert_eq!(core.server.game_rules().random_tick_speed, 0);
     assert_eq!(core.server.game_rules().fire_spread_radius, 0);
+
+    // 9. Locked Options menu -> clicking Fly (12) and Speed (14) MUST work and update Abilities
+    let opt_cursor = alice.log_cursor();
+    send_input(
+        &mut core.server,
+        &alice,
+        PlayerInput::Command("options".to_owned()),
+    );
+    let mut opt_screen = None;
+    core.run_until("Alice opens Options menu", |_| {
+        opt_screen = alice.latest_screen_after(opt_cursor, "Options");
+        opt_screen.is_some()
+    });
+    let (opt_win, opt_state) = opt_screen.unwrap();
+
+    let fly_cursor = alice.log_cursor();
+    send_input(
+        &mut core.server,
+        &alice,
+        PlayerInput::ContainerClick(ContainerClick {
+            container: opt_win,
+            state_id: opt_state,
+            slot: 12, // OPT_SLOT_FLIGHT
+            button: 0,
+            input: ClickInput::Pickup,
+            changed: Vec::new(),
+            carried: HashedSlot::EMPTY,
+        }),
+    );
+    core.run_until("Clicking Fly in Options grants flight ability", |_| {
+        alice.abilities_after(fly_cursor, |ab| ab.may_fly)
+            && alice.said("Vol dans le Lobby activé")
+    });
+
+    let speed_cursor = alice.log_cursor();
+    send_input(
+        &mut core.server,
+        &alice,
+        PlayerInput::ContainerClick(ContainerClick {
+            container: opt_win,
+            state_id: opt_state,
+            slot: 14, // OPT_SLOT_SPEED
+            button: 0,
+            input: ClickInput::Pickup,
+            changed: Vec::new(),
+            carried: HashedSlot::EMPTY,
+        }),
+    );
+    core.run_until("Clicking Speed in Options increases walk & fly speed", |_| {
+        alice.abilities_after(speed_cursor, |ab| {
+            ab.may_fly && ab.walk_speed > 0.13 && ab.fly_speed > 0.06
+        }) && alice.said("Vitesse réglée")
+    });
+    send_input(&mut core.server, &alice, PlayerInput::ContainerClose(opt_win));
+
+    // /fly toggles flight off and back on cleanly
+    let cmd_fly_cursor = alice.log_cursor();
+    send_input(
+        &mut core.server,
+        &alice,
+        PlayerInput::Command("fly".to_owned()),
+    );
+    core.run_until("/fly disables flight", |_| {
+        alice.abilities_after(cmd_fly_cursor, |ab| !ab.may_fly)
+    });
+
+    // 10. /gadgets menu -> cycle Trail (22), equip SheepCannon (12), fire it, then FeatherDash (10)
+    let gad_cursor = alice.log_cursor();
+    send_input(
+        &mut core.server,
+        &alice,
+        PlayerInput::Command("gadgets".to_owned()),
+    );
+    let mut gad_screen = None;
+    core.run_until("Alice opens Gadgets menu", |_| {
+        gad_screen = alice.latest_screen_after(gad_cursor, "Gadgets");
+        gad_screen.is_some()
+    });
+    let (gad_win, gad_state) = gad_screen.unwrap();
+
+    send_input(
+        &mut core.server,
+        &alice,
+        PlayerInput::ContainerClick(ContainerClick {
+            container: gad_win,
+            state_id: gad_state,
+            slot: 22, // GAD_SLOT_TRAIL
+            button: 0,
+            input: ClickInput::Pickup,
+            changed: Vec::new(),
+            carried: HashedSlot::EMPTY,
+        }),
+    );
+    send_input(
+        &mut core.server,
+        &alice,
+        PlayerInput::ContainerClick(ContainerClick {
+            container: gad_win,
+            state_id: gad_state,
+            slot: 12, // GAD_SLOT_SHEEP
+            button: 0,
+            input: ClickInput::Pickup,
+            changed: Vec::new(),
+            carried: HashedSlot::EMPTY,
+        }),
+    );
+    core.run_until("Alice equips SheepCannon from Gadgets menu", |_| {
+        alice.said("Canon à Moutons")
+    });
+    send_input(&mut core.server, &alice, PlayerInput::ContainerClose(gad_win));
+
+    // Activate SheepCannon from slot 6 -> spawns a Sheep entity & particles
+    let sheep_cursor = alice.log_cursor();
+    send_input(&mut core.server, &alice, PlayerInput::HeldSlot(6));
+    send_input(
+        &mut core.server,
+        &alice,
+        PlayerInput::UseItem {
+            hand: Hand::Main,
+            sequence: 1,
+            rotation: Rotation::default(),
+        },
+    );
+    core.run_until("SheepCannon spawns sheep and particles", |_| {
+        alice.has_sheep_spawn_after(sheep_cursor) && alice.has_particle_after(sheep_cursor)
+    });
+
+    // Equip FeatherDash (slot 10) and fire it -> sets player velocity & particles
+    let gad2_cursor = alice.log_cursor();
+    send_input(
+        &mut core.server,
+        &alice,
+        PlayerInput::Command("gadgets".to_owned()),
+    );
+    let mut gad2_screen = None;
+    core.run_until("Alice re-opens Gadgets menu", |_| {
+        gad2_screen = alice.latest_screen_after(gad2_cursor, "Gadgets");
+        gad2_screen.is_some()
+    });
+    let (gad2_win, gad2_state) = gad2_screen.unwrap();
+    send_input(
+        &mut core.server,
+        &alice,
+        PlayerInput::ContainerClick(ContainerClick {
+            container: gad2_win,
+            state_id: gad2_state,
+            slot: 10, // GAD_SLOT_FEATHER
+            button: 0,
+            input: ClickInput::Pickup,
+            changed: Vec::new(),
+            carried: HashedSlot::EMPTY,
+        }),
+    );
+    core.run_until("Alice equips FeatherDash", |_| {
+        alice.said("Propulseur Éthéré")
+    });
+    send_input(&mut core.server, &alice, PlayerInput::ContainerClose(gad2_win));
+
+    let dash_cursor = alice.log_cursor();
+    send_input(&mut core.server, &alice, PlayerInput::HeldSlot(6));
+    send_input(
+        &mut core.server,
+        &alice,
+        PlayerInput::UseItem {
+            hand: Hand::Main,
+            sequence: 2,
+            rotation: Rotation::default(),
+        },
+    );
+    core.run_until("FeatherDash propels Alice with velocity & particles", |_| {
+        alice.has_velocity_after(dash_cursor) && alice.has_particle_after(dash_cursor)
+    });
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }

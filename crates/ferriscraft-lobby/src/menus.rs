@@ -7,22 +7,27 @@ use rspigot_plugin::{
 };
 
 use crate::auth::UserClaims;
+use crate::gadgets::LobbyGadget;
 use crate::prefs::PlayerPrefs;
 
 pub const HOTBAR_GAMES_SLOT: u8 = 0;
 pub const HOTBAR_SHEEPWARS_SLOT: u8 = 1;
 pub const HOTBAR_ACCOUNT_SLOT: u8 = 4;
+pub const HOTBAR_GADGETS_MENU_SLOT: u8 = 5;
+pub const HOTBAR_EQUIPPED_GADGET_SLOT: u8 = 6;
 pub const HOTBAR_VISIBILITY_SLOT: u8 = 7;
 pub const HOTBAR_OPTIONS_SLOT: u8 = 8;
 
 pub const GAMES_ROWS: u8 = 5;
 pub const OPTIONS_ROWS: u8 = 4;
+pub const GADGETS_ROWS: u8 = 4;
 
 pub const SLOT_SHEEPWARS: u16 = 13;
 pub const SLOT_PITCHOUT: u16 = 20;
 pub const SLOT_FK: u16 = 21;
 pub const SLOT_PVPSWAP: u16 = 23;
 pub const SLOT_MOUTRON: u16 = 24;
+pub const SLOT_OPEN_GADGETS: u16 = 37;
 pub const SLOT_TP_SPAWN: u16 = 38;
 pub const SLOT_TP_PORTAL: u16 = 39;
 pub const SLOT_TP_CAPITAINERIE: u16 = 40;
@@ -36,10 +41,23 @@ pub const OPT_SLOT_CHAT_SOUNDS: u16 = 16;
 pub const OPT_SLOT_FERRISKEY: u16 = 22;
 pub const OPT_SLOT_BACK: u16 = 31;
 
+pub const GAD_SLOT_FEATHER: u16 = 10;
+pub const GAD_SLOT_ROCKET: u16 = 11;
+pub const GAD_SLOT_SHEEP: u16 = 12;
+pub const GAD_SLOT_VORTEX: u16 = 13;
+pub const GAD_SLOT_WIND: u16 = 14;
+pub const GAD_SLOT_ENDER: u16 = 15;
+pub const GAD_SLOT_UNEQUIP: u16 = 16;
+pub const GAD_SLOT_FLIGHT: u16 = 20;
+pub const GAD_SLOT_TRAIL: u16 = 22;
+pub const GAD_SLOT_SPEED: u16 = 24;
+pub const GAD_SLOT_BACK: u16 = 31;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GamesMenuAction {
     JoinSheepWars,
     ComingSoon(&'static str),
+    OpenGadgets,
     TeleportPoi(&'static str),
     OpenOptions,
 }
@@ -54,6 +72,16 @@ pub enum OptionsMenuAction {
     BackToGames,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GadgetsMenuAction {
+    Equip(LobbyGadget),
+    UnequipGadget,
+    ToggleFlight,
+    CycleTrail,
+    CycleSpeed,
+    BackToGames,
+}
+
 pub fn decode_games_click(slot: i32) -> Option<GamesMenuAction> {
     let slot = u16::try_from(slot).ok()?;
     match slot {
@@ -62,6 +90,7 @@ pub fn decode_games_click(slot: i32) -> Option<GamesMenuAction> {
         SLOT_FK => Some(GamesMenuAction::ComingSoon("Fallen Kingdoms")),
         SLOT_PVPSWAP => Some(GamesMenuAction::ComingSoon("PvP Swap")),
         SLOT_MOUTRON => Some(GamesMenuAction::ComingSoon("Moutron")),
+        SLOT_OPEN_GADGETS => Some(GamesMenuAction::OpenGadgets),
         SLOT_TP_SPAWN => Some(GamesMenuAction::TeleportPoi("spawn")),
         SLOT_TP_PORTAL => Some(GamesMenuAction::TeleportPoi("portal")),
         SLOT_TP_CAPITAINERIE => Some(GamesMenuAction::TeleportPoi("capitainerie")),
@@ -80,6 +109,24 @@ pub fn decode_options_click(slot: i32) -> Option<OptionsMenuAction> {
         OPT_SLOT_CHAT_SOUNDS => Some(OptionsMenuAction::ToggleChatSounds),
         OPT_SLOT_FERRISKEY => Some(OptionsMenuAction::FerrisKeyAction),
         OPT_SLOT_BACK => Some(OptionsMenuAction::BackToGames),
+        _ => None,
+    }
+}
+
+pub fn decode_gadgets_click(slot: i32) -> Option<GadgetsMenuAction> {
+    let slot = u16::try_from(slot).ok()?;
+    match slot {
+        GAD_SLOT_FEATHER => Some(GadgetsMenuAction::Equip(LobbyGadget::FeatherDash)),
+        GAD_SLOT_ROCKET => Some(GadgetsMenuAction::Equip(LobbyGadget::FireworkRocket)),
+        GAD_SLOT_SHEEP => Some(GadgetsMenuAction::Equip(LobbyGadget::SheepCannon)),
+        GAD_SLOT_VORTEX => Some(GadgetsMenuAction::Equip(LobbyGadget::VortexWand)),
+        GAD_SLOT_WIND => Some(GadgetsMenuAction::Equip(LobbyGadget::WindCharge)),
+        GAD_SLOT_ENDER => Some(GadgetsMenuAction::Equip(LobbyGadget::EnderGrapple)),
+        GAD_SLOT_UNEQUIP => Some(GadgetsMenuAction::UnequipGadget),
+        GAD_SLOT_FLIGHT => Some(GadgetsMenuAction::ToggleFlight),
+        GAD_SLOT_TRAIL => Some(GadgetsMenuAction::CycleTrail),
+        GAD_SLOT_SPEED => Some(GadgetsMenuAction::CycleSpeed),
+        GAD_SLOT_BACK => Some(GadgetsMenuAction::BackToGames),
         _ => None,
     }
 }
@@ -116,6 +163,15 @@ pub fn apply_lobby_hotbar(player: &Player, claims: Option<&UserClaims>, prefs: &
             ]),
     };
 
+    let gadgets_chest = ItemStack::new(Material::Chest, 1)
+        .name("§b§lGadgets & Cosmétiques §7(Clic droit)")
+        .lore([
+            "§7Équipez propulseur, canon à moutons,",
+            "§7fusées, grappin, traînées et /fly !",
+        ]);
+
+    let equipped_gadget = prefs.equipped_gadget.map(LobbyGadget::hotbar_item);
+
     let visibility = if prefs.players_visible {
         ItemStack::new(Material::LimeDye, 1)
             .name("§a§lJoueurs : Visibles §7(Clic droit)")
@@ -144,6 +200,14 @@ pub fn apply_lobby_hotbar(player: &Player, claims: Option<&UserClaims>, prefs: &
     player.inventory.set(SlotItem::new(
         InventorySlot::Hotbar(HOTBAR_ACCOUNT_SLOT),
         Some(account),
+    ));
+    player.inventory.set(SlotItem::new(
+        InventorySlot::Hotbar(HOTBAR_GADGETS_MENU_SLOT),
+        Some(gadgets_chest),
+    ));
+    player.inventory.set(SlotItem::new(
+        InventorySlot::Hotbar(HOTBAR_EQUIPPED_GADGET_SLOT),
+        equipped_gadget,
     ));
     player.inventory.set(SlotItem::new(
         InventorySlot::Hotbar(HOTBAR_VISIBILITY_SLOT),
@@ -257,6 +321,17 @@ pub fn populate_games_menu(inv: &CustomInventory, queued_sheepwars: usize) {
         ),
     );
 
+    inv.set(
+        SLOT_OPEN_GADGETS,
+        Some(
+            ItemStack::new(Material::Chest, 1)
+                .name("§b§l✦ Gadgets & Cosmétiques")
+                .lore([
+                    "§7Propulseur, Canon à Moutons, Fusée,",
+                    "§7Grappin, Traînées et Vol (/fly) !",
+                ]),
+        ),
+    );
     inv.set(
         SLOT_TP_SPAWN,
         Some(
@@ -437,10 +512,129 @@ pub fn populate_options_menu(
     );
 }
 
+pub fn populate_gadgets_menu(inv: &CustomInventory, prefs: &PlayerPrefs) {
+    fill_border(
+        inv,
+        GADGETS_ROWS,
+        Material::LightBlueStainedGlassPane,
+        Material::GrayStainedGlassPane,
+    );
+
+    let gadget_slots = [
+        (GAD_SLOT_FEATHER, LobbyGadget::FeatherDash),
+        (GAD_SLOT_ROCKET, LobbyGadget::FireworkRocket),
+        (GAD_SLOT_SHEEP, LobbyGadget::SheepCannon),
+        (GAD_SLOT_VORTEX, LobbyGadget::VortexWand),
+        (GAD_SLOT_WIND, LobbyGadget::WindCharge),
+        (GAD_SLOT_ENDER, LobbyGadget::EnderGrapple),
+    ];
+
+    for (slot, gadget) in gadget_slots {
+        let equipped = prefs.equipped_gadget == Some(gadget);
+        let [line1, line2] = gadget.description();
+        let cd_secs = gadget.cooldown().as_secs_f32();
+        let mut item = ItemStack::new(gadget.material(), 1)
+            .name(if equipped {
+                format!("{} §a§l[ÉQUIPÉ]", gadget.title())
+            } else {
+                gadget.title().to_owned()
+            })
+            .lore([
+                line1.to_owned(),
+                line2.to_owned(),
+                String::new(),
+                format!("§7Recharge : §f{cd_secs:.1}s"),
+                if equipped {
+                    "§a✔ Actuellement dans votre main (slot 7)".to_owned()
+                } else {
+                    "§e▶ Cliquez pour équiper".to_owned()
+                },
+            ]);
+        if equipped {
+            item = item.enchant(Enchantment::Unbreaking, 1);
+        }
+        inv.set(slot, Some(item));
+    }
+
+    inv.set(
+        GAD_SLOT_UNEQUIP,
+        Some(
+            ItemStack::new(Material::Barrier, 1)
+                .name("§c§lRanger le gadget")
+                .lore([
+                    "§7Libère le slot 7 de votre barre.",
+                    "",
+                    if prefs.equipped_gadget.is_none() {
+                        "§7Aucun gadget équipé."
+                    } else {
+                        "§e▶ Cliquez pour déséquiper"
+                    },
+                ]),
+        ),
+    );
+
+    let flight_item = if prefs.flight_enabled {
+        ItemStack::new(Material::Elytra, 1)
+            .name("§b§lVol dans le Lobby : ACTIVÉ")
+            .lore([
+                "§7Double-espace pour voler librement !",
+                "",
+                "§e▶ Cliquez pour désactiver (/fly)",
+            ])
+            .enchant(Enchantment::Unbreaking, 1)
+    } else {
+        ItemStack::new(Material::Elytra, 1)
+            .name("§7§lVol dans le Lobby : DÉSACTIVÉ")
+            .lore([
+                "§7Survolez le château et la cité.",
+                "",
+                "§a▶ Cliquez pour activer (/fly)",
+            ])
+    };
+    inv.set(GAD_SLOT_FLIGHT, Some(flight_item));
+
+    let trail_item = ItemStack::new(prefs.aura_trail.material(), 1)
+        .name(format!("§d§lTraînée : {}", prefs.aura_trail.label()))
+        .lore([
+            "§7Diffuse des particules derrière vous",
+            "§7lorsque vous explorez le Hub.",
+            "",
+            "§e▶ Cliquez pour changer de traînée",
+        ]);
+    inv.set(GAD_SLOT_TRAIL, Some(trail_item));
+
+    let speed_mat = match prefs.speed_tier {
+        crate::prefs::SpeedTier::Normal => Material::Sugar,
+        crate::prefs::SpeedTier::Fast | crate::prefs::SpeedTier::Sprint => Material::RabbitFoot,
+    };
+    inv.set(
+        GAD_SLOT_SPEED,
+        Some(
+            ItemStack::new(speed_mat, 1)
+                .name(format!("§e§lVitesse : {}", prefs.speed_tier.label()))
+                .lore([
+                    "§7Ajuste marche et vitesse de vol (/speed).",
+                    "",
+                    "§e▶ Cliquez pour changer de palier",
+                ]),
+        ),
+    );
+
+    inv.set(
+        GAD_SLOT_BACK,
+        Some(
+            ItemStack::new(Material::Compass, 1)
+                .name("§6§l← Retour au Menu des Jeux")
+                .lore(["§7Revenir à la carte de navigation."]),
+        ),
+    );
+}
+
 #[derive(Default)]
 pub struct MenuManager {
     games_menu: RwLock<Option<CustomInventory>>,
     options_menus: RwLock<HashMap<Uuid, CustomInventory>>,
+    gadgets_menus: RwLock<HashMap<Uuid, CustomInventory>>,
 }
 
 impl MenuManager {
@@ -509,6 +703,36 @@ impl MenuManager {
         }
     }
 
+    pub async fn open_gadgets(
+        &self,
+        server: &Server,
+        player: &Player,
+        prefs: &PlayerPrefs,
+    ) -> Result<(), Error> {
+        self.discard_gadgets(player.uuid);
+        let inv = server
+            .create_inventory(GADGETS_ROWS, "§b§lFerrisCraft §8• §fGadgets")
+            .await?;
+        populate_gadgets_menu(&inv, prefs);
+        self.gadgets_menus
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(player.uuid, inv.clone());
+        player.inventory.open(&inv).await
+    }
+
+    pub fn refresh_open_gadgets(&self, player_uuid: Uuid, prefs: &PlayerPrefs) {
+        let inv = self
+            .gadgets_menus
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&player_uuid)
+            .cloned();
+        if let Some(inv) = inv {
+            populate_gadgets_menu(&inv, prefs);
+        }
+    }
+
     pub fn is_games_inventory(&self, inv_ref: Option<&InventoryRef>) -> bool {
         let Some(custom) = inv_ref.and_then(InventoryRef::custom) else {
             return false;
@@ -531,16 +755,42 @@ impl MenuManager {
             .is_some_and(|known| known == custom)
     }
 
+    pub fn is_player_gadgets_inventory(
+        &self,
+        player_uuid: Uuid,
+        inv_ref: Option<&InventoryRef>,
+    ) -> bool {
+        let Some(custom) = inv_ref.and_then(InventoryRef::custom) else {
+            return false;
+        };
+        self.gadgets_menus
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&player_uuid)
+            .is_some_and(|known| known == custom)
+    }
+
     pub fn handle_close(&self, player_uuid: Uuid, closed: &InventoryRef) {
         let Some(custom) = closed.custom() else {
             return;
         };
-        let mut guard = self
+        let mut opt_guard = self
             .options_menus
             .write()
             .unwrap_or_else(|e| e.into_inner());
-        if guard.get(&player_uuid) == Some(custom)
-            && let Some(removed) = guard.remove(&player_uuid)
+        if opt_guard.get(&player_uuid) == Some(custom)
+            && let Some(removed) = opt_guard.remove(&player_uuid)
+        {
+            removed.discard();
+        }
+        drop(opt_guard);
+
+        let mut gad_guard = self
+            .gadgets_menus
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if gad_guard.get(&player_uuid) == Some(custom)
+            && let Some(removed) = gad_guard.remove(&player_uuid)
         {
             removed.discard();
         }
@@ -556,6 +806,17 @@ impl MenuManager {
             removed.discard();
         }
     }
+
+    pub fn discard_gadgets(&self, player_uuid: Uuid) {
+        if let Some(removed) = self
+            .gadgets_menus
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&player_uuid)
+        {
+            removed.discard();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -563,10 +824,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn games_and_options_slots_decode_to_expected_actions() {
+    fn games_options_and_gadgets_slots_decode_to_expected_actions() {
         assert_eq!(
             decode_games_click(i32::from(SLOT_SHEEPWARS)),
             Some(GamesMenuAction::JoinSheepWars)
+        );
+        assert_eq!(
+            decode_games_click(i32::from(SLOT_OPEN_GADGETS)),
+            Some(GamesMenuAction::OpenGadgets)
         );
         assert_eq!(
             decode_games_click(i32::from(SLOT_TP_PORTAL)),
@@ -583,12 +848,37 @@ mod tests {
             Some(OptionsMenuAction::ToggleVisibility)
         );
         assert_eq!(
+            decode_options_click(i32::from(OPT_SLOT_FLIGHT)),
+            Some(OptionsMenuAction::ToggleFlight)
+        );
+        assert_eq!(
+            decode_options_click(i32::from(OPT_SLOT_SPEED)),
+            Some(OptionsMenuAction::CycleSpeed)
+        );
+        assert_eq!(
             decode_options_click(i32::from(OPT_SLOT_FERRISKEY)),
             Some(OptionsMenuAction::FerrisKeyAction)
         );
         assert_eq!(
             decode_options_click(i32::from(OPT_SLOT_BACK)),
             Some(OptionsMenuAction::BackToGames)
+        );
+
+        assert_eq!(
+            decode_gadgets_click(i32::from(GAD_SLOT_FEATHER)),
+            Some(GadgetsMenuAction::Equip(LobbyGadget::FeatherDash))
+        );
+        assert_eq!(
+            decode_gadgets_click(i32::from(GAD_SLOT_SHEEP)),
+            Some(GadgetsMenuAction::Equip(LobbyGadget::SheepCannon))
+        );
+        assert_eq!(
+            decode_gadgets_click(i32::from(GAD_SLOT_TRAIL)),
+            Some(GadgetsMenuAction::CycleTrail)
+        );
+        assert_eq!(
+            decode_gadgets_click(i32::from(GAD_SLOT_UNEQUIP)),
+            Some(GadgetsMenuAction::UnequipGadget)
         );
     }
 }
