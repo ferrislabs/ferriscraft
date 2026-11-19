@@ -1,0 +1,46 @@
+[package]
+name = "ferriscraft-lobby"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+default-run = "ferriscraft-lobby"
+
+[lib]
+name = "ferriscraft_lobby"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ferriscraft-lobby"
+path = "src/main.rs"
+
+[[bin]]
+name = "normalize-anvil"
+path = "src/bin/normalize_anvil.rs"
+
+[dependencies]
+rspigot-anvil.workspace = true
+rspigot-core.workspace = true
+rspigot-domain.workspace = true
+rspigot-nbt.workspace = true
+rspigot-plugin.workspace = true
+base64.workspace = true
+dotenvy.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+crossbeam-channel.workspace = true
+rspigot-plugins.workspace = true
+
+[lints]
+workspace = true

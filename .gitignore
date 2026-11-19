@@ -1,0 +1,38 @@
+/target
+.env
+.sessions.json
+.capitainerie-sessions.json
+*.bak
+.DS_Store
+
+# Proxy Velocity (binaire JAR, secret HMAC et logs)
+/proxy/velocity.jar
+/proxy/forwarding.secret
+/proxy/logs/
+/proxy/plugins/
+/proxy/lang/
+/proxy/.console_history
+
+# Fichiers runtime du serveur rspigot Lobby (map archivée dans server/world.zip, config exemple dans server/spigot.yml.example)
+/server/logs/
+/server/crash-reports/
+/server/ops.json
+/server/whitelist.json
+/server/banned-players.json
+/server/banned-ips.json
+/server/usercache.json
+/server/spigot.yml
+/server/world/
+/server/world_rspigot_*/
+
+# Fichiers runtime du serveur rspigot SheepWars (config exemple dans server-sheepwars/spigot.yml.example)
+/server-sheepwars/logs/
+/server-sheepwars/crash-reports/
+/server-sheepwars/ops.json
+/server-sheepwars/whitelist.json
+/server-sheepwars/banned-players.json
+/server-sheepwars/banned-ips.json
+/server-sheepwars/usercache.json
+/server-sheepwars/spigot.yml
+/server-sheepwars/world/
+/server-sheepwars/world_rspigot_*/

@@ -1,0 +1,841 @@
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::path::Path;
+use std::process::{Child, Command};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use axum::extract::{Form, Path as AxumPath, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::IntoResponse;
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use crossbeam_channel::{Receiver, RecvTimeoutError};
+use rspigot_core::config::{GameConfig, LevelData};
+use rspigot_core::events::{ClientEvent, EntityKind, Hand, Inbound, MetadataValue, PlayerInput};
+use rspigot_core::ports::{ChunkGenerator, ChunkStore, ClientLink, EntityStore, StoreError};
+use rspigot_core::server::Server;
+use rspigot_core::status::StatusBoard;
+use rspigot_domain::chunk::ChunkColumn;
+use rspigot_domain::player::{ClientSettings, GameProfile, PlayerId};
+use rspigot_domain::text::Component;
+use rspigot_domain::world::Dimension;
+use rspigot_domain::{BiomeId, BlockPos, BlockStateId, ChunkPos, EntityId, Identifier, Vec3};
+use rspigot_nbt::Compound;
+use serde_json::{Value, json};
+use tokio::net::TcpListener;
+use tokio::sync::watch;
+
+const TICK: Duration = Duration::from_millis(50);
+const PATIENCE: Duration = Duration::from_secs(25);
+const SPAWN: Vec3 = Vec3::new(13.5, 29.0, -82.5);
+
+#[derive(Clone, Default)]
+struct Link {
+    events: Arc<Mutex<Vec<ClientEvent>>>,
+    closed: Arc<AtomicBool>,
+}
+
+impl Link {
+    fn take(&self) -> Vec<ClientEvent> {
+        self.events
+            .lock()
+            .map(|mut e| std::mem::take(&mut *e))
+            .unwrap_or_default()
+    }
+}
+
+impl ClientLink for Link {
+    fn send(&self, event: ClientEvent) {
+        if let Ok(mut events) = self.events.lock() {
+            events.push(event);
+        }
+    }
+
+    fn disconnect(&self, _: Component) {
+        self.closed.store(true, Ordering::Release);
+    }
+
+    fn is_connected(&self) -> bool {
+        !self.closed.load(Ordering::Acquire)
+    }
+}
+
+struct NoStore;
+
+impl ChunkStore for NoStore {
+    fn load(&self, _: &Identifier, _: ChunkPos) -> Result<Option<ChunkColumn>, StoreError> {
+        Ok(None)
+    }
+    fn save(&self, _: &Identifier, _: &ChunkColumn) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn flush(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
+}
+
+impl EntityStore for NoStore {
+    fn load_entities(
+        &self,
+        _: &Identifier,
+        _: ChunkPos,
+    ) -> Result<Option<Vec<Compound>>, StoreError> {
+        Ok(None)
+    }
+    fn save_entities(&self, _: &Identifier, _: ChunkPos, _: &[Compound]) -> Result<(), StoreError> {
+        Ok(())
+    }
+}
+
+struct FlatIsland;
+
+impl ChunkGenerator for FlatIsland {
+    fn generate(&self, dimension: &Dimension, pos: ChunkPos) -> ChunkColumn {
+        let mut chunk = ChunkColumn::empty(pos, dimension.height, BiomeId(0));
+        for x in 0..16 {
+            for z in 0..16 {
+                let wx = pos.min_block_x() + x;
+                let wz = pos.min_block_z() + z;
+                let top_y = if wz <= -78 {
+                    28
+                } else if wz <= -46 {
+                    26
+                } else if (8..=18).contains(&wx) {
+                    21
+                } else {
+                    23
+                };
+                for y in 15..=top_y {
+                    chunk.set_block(BlockPos::new(wx, y, wz), BlockStateId(1));
+                }
+            }
+        }
+        chunk
+    }
+
+    fn spawn_point(&self, _: &Dimension) -> Vec3 {
+        SPAWN
+    }
+}
+
+struct TestPlayer {
+    id: PlayerId,
+    link: Link,
+    log: Vec<ClientEvent>,
+    confirmed_cursor: usize,
+    pos: Vec3,
+}
+
+impl TestPlayer {
+    fn drain_into_log(&mut self) -> &[ClientEvent] {
+        self.log.extend(self.link.take());
+        &self.log
+    }
+
+    fn received_chunk(&mut self, pos: ChunkPos) -> bool {
+        self.drain_into_log()
+            .iter()
+            .any(|event| matches!(event, ClientEvent::Chunk { chunk, .. } if chunk.pos() == pos))
+    }
+
+    fn npc_entity_and_pos(&mut self, name: &str) -> Option<(i32, Vec3)> {
+        let log = self.drain_into_log();
+        let uuid = log.iter().find_map(|event| match event {
+            ClientEvent::PlayerInfo(entries) => entries
+                .iter()
+                .find(|entry| entry.profile.name == name)
+                .map(|entry| entry.profile.id.0),
+            _ => None,
+        })?;
+        log.iter().find_map(|event| match event {
+            ClientEvent::SpawnEntity {
+                entity,
+                uuid: spawned,
+                kind: EntityKind::Player,
+                position,
+                ..
+            } if *spawned == uuid => Some((entity.0, *position)),
+            _ => None,
+        })
+    }
+
+    fn label_has(&mut self, text: &str) -> bool {
+        self.drain_into_log().iter().any(|event| match event {
+            ClientEvent::EntityMetadata { entries, .. } => entries.iter().any(|entry| {
+                matches!(&entry.value, MetadataValue::Component(shown) if shown.plain_text().contains(text))
+            }),
+            _ => false,
+        })
+    }
+
+    fn said(&mut self, text: &str) -> bool {
+        self.drain_into_log().iter().any(|event| {
+            matches!(event, ClientEvent::SystemChat { message, .. } if message.plain_text().contains(text))
+        })
+    }
+
+    fn dialog_buttons(&mut self) -> Vec<String> {
+        self.drain_into_log()
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                ClientEvent::ShowDialog(dialog) => Some(
+                    dialog
+                        .buttons
+                        .iter()
+                        .map(|button| button.id.to_string())
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    fn dialog_has(&mut self, text: &str) -> bool {
+        self.drain_into_log()
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                ClientEvent::ShowDialog(dialog) => {
+                    let debug_str = format!("{dialog:?}");
+                    Some(debug_str.contains(text))
+                }
+                _ => None,
+            })
+            .unwrap_or(false)
+    }
+
+    fn event_has(&mut self, text: &str) -> bool {
+        self.drain_into_log()
+            .iter()
+            .any(|event| format!("{event:?}").contains(text))
+    }
+
+    fn vanilla_chat_seen(&mut self) -> bool {
+        self.drain_into_log()
+            .iter()
+            .any(|event| matches!(event, ClientEvent::PlayerChat { .. }))
+    }
+}
+
+fn build_server() -> Server<Link> {
+    let config = GameConfig {
+        view_distance: 6,
+        spawn_chunk_radius: 5,
+        chunk_workers: 2,
+        spawn_protection: 0,
+        ..GameConfig::default()
+    };
+    let mut server = Server::new(
+        config,
+        LevelData::default(),
+        Arc::new(NoStore),
+        Arc::new(FlatIsland),
+        StatusBoard::new(20),
+    );
+    server.wait_for_spawn(Duration::from_secs(10));
+    server
+}
+
+fn confirm_teleports(server: &mut Server<Link>, player: &mut TestPlayer) {
+    player.drain_into_log();
+    let mut updates = Vec::new();
+    for event in &player.log[player.confirmed_cursor..] {
+        if let ClientEvent::Teleport { id, position, .. } = event {
+            updates.push((*id, *position));
+        }
+    }
+    player.confirmed_cursor = player.log.len();
+    for (id, pos) in updates {
+        player.pos = pos;
+        server.handle(Inbound::Input {
+            player: player.id,
+            input: PlayerInput::TeleportConfirm(id),
+        });
+    }
+    server.deliver();
+}
+
+fn walk_close_to(core: &mut Core, player: &mut TestPlayer, target: Vec3) {
+    loop {
+        confirm_teleports(&mut core.server, player);
+        let dx = target.x - player.pos.x;
+        let dy = target.y - player.pos.y;
+        let dz = target.z - player.pos.z;
+        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+        if dist <= 2.2 {
+            break;
+        }
+        let step = (dist - 1.5).min(6.0) / dist;
+        let next = Vec3::new(
+            player.pos.x + dx * step,
+            player.pos.y + dy * step,
+            player.pos.z + dz * step,
+        );
+        player.pos = next;
+        core.server.handle(Inbound::Input {
+            player: player.id,
+            input: PlayerInput::Move {
+                position: Some(next),
+                rotation: None,
+                on_ground: true,
+            },
+        });
+        core.server.deliver();
+        let waiting = core.inbox.len();
+        let inbox = core.inbox.clone();
+        for msg in inbox.try_iter().take(waiting) {
+            core.handle(msg);
+        }
+        core.server.tick();
+        std::thread::sleep(Duration::from_millis(15));
+        let waiting = core.inbox.len();
+        let inbox = core.inbox.clone();
+        for msg in inbox.try_iter().take(waiting) {
+            core.handle(msg);
+        }
+        core.server.tick();
+    }
+}
+
+fn join(server: &mut Server<Link>, name: &str) -> TestPlayer {
+    let link = Link::default();
+    let id = PlayerId::offline(name);
+    server.handle(Inbound::Join {
+        profile: GameProfile {
+            id,
+            name: name.to_owned(),
+            properties: Vec::new(),
+        },
+        settings: ClientSettings::default(),
+        link: link.clone(),
+        address: std::net::Ipv4Addr::LOCALHOST.into(),
+        session: 0,
+    });
+    server.deliver();
+    server.tick();
+    let mut player = TestPlayer {
+        id,
+        link,
+        log: Vec::new(),
+        confirmed_cursor: 0,
+        pos: SPAWN,
+    };
+    assert!(player.received_chunk(SPAWN.chunk()));
+    confirm_teleports(server, &mut player);
+    server.handle(Inbound::Input {
+        player: id,
+        input: PlayerInput::Loaded,
+    });
+    player
+}
+
+struct PluginProcess(Child);
+
+impl PluginProcess {
+    fn start(host: SocketAddr, mock_http: SocketAddr, temp_dir: &Path) -> Self {
+        let child = Command::new(env!("CARGO_BIN_EXE_ferriscraft-lobby"))
+            .current_dir(temp_dir)
+            .env("RSPIGOT_URL", format!("http://{host}"))
+            .env_remove("RSPIGOT_TOKEN")
+            .env("FERRISKEY_URL", format!("http://{mock_http}"))
+            .env("FERRISKEY_REALM", "ferriscraft")
+            .env("FERRISKEY_CLIENT_ID", "ferriscraft-lobby")
+            .env_remove("FERRISKEY_CLIENT_SECRET")
+            .env("CAPITAINERIE_URL", format!("http://{mock_http}"))
+            .env("CAPITAINERIE_CONSOLE_URL", format!("http://{mock_http}"))
+            .env("CAPITAINERIE_RESOURCE", format!("http://{mock_http}"))
+            .env_remove("CAPITAINERIE_REALM")
+            .env_remove("CAPITAINERIE_CLIENT_ID")
+            .env_remove("CAPITAINERIE_CLIENT_SECRET")
+            .env_remove("CAPITAINERIE_FERRISKEY_URL")
+            .env_remove("CAPITAINERIE_OBSERVER_TOKEN")
+            .env_remove("SHEEPWARS_HOST")
+            .env_remove("SHEEPWARS_PORT")
+            .env_remove("SHEEPWARS_BACKEND")
+            .env_remove("SHEEPWARS_WORLD")
+            .env("LOBBY_LAYOUT_PATH", temp_dir.join("lobby.json"))
+            .env("LOBBY_SESSIONS_PATH", temp_dir.join("sessions.json"))
+            .spawn()
+            .expect("ferriscraft-lobby starts");
+        Self(child)
+    }
+}
+
+impl Drop for PluginProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+struct Core {
+    server: Server<Link>,
+    inbox: Receiver<Inbound<Link>>,
+    plugin: Option<u64>,
+    next_tick: Instant,
+}
+
+impl Core {
+    fn new(inbox: Receiver<Inbound<Link>>) -> Self {
+        Self {
+            server: build_server(),
+            inbox,
+            plugin: None,
+            next_tick: Instant::now(),
+        }
+    }
+
+    fn run_until(&mut self, what: &str, mut done: impl FnMut(&mut Self) -> bool) {
+        let deadline = Instant::now() + PATIENCE;
+        while !done(self) {
+            let now = Instant::now();
+            assert!(now < deadline, "timed out waiting for: {what}");
+            if now >= self.next_tick {
+                let waiting = self.inbox.len();
+                let inbox = self.inbox.clone();
+                for msg in inbox.try_iter().take(waiting) {
+                    self.handle(msg);
+                }
+                self.server.tick();
+                self.next_tick += TICK;
+                continue;
+            }
+            match self.inbox.recv_timeout(self.next_tick - now) {
+                Ok(msg) => self.handle(msg),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => panic!("plugin host stopped"),
+            }
+        }
+    }
+
+    fn handle(&mut self, msg: Inbound<Link>) {
+        match &msg {
+            Inbound::PluginConnected { connection, .. } => self.plugin = Some(*connection),
+            Inbound::PluginDisconnected { connection } if self.plugin == Some(*connection) => {
+                self.plugin = None;
+            }
+            _ => {}
+        }
+        self.server.handle(msg);
+        self.server.deliver();
+    }
+}
+
+fn make_jwt(username: &str, roles: &[&str]) -> String {
+    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+    let body = URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&json!({
+            "sub": format!("fk-{username}"),
+            "preferred_username": username,
+            "email": format!("{username}@ferrislabs.io"),
+            "exp": 1_999_999_999u64,
+            "realm_access": { "roles": roles }
+        }))
+        .unwrap(),
+    );
+    format!("{header}.{body}.sig")
+}
+
+#[derive(Default)]
+struct MockBackend {
+    expected_jwt: String,
+    card_bearers: Vec<String>,
+    cards: Vec<Value>,
+    chat_bearers: Vec<String>,
+    runs: Vec<Value>,
+    run_poll_count: u32,
+}
+
+type SharedMock = Arc<Mutex<MockBackend>>;
+
+fn bearer_of(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(str::to_owned)
+}
+
+fn build_mock_router(state: SharedMock) -> Router {
+    Router::new()
+        .route(
+            "/realms/ferriscraft/protocol/openid-connect/auth/device",
+            post(|| async {
+                Json(json!({
+                    "device_code": "dc-alice-1",
+                    "user_code": "FERR-2026",
+                    "verification_uri": "http://localhost:3333/device",
+                    "verification_uri_complete": "http://localhost:3333/device?user_code=FERR-2026",
+                    "expires_in": 300,
+                    "interval": 1
+                }))
+            }),
+        )
+        .route(
+            "/realms/ferriscraft/protocol/openid-connect/token",
+            post(
+                |State(mock): State<SharedMock>, Form(form): Form<HashMap<String, String>>| async move {
+                    if form.get("grant_type").map(String::as_str)
+                        == Some("urn:ietf:params:oauth:grant-type:device_code")
+                    {
+                        let jwt = mock.lock().unwrap().expected_jwt.clone();
+                        Json(json!({
+                            "access_token": jwt,
+                            "refresh_token": "rt-alice",
+                            "expires_in": 600
+                        }))
+                        .into_response()
+                    } else {
+                        StatusCode::BAD_REQUEST.into_response()
+                    }
+                },
+            ),
+        )
+        .route(
+            "/api/v1/team/agents",
+            get(|State(mock): State<SharedMock>, headers: HeaderMap| async move {
+                let expected = mock.lock().unwrap().expected_jwt.clone();
+                if bearer_of(&headers).as_deref() != Some(expected.as_str()) {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                Json(json!({
+                    "items": [{
+                        "id": "a1",
+                        "slug": "forgeur",
+                        "name": "Forgeur",
+                        "role": "Développe les plugins mini-jeux",
+                        "archived": false,
+                        "paused": false
+                    }]
+                }))
+                .into_response()
+            }),
+        )
+        .route(
+            "/api/v1/runs/active",
+            get(|State(mock): State<SharedMock>, headers: HeaderMap| async move {
+                let guard = mock.lock().unwrap();
+                if bearer_of(&headers).as_deref() != Some(guard.expected_jwt.as_str()) {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                Json(json!({ "items": guard.runs })).into_response()
+            }),
+        )
+        .route(
+            "/api/v1/cards",
+            post(
+                |State(mock): State<SharedMock>, headers: HeaderMap, Json(body): Json<Value>| async move {
+                    let Some(bearer) = bearer_of(&headers) else {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    };
+                    let mut guard = mock.lock().unwrap();
+                    guard.card_bearers.push(bearer);
+                    guard.cards.push(body);
+                    (StatusCode::CREATED, Json(json!({"id": "card-1", "version": 1})))
+                        .into_response()
+                },
+            ),
+        )
+        .route(
+            "/api/v1/cards/{card}/agent-runs",
+            post(|AxumPath(_card): AxumPath<String>, headers: HeaderMap| async move {
+                if bearer_of(&headers).is_none() {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                (StatusCode::ACCEPTED, Json(json!({"run_id": "run-1"}))).into_response()
+            }),
+        )
+        .route(
+            "/api/v1/runs/{run_id}",
+            get(
+                |State(mock): State<SharedMock>,
+                 AxumPath(run_id): AxumPath<String>,
+                 headers: HeaderMap| async move {
+                    if bearer_of(&headers).is_none() {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    let mut guard = mock.lock().unwrap();
+                    guard.run_poll_count += 1;
+                    let status = if guard.run_poll_count >= 2 {
+                        "succeeded"
+                    } else {
+                        "running"
+                    };
+                    Json(json!({
+                        "id": run_id,
+                        "status": status,
+                        "title": "Ajouter Mouton Glacé",
+                        "card_id": "card-1",
+                        "failure": null,
+                        "agent": { "id": "a1", "name": "Forgeur" }
+                    }))
+                    .into_response()
+                },
+            ),
+        )
+        .route(
+            "/api/v1/cards/{card_id}",
+            get(
+                |AxumPath(card_id): AxumPath<String>, headers: HeaderMap| async move {
+                    if bearer_of(&headers).is_none() {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    Json(json!({
+                        "card": { "id": card_id },
+                        "comments": [{
+                            "id": "cm-1",
+                            "body": "## Mouton Glacé ajouté\n- Ralentissement 4s dans un rayon de 5 blocs.",
+                            "author_subject": "forgeur",
+                            "author_actor": "agent:forgeur",
+                            "created_at": "2026-11-19T10:00:00Z"
+                        }],
+                        "runs": []
+                    }))
+                    .into_response()
+                },
+            ),
+        )
+        .route(
+            "/api/v1/conversations",
+            post(|State(mock): State<SharedMock>, headers: HeaderMap| async move {
+                let Some(bearer) = bearer_of(&headers) else {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                };
+                mock.lock().unwrap().chat_bearers.push(bearer);
+                (StatusCode::CREATED, Json(json!({"id": "conv-lobby"}))).into_response()
+            }),
+        )
+        .route(
+            "/api/v1/conversations/{id}/messages",
+            post(|AxumPath(_id): AxumPath<String>, headers: HeaderMap| async move {
+                if bearer_of(&headers).is_none() {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                let sse = "event: delta\ndata: {\"text\":\"Les moutons sont prêts !\"}\n\n\
+                           event: done\ndata: {\"status\":\"complete\"}\n\n";
+                ([("content-type", "text/event-stream")], sse).into_response()
+            }),
+        )
+        .with_state(state)
+}
+
+fn interact_entity(server: &mut Server<Link>, player: &TestPlayer, entity_id: i32) {
+    server.handle(Inbound::Input {
+        player: player.id,
+        input: PlayerInput::Interact {
+            target: EntityId(entity_id),
+            hand: Hand::Main,
+            sneaking: false,
+            location: Vec3::new(0.0, 1.0, 0.0),
+        },
+    });
+    server.deliver();
+}
+
+fn send_input(server: &mut Server<Link>, player: &TestPlayer, input: PlayerInput) {
+    server.handle(Inbound::Input {
+        player: player.id,
+        input,
+    });
+    server.deliver();
+}
+
+#[test]
+fn lobby_spawns_pedestals_living_npcs_rich_chat_and_per_player_ferriskey_capitainerie() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+
+    let host_listener = runtime.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
+    let host_addr = host_listener.local_addr().unwrap();
+    let (inbound_tx, inbox_rx) = crossbeam_channel::unbounded::<Inbound<Link>>();
+    let (_stop_tx, stop_rx) = watch::channel(false);
+    runtime.spawn(rspigot_plugins::serve(
+        host_listener,
+        None,
+        inbound_tx,
+        stop_rx,
+    ));
+
+    let alice_jwt = make_jwt("alice_fk", &["admin"]);
+    let mock: SharedMock = Arc::new(Mutex::new(MockBackend {
+        expected_jwt: alice_jwt.clone(),
+        runs: vec![json!({
+            "run": {
+                "id": "r-1",
+                "status": "running",
+                "title": "Équilibrage SheepWars",
+                "agent": {"id": "a1", "name": "Forgeur"}
+            },
+            "current_step": {"kind": "execute"},
+            "steps_done": 2,
+            "steps_total": 4
+        })],
+        ..MockBackend::default()
+    }));
+
+    let http_listener = runtime.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
+    let http_addr = http_listener.local_addr().unwrap();
+    let router = build_mock_router(Arc::clone(&mock));
+    runtime.spawn(async move {
+        let _ = axum::serve(http_listener, router).await;
+    });
+
+    let temp_dir = std::env::temp_dir().join(format!("fc_lobby_e2e_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+
+    let mut core = Core::new(inbox_rx);
+    let _plugin = PluginProcess::start(host_addr, http_addr, &temp_dir);
+    core.run_until("lobby plugin connects", |c| c.plugin.is_some());
+
+    let mut alice = join(&mut core.server, "Alice");
+    let mut bob = join(&mut core.server, "Bob");
+
+    core.run_until("Alice receives welcome message and spawn teleport", |c| {
+        confirm_teleports(&mut c.server, &mut alice);
+        confirm_teleports(&mut c.server, &mut bob);
+        alice.said("FerrisCraft")
+    });
+
+    let (mut sheepwars_npc, mut guard_npc, mut captain_npc) = (None, None, None);
+    core.run_until(
+        "Alice sees SheepWars pedestal, Guard, and Captain NPCs",
+        |c| {
+            confirm_teleports(&mut c.server, &mut alice);
+            sheepwars_npc = alice.npc_entity_and_pos("SheepWars");
+            guard_npc = alice.npc_entity_and_pos("Garde_Pont");
+            captain_npc = alice.npc_entity_and_pos("Capitaine");
+            sheepwars_npc.is_some() && guard_npc.is_some() && captain_npc.is_some()
+        },
+    );
+    let (sheepwars_id, sheepwars_pos) = sheepwars_npc.unwrap();
+    let (guard_id, guard_pos) = guard_npc.unwrap();
+    let (captain_id, captain_pos) = captain_npc.unwrap();
+
+    // 1. Walk to Guard & interact
+    walk_close_to(&mut core, &mut alice, guard_pos);
+    interact_entity(&mut core.server, &alice, guard_id);
+    core.run_until("Guard greets Alice", |_| {
+        alice.said("Bienvenue dans la Citadelle FerrisCraft")
+    });
+
+    // 2. Walk to SheepWars pedestal NPC & click to join queue
+    walk_close_to(&mut core, &mut alice, sheepwars_pos);
+    interact_entity(&mut core.server, &alice, sheepwars_id);
+    core.run_until("Alice joins SheepWars queue", |_| {
+        alice.said("file d'attente") && alice.label_has("En file : 1")
+    });
+
+    // 3. Rich Lobby Chat with @mention (replaces vanilla PlayerChat)
+    send_input(
+        &mut core.server,
+        &alice,
+        PlayerInput::Chat("Salut @bob prêt pour SheepWars ?".to_owned()),
+    );
+    core.run_until("Bob receives formatted @mention chat", |_| {
+        bob.said("@Bob") && !bob.vanilla_chat_seen()
+    });
+
+    // 4. Walk to Captain before FerrisKey login -> prompts Device Flow dialog
+    walk_close_to(&mut core, &mut alice, captain_pos);
+    interact_entity(&mut core.server, &alice, captain_id);
+    core.run_until("Alice receives FerrisKey login prompt dialog", |_| {
+        alice
+            .dialog_buttons()
+            .iter()
+            .any(|b| b == "ferriscraft:login_now")
+    });
+
+    // 5. Alice triggers FerrisKey Device Flow -> receives code -> auto-authenticates!
+    send_input(
+        &mut core.server,
+        &alice,
+        PlayerInput::CustomClick {
+            id: "ferriscraft:login_now".to_owned(),
+            data: None,
+        },
+    );
+    core.run_until(
+        "Alice sees FerrisKey user_code prompt and completes auth",
+        |_| alice.said("FERR-2026") && alice.said("alice_fk"),
+    );
+
+    // 6. Now Capitainerie discovers Forgeur agent & shows live progress bar
+    let mut forgeur_npc = None;
+    core.run_until("Forgeur agent spawns and displays active run", |_| {
+        forgeur_npc = alice.npc_entity_and_pos("forgeur");
+        forgeur_npc.is_some() && alice.label_has("Équilibrage SheepWars") && alice.label_has("2/4")
+    });
+    let (forgeur_id, forgeur_pos) = forgeur_npc.unwrap();
+
+    // 7. Walk to Forgeur workstation & assign task using Alice's personal FerrisKey token
+    walk_close_to(&mut core, &mut alice, forgeur_pos);
+    interact_entity(&mut core.server, &alice, forgeur_id);
+    core.run_until("Alice gets Forgeur task dialog", |_| {
+        alice
+            .dialog_buttons()
+            .iter()
+            .any(|b| b == "ferriscraft:cap_run/forgeur")
+    });
+    send_input(
+        &mut core.server,
+        &alice,
+        PlayerInput::CustomClick {
+            id: "ferriscraft:cap_run/forgeur".to_owned(),
+            data: Some(
+                r#"{"title":"Ajouter Mouton Glacé","description":"Ralentit la zone"}"#.to_owned(),
+            ),
+        },
+    );
+    core.run_until("Forgeur task starts under Alice's FerrisKey bearer", |_| {
+        alice.said("Forgeur rejoint son établi")
+    });
+    {
+        let guard = mock.lock().unwrap();
+        assert_eq!(guard.card_bearers, vec![alice_jwt.clone()]);
+        assert_eq!(guard.cards[0]["title"], "Ajouter Mouton Glacé");
+    }
+
+    // 7b. Run watcher detects completion -> BossBar + Title + RichMessage -> clicking opens full Dialog
+    core.run_until("Alice receives Forgeur completion feedback", |_| {
+        alice.event_has("Forgeur A TERMINÉ")
+            && alice.event_has("Terminé :")
+            && alice.said("Forgeur a terminé sa mission")
+            && alice.said("Lire la réponse")
+            && alice.said("Ouvrir sur Capitainerie")
+    });
+    send_input(
+        &mut core.server,
+        &alice,
+        PlayerInput::CustomClick {
+            id: "ferriscraft:cap_result/run-1".to_owned(),
+            data: None,
+        },
+    );
+    core.run_until("Alice opens Forgeur full result dialog", |_| {
+        alice.dialog_has("Mouton Glacé ajouté") && alice.dialog_has("Ralentissement 4s")
+    });
+
+    // 8. Walk back to Captain & chat over SSE using Alice's personal FerrisKey token
+    walk_close_to(&mut core, &mut alice, captain_pos);
+    interact_entity(&mut core.server, &alice, captain_id);
+    core.run_until("Alice opens private Captain channel", |_| {
+        alice.said("Canal privé ouvert sous votre identité FerrisKey")
+    });
+    send_input(
+        &mut core.server,
+        &alice,
+        PlayerInput::Chat("Où en est l'arène ?".to_owned()),
+    );
+    core.run_until("Captain streams SSE reply", |_| {
+        alice.said("Les moutons sont prêts !")
+    });
+    assert_eq!(mock.lock().unwrap().chat_bearers, vec![alice_jwt]);
+    assert_eq!(core.server.game_rules().random_tick_speed, 0);
+    assert_eq!(core.server.game_rules().fire_spread_radius, 0);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
