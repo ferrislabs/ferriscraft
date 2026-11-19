@@ -16,16 +16,21 @@ rspigot-domain = { path = "/opt/minecraft/dev/rspigot/crates/rspigot-domain" }
 rspigot-nbt = { path = "/opt/minecraft/dev/rspigot/crates/rspigot-nbt" }
 rspigot-plugins = { path = "/opt/minecraft/dev/rspigot/crates/rspigot-plugins" }
 
+ferriscraft-protocol = { path = "crates/ferriscraft-protocol" }
+
 axum = "0.8"
 base64 = "0.22"
 crossbeam-channel = "0.5"
 dotenvy = "0.15"
 futures-util = "0.3"
+k8s-openapi = { version = "0.24", features = ["v1_31"] }
+kube = { version = "0.98", default-features = false, features = ["client", "runtime", "rustls-tls"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["serde", "v4"] }

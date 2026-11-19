@@ -44,6 +44,8 @@ pub struct EnvConfig {
     pub sheepwars_transfer: Option<(String, u16)>,
     pub sheepwars_backend: Option<String>,
     pub sheepwars_world: Option<String>,
+    pub orchestrator_url: Option<String>,
+    pub orchestrator_token: Option<String>,
     pub layout_path: PathBuf,
     pub sessions_path: PathBuf,
 }
@@ -88,17 +90,20 @@ impl EnvConfig {
         let same_auth_client = capitainerie_ferriskey_url == ferriskey_base_url
             && capitainerie_realm == ferriskey_realm
             && capitainerie_client_id == ferriskey_client_id;
-        let capitainerie_client_secret = non_empty_env("CAPITAINERIE_CLIENT_SECRET").or_else(|| {
-            if same_auth_client {
-                ferriskey_client_secret.clone()
-            } else {
-                None
-            }
-        });
+        let capitainerie_client_secret =
+            non_empty_env("CAPITAINERIE_CLIENT_SECRET").or_else(|| {
+                if same_auth_client {
+                    ferriskey_client_secret.clone()
+                } else {
+                    None
+                }
+            });
         let capitainerie_scope =
             non_empty_env("CAPITAINERIE_SCOPE").unwrap_or_else(|| ferriskey_scope.clone());
-        let capitainerie_sessions_path = non_empty_env("CAPITAINERIE_SESSIONS_PATH")
-            .map_or_else(|| PathBuf::from(".capitainerie-sessions.json"), PathBuf::from);
+        let capitainerie_sessions_path = non_empty_env("CAPITAINERIE_SESSIONS_PATH").map_or_else(
+            || PathBuf::from(".capitainerie-sessions.json"),
+            PathBuf::from,
+        );
 
         let sheepwars_transfer = non_empty_env("SHEEPWARS_HOST").map(|host| {
             let port = non_empty_env("SHEEPWARS_PORT")
@@ -108,6 +113,9 @@ impl EnvConfig {
         });
         let sheepwars_backend = non_empty_env("SHEEPWARS_BACKEND");
         let sheepwars_world = non_empty_env("SHEEPWARS_WORLD");
+        let orchestrator_url =
+            non_empty_env("ORCHESTRATOR_URL").map(|url| url.trim_end_matches('/').to_owned());
+        let orchestrator_token = non_empty_env("ORCHESTRATOR_TOKEN");
 
         let layout_path = non_empty_env("LOBBY_LAYOUT_PATH")
             .map_or_else(|| PathBuf::from("lobby.json"), PathBuf::from);
@@ -133,6 +141,8 @@ impl EnvConfig {
             sheepwars_transfer,
             sheepwars_backend,
             sheepwars_world,
+            orchestrator_url,
+            orchestrator_token,
             layout_path,
             sessions_path,
         }

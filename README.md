@@ -111,3 +111,47 @@ cargo run --release -p ferriscraft-lobby --bin normalize-anvil -- ./server/world
 - `/lobby setspawn` / `/lobby setpoi <nom>` / `/lobby setpedestal <1..7>`
 - `/lobby setcaptain` / `/lobby setstation <index>` / `/lobby setwaypoint <pnj> <index>`
 - `/lobby reload` / `/lobby info`
+
+---
+
+## 5. Déploiement Kubernetes (`k3s` / `k3d`) & gestion de flotte ($k$ serveurs SheepWars)
+
+Composants de gestion de flotte :
+
+| Composant | Rôle | Sources |
+|---|---|---|
+| **`ferriscraft-orchestrator`** | File d'attente FIFO, matchmaking par lots, scaling dynamique de `min` à `k` (`SHEEPWARS_MAX_REPLICAS`) Pods SheepWars via `kube-rs`, flux SSE proxy | [`crates/ferriscraft-orchestrator`](./crates/ferriscraft-orchestrator) |
+| **`ferriscraft-velocity`** | Plugin Velocity 4.3.1 enregistrant dynamiquement les Pods `sheepwars-*` et transférant les joueurs sans déconnexion client | [`proxy/velocity-plugin`](./proxy/velocity-plugin) |
+| **`ferriscraft-protocol`** | Contrat JSON partagé (queue, heartbeat, phases, retours Hub) pour le futur plugin SheepWars | [`crates/ferriscraft-protocol`](./crates/ferriscraft-protocol) |
+
+### Construire les images Docker (avec contexte `rspigot` local)
+
+```bash
+RSPIGOT_DIR=/opt/minecraft/dev/rspigot IMAGE_TAG=dev ./deploy/scripts/build-images.sh
+```
+
+Pour importer directement dans un cluster `k3d` existant :
+
+```bash
+K3D_CLUSTER=capitainerie IMAGE_TAG=dev ./deploy/scripts/build-images.sh
+```
+
+### Déployer via Helm
+
+```bash
+helm upgrade --install ferriscraft ./deploy/charts/ferriscraft \
+  --namespace ferriscraft --create-namespace \
+  -f ./deploy/charts/ferriscraft/values-k3d.yaml
+```
+
+Pour ajuster le nombre max de serveurs SheepWars (`k`) et le seuil de lancement de partie :
+
+```bash
+helm upgrade --install ferriscraft ./deploy/charts/ferriscraft \
+  --namespace ferriscraft --create-namespace \
+  --set orchestrator.sheepwars.maxReplicas=10 \
+  --set orchestrator.queue.minPlayers=8
+```
+
+Voir [`docs/SHEEPWARS_PLUGIN_CONTRACT.md`](./docs/SHEEPWARS_PLUGIN_CONTRACT.md) pour brancher le futur plugin SheepWars en sidecar.
+

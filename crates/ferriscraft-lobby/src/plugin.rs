@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use ferriscraft_protocol::QueueJoinStatus;
 use rspigot_plugin::prelude::*;
 use rspigot_plugin::{
     Action, BarColor, BarStyle, EquipmentSlot, EventResult, Facing, Particle, ParticleBurst,
@@ -23,6 +24,7 @@ use crate::menus::{
     decode_options_click,
 };
 use crate::npcs::{CaptainTurn, NpcClickTarget, NpcDirector};
+use crate::orchestrator::{OrchestratorClient, ToggleQueueOutcome};
 use crate::prefs::PrefsStore;
 
 const MAX_TASK_TITLE: u32 = 120;
@@ -53,6 +55,7 @@ struct SharedState {
     hud: HudManager,
     chat: ChatSystem,
     npcs: Arc<NpcDirector>,
+    orchestrator: Option<Arc<OrchestratorClient>>,
     sheepwars_queue: RwLock<HashSet<Uuid>>,
     portal_cooldowns: RwLock<HashMap<Uuid, Instant>>,
     task_results: RwLock<HashMap<String, TaskResultReport>>,
@@ -71,6 +74,12 @@ impl FerrisCraftLobby {
             Arc::clone(&layout),
             config.capitainerie_url.clone(),
         ));
+        let orchestrator = config.orchestrator_url.clone().map(|url| {
+            Arc::new(OrchestratorClient::new(
+                url,
+                config.orchestrator_token.clone(),
+            ))
+        });
         Self {
             state: Arc::new(SharedState {
                 config,
@@ -81,6 +90,7 @@ impl FerrisCraftLobby {
                 hud: HudManager::default(),
                 chat: ChatSystem::default(),
                 npcs,
+                orchestrator,
                 sheepwars_queue: RwLock::new(HashSet::new()),
                 portal_cooldowns: RwLock::new(HashMap::new()),
                 task_results: RwLock::new(HashMap::new()),
@@ -89,6 +99,9 @@ impl FerrisCraftLobby {
     }
 
     fn queued_count(&self) -> usize {
+        if let Some(client) = &self.state.orchestrator {
+            return client.cached_queue_len();
+        }
         self.state
             .sheepwars_queue
             .read()
@@ -349,6 +362,72 @@ impl FerrisCraftLobby {
         let lobby = self.clone();
         tokio::spawn(async move {
             player.inventory.close();
+            if let Some(orch) = lobby.state.orchestrator.clone() {
+                match orch.toggle_queue(player.uuid, &player.name).await {
+                    Ok(ToggleQueueOutcome::Joined(resp)) => {
+                        let count = match orch.fetch_status().await {
+                            Ok(snap) => snap.queue_len,
+                            Err(_) => resp.total_queued,
+                        };
+                        lobby.state.menus.refresh_games_menu(count);
+                        lobby.state.npcs.update_sheepwars_pedestal_label(count);
+                        if resp.status == QueueJoinStatus::Transferring {
+                            player.sound.play(
+                                SoundCue::new(Sound::EntityEndermanTeleport)
+                                    .volume(0.85)
+                                    .pitch(1.15),
+                            );
+                            let target = resp.target_server.as_deref().unwrap_or("sheepwars");
+                            player.message.send(format!(
+                                "§d§lSheepWars §8» §aPartie trouvée ! Transfert vers §f{target}§a…"
+                            ));
+                        } else {
+                            player.sound.play(
+                                SoundCue::new(Sound::EntityExperienceOrbPickup)
+                                    .volume(0.8)
+                                    .pitch(1.3),
+                            );
+                            player.action_bar.send(format!(
+                                "§d§lSheepWars §8• §aFile #{}/{} §7(min §f{}§7 • §b{}/{} srv§7)",
+                                resp.position,
+                                resp.total_queued.max(1),
+                                resp.min_players,
+                                resp.ready_servers,
+                                resp.max_servers
+                            ));
+                            player.message.send(format!(
+                                "§d§lSheepWars §8» §aFile d'attente rejointe (§f#{}§a, §f{}§a/§f{} min§a — §b{}§a prêt(s) / §f{} max§a). Recliquez pour quitter.",
+                                resp.position,
+                                resp.total_queued,
+                                resp.min_players,
+                                resp.ready_servers,
+                                resp.max_servers
+                            ));
+                        }
+                        lobby.refresh_single_player_ui(&player).await;
+                    }
+                    Ok(ToggleQueueOutcome::Left(resp)) => {
+                        let count = match orch.fetch_status().await {
+                            Ok(snap) => snap.queue_len,
+                            Err(_) => resp.total_queued,
+                        };
+                        lobby.state.menus.refresh_games_menu(count);
+                        lobby.state.npcs.update_sheepwars_pedestal_label(count);
+                        player
+                            .message
+                            .send("§d§lSheepWars §8» §7Vous avez quitté la file d'attente.");
+                        lobby.refresh_single_player_ui(&player).await;
+                    }
+                    Err(err) => {
+                        tracing::warn!("Orchestrateur SheepWars injoignable : {err}");
+                        player.message.send(format!(
+                            "§cService de file d'attente SheepWars indisponible ({err})."
+                        ));
+                    }
+                }
+                return;
+            }
+
             if let Some((host, port)) = lobby.state.config.sheepwars_transfer.clone() {
                 let probe_target = lobby
                     .state
@@ -949,6 +1028,34 @@ impl FerrisCraftLobby {
             let mut ticker = tokio::time::interval(HUD_REFRESH_INTERVAL);
             loop {
                 ticker.tick().await;
+                if let Some(orch) = &lobby_hud.state.orchestrator
+                    && let Ok(snap) = orch.fetch_status().await
+                {
+                    lobby_hud.state.menus.refresh_games_menu(snap.queue_len);
+                    lobby_hud
+                        .state
+                        .npcs
+                        .update_sheepwars_pedestal_label(snap.queue_len);
+                    if !snap.queued_players.is_empty()
+                        && let Ok(online) = srv_hud.get_players().await
+                    {
+                        for qp in &snap.queued_players {
+                            if let Some(p) = online.iter().find(|p| p.uuid == qp.player_uuid) {
+                                let state_hint = if snap.ready_servers > 0 {
+                                    format!("§b{} serveur(s) prêt(s)", snap.ready_servers)
+                                } else if snap.starting_servers > 0 {
+                                    "§eDémarrage serveur…".to_owned()
+                                } else {
+                                    format!("§7{}/{} max", snap.in_game_servers, snap.max_replicas)
+                                };
+                                p.action_bar.send(format!(
+                                    "§d§lSheepWars §8• §aFile #{}/{} §7(min §f{}§7) §8• {state_hint}",
+                                    qp.position, snap.queue_len, snap.min_players
+                                ));
+                            }
+                        }
+                    }
+                }
                 let metrics = lobby_hud.collect_metrics(&srv_hud).await;
                 lobby_hud
                     .state
@@ -959,11 +1066,12 @@ impl FerrisCraftLobby {
         });
 
         tracing::info!(
-            "FerrisCraft Lobby initialisé (FerrisKey={} realm={}, Capitainerie={:?} realm={})",
+            "FerrisCraft Lobby initialisé (FerrisKey={} realm={}, Capitainerie={:?} realm={}, Orchestrator={:?})",
             self.state.config.ferriskey_base_url,
             self.state.config.ferriskey_realm,
             self.state.config.capitainerie_url,
             self.state.config.capitainerie_realm,
+            self.state.config.orchestrator_url,
         );
     }
 
@@ -1065,6 +1173,13 @@ impl FerrisCraftLobby {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&player.uuid);
+
+        if let Some(orch) = self.state.orchestrator.clone() {
+            let uuid = player.uuid;
+            tokio::spawn(async move {
+                let _ = orch.leave_if_queued(uuid).await;
+            });
+        }
 
         let new_len = {
             let mut q = self

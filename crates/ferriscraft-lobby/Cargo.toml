@@ -27,6 +27,7 @@ rspigot-nbt.workspace = true
 rspigot-plugin.workspace = true
 base64.workspace = true
 dotenvy.workspace = true
+ferriscraft-protocol.workspace = true
 futures-util.workspace = true
 reqwest.workspace = true
 serde.workspace = true

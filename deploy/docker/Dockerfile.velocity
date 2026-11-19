@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1
+FROM maven:3.9-eclipse-temurin-25 AS plugin-builder
+WORKDIR /build
+COPY proxy/velocity-plugin/pom.xml ./
+RUN mvn -B dependency:go-offline
+COPY proxy/velocity-plugin/src ./src
+RUN mvn -B package
+
+FROM eclipse-temurin:25-jre-noble AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+
+ARG VELOCITY_URL="https://fill-data.papermc.io/v1/objects/0844bcabdcdb4f5b875906fd4c3365bc1bb76918e42bc595ed88ad195258dd75/velocity-4.3.1-45.jar"
+ARG VELOCITY_SHA256="0844bcabdcdb4f5b875906fd4c3365bc1bb76918e42bc595ed88ad195258dd75"
+
+RUN curl -fSL -o /app/velocity.jar "${VELOCITY_URL}" \
+    && echo "${VELOCITY_SHA256}  /app/velocity.jar" | sha256sum -c - \
+    && mkdir -p /app/plugins
+
+COPY --from=plugin-builder /build/target/ferriscraft-velocity.jar /app/plugins/ferriscraft-velocity.jar
+COPY deploy/docker/velocity-entrypoint.sh /usr/local/bin/velocity-entrypoint.sh
+RUN chmod +x /usr/local/bin/velocity-entrypoint.sh
+
+EXPOSE 25565
+ENTRYPOINT ["/usr/local/bin/velocity-entrypoint.sh"]
