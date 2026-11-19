@@ -1,0 +1,153 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ferriscraft.fullname" . }}-lobby
+  labels:
+    {{- include "ferriscraft.labels" . | nindent 4 }}
+    app.kubernetes.io/component: lobby
+spec:
+  replicas: {{ .Values.lobby.replicas }}
+  selector:
+    matchLabels:
+      {{- include "ferriscraft.labels" . | nindent 6 }}
+      app.kubernetes.io/component: lobby
+  template:
+    metadata:
+      labels:
+        {{- include "ferriscraft.labels" . | nindent 8 }}
+        app.kubernetes.io/component: lobby
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: rspigot
+          image: {{ include "ferriscraft.image" (dict "global" .Values.global "repository" .Values.lobby.rspigotImage.repository "tag" .Values.lobby.rspigotImage.tag) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          env:
+            - name: RSPIGOT_MODE
+              value: "lobby"
+            - name: SERVER_PORT
+              value: {{ .Values.lobby.port | quote }}
+            - name: MAX_PLAYERS
+              value: {{ .Values.lobby.maxPlayers | quote }}
+            - name: PLUGIN_GRPC_BIND
+              value: {{ printf "127.0.0.1:%d" (int .Values.lobby.grpcPort) | quote }}
+          ports:
+            - name: minecraft
+              containerPort: {{ .Values.lobby.port }}
+              protocol: TCP
+            - name: grpc-plugin
+              containerPort: {{ .Values.lobby.grpcPort }}
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: minecraft
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: minecraft
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          {{- with .Values.lobby.resources.rspigot }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: forwarding-secret
+              mountPath: /etc/ferriscraft/forwarding
+              readOnly: true
+            - name: lobby-data
+              mountPath: /data
+        - name: lobby-plugin
+          image: {{ include "ferriscraft.image" (dict "global" .Values.global "repository" .Values.lobby.pluginImage.repository "tag" .Values.lobby.pluginImage.tag) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          env:
+            - name: RSPIGOT_URL
+              value: {{ printf "http://127.0.0.1:%d" (int .Values.lobby.grpcPort) | quote }}
+            - name: RSPIGOT_PLUGIN_NAME
+              value: "ferriscraft-lobby"
+            - name: ORCHESTRATOR_URL
+              value: {{ printf "http://%s-orchestrator:%d" (include "ferriscraft.fullname" .) (int .Values.orchestrator.port) | quote }}
+            {{- if (include "ferriscraft.orchestratorTokenSecretName" .) }}
+            - name: ORCHESTRATOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ferriscraft.orchestratorTokenSecretName" . }}
+                  key: token
+            {{- end }}
+            - name: FERRISKEY_URL
+              value: {{ .Values.lobby.ferriskey.url | quote }}
+            - name: FERRISKEY_REALM
+              value: {{ .Values.lobby.ferriskey.realm | quote }}
+            - name: FERRISKEY_CLIENT_ID
+              value: {{ .Values.lobby.ferriskey.clientId | quote }}
+            - name: FERRISKEY_SCOPE
+              value: {{ .Values.lobby.ferriskey.scope | quote }}
+            {{- if .Values.secrets.existingFerrisKeySecret }}
+            - name: FERRISKEY_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingFerrisKeySecret }}
+                  key: client-secret
+                  optional: true
+            - name: CAPITAINERIE_OBSERVER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingFerrisKeySecret }}
+                  key: observer-token
+                  optional: true
+            {{- end }}
+            {{- if .Values.lobby.capitainerie.url }}
+            - name: CAPITAINERIE_URL
+              value: {{ .Values.lobby.capitainerie.url | quote }}
+            {{- end }}
+            {{- if .Values.lobby.capitainerie.consoleUrl }}
+            - name: CAPITAINERIE_CONSOLE_URL
+              value: {{ .Values.lobby.capitainerie.consoleUrl | quote }}
+            {{- end }}
+            {{- if .Values.lobby.capitainerie.resource }}
+            - name: CAPITAINERIE_RESOURCE
+              value: {{ .Values.lobby.capitainerie.resource | quote }}
+            {{- end }}
+            {{- if .Values.lobby.capitainerie.realm }}
+            - name: CAPITAINERIE_REALM
+              value: {{ .Values.lobby.capitainerie.realm | quote }}
+            {{- end }}
+            {{- if .Values.lobby.capitainerie.clientId }}
+            - name: CAPITAINERIE_CLIENT_ID
+              value: {{ .Values.lobby.capitainerie.clientId | quote }}
+            {{- end }}
+            - name: LOBBY_LAYOUT_PATH
+              value: "/app/lobby.json"
+            - name: LOBBY_SESSIONS_PATH
+              value: "/tmp/.sessions.json"
+          {{- with .Values.lobby.resources.plugin }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: forwarding-secret
+          secret:
+            secretName: {{ include "ferriscraft.forwardingSecretName" . }}
+        - name: lobby-data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ferriscraft.fullname" . }}-lobby
+  labels:
+    {{- include "ferriscraft.labels" . | nindent 4 }}
+    app.kubernetes.io/component: lobby
+spec:
+  selector:
+    {{- include "ferriscraft.labels" . | nindent 4 }}
+    app.kubernetes.io/component: lobby
+  ports:
+    - name: minecraft
+      port: {{ .Values.lobby.port }}
+      targetPort: minecraft
+      protocol: TCP

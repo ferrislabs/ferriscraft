@@ -1,0 +1,96 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ferriscraft.fullname" . }}-sheepwars-template
+  labels:
+    {{- include "ferriscraft.labels" . | nindent 4 }}
+    app.kubernetes.io/component: orchestrator
+data:
+  pod-template.yaml: |
+    metadata:
+      labels:
+        app.kubernetes.io/name: ferriscraft
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: sheepwars
+    spec:
+      restartPolicy: Never
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.sheepwars.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.sheepwars.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: rspigot
+          image: {{ include "ferriscraft.image" (dict "global" .Values.global "repository" .Values.sheepwars.rspigotImage.repository "tag" .Values.sheepwars.rspigotImage.tag) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          env:
+            - name: RSPIGOT_MODE
+              value: "sheepwars"
+            - name: SERVER_PORT
+              value: {{ .Values.sheepwars.port | quote }}
+            - name: PLUGIN_GRPC_BIND
+              value: {{ printf "127.0.0.1:%d" (int .Values.sheepwars.grpcPort) | quote }}
+            - name: SHEEPWARS_MAX_PLAYERS
+              value: {{ .Values.orchestrator.sheepwars.maxPlayers | quote }}
+          ports:
+            - name: minecraft
+              containerPort: {{ .Values.sheepwars.port }}
+              protocol: TCP
+            - name: grpc-plugin
+              containerPort: {{ .Values.sheepwars.grpcPort }}
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.sheepwars.port }}
+            initialDelaySeconds: 2
+            periodSeconds: 2
+          livenessProbe:
+            tcpSocket:
+              port: {{ .Values.sheepwars.port }}
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          {{- with .Values.sheepwars.resources.rspigot }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: forwarding-secret
+              mountPath: /etc/ferriscraft/forwarding
+              readOnly: true
+            - name: world-data
+              mountPath: /data
+        {{- if .Values.sheepwars.pluginSidecar.enabled }}
+        - name: sheepwars-plugin
+          image: {{ .Values.sheepwars.pluginSidecar.image }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          env:
+            - name: RSPIGOT_URL
+              value: {{ printf "http://127.0.0.1:%d" (int .Values.sheepwars.grpcPort) | quote }}
+            {{- if (include "ferriscraft.orchestratorTokenSecretName" .) }}
+            - name: ORCHESTRATOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ferriscraft.orchestratorTokenSecretName" . }}
+                  key: token
+            {{- end }}
+            {{- with .Values.sheepwars.pluginSidecar.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.sheepwars.pluginSidecar.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        {{- end }}
+      volumes:
+        - name: forwarding-secret
+          secret:
+            secretName: {{ include "ferriscraft.forwardingSecretName" . }}
+        - name: world-data
+          emptyDir: {}

@@ -12,6 +12,7 @@
 /proxy/plugins/
 /proxy/lang/
 /proxy/.console_history
+/proxy/velocity-plugin/target/
 
 # Fichiers runtime du serveur rspigot Lobby (map archivée dans server/world.zip, config exemple dans server/spigot.yml.example)
 /server/logs/

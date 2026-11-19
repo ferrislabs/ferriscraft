@@ -506,7 +506,8 @@ impl SessionStore {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
+                let _ =
+                    std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
             }
         }
     }
@@ -650,10 +651,7 @@ impl AuthManager {
         let target = self.target_for(scope);
         store.cancel_pending(player_uuid);
 
-        let mut form = vec![
-            ("client_id", target.client_id),
-            ("scope", target.scope),
-        ];
+        let mut form = vec![("client_id", target.client_id), ("scope", target.scope)];
         if let Some(secret) = target.client_secret {
             form.push(("client_secret", secret));
         }
@@ -983,6 +981,8 @@ mod tests {
             sheepwars_transfer: None,
             sheepwars_backend: None,
             sheepwars_world: None,
+            orchestrator_url: None,
+            orchestrator_token: None,
             layout_path: PathBuf::new(),
             sessions_path: PathBuf::new(),
         };
@@ -1126,6 +1126,8 @@ mod tests {
             sheepwars_transfer: None,
             sheepwars_backend: None,
             sheepwars_world: None,
+            orchestrator_url: None,
+            orchestrator_token: None,
             layout_path: PathBuf::new(),
             sessions_path: PathBuf::new(),
         };
@@ -1160,7 +1162,10 @@ mod tests {
         let lobby_tok = manager.valid_access_token(player_id).await.unwrap();
         let cap_tok = manager.valid_capitainerie_token(player_id).await.unwrap();
         assert_ne!(lobby_tok, cap_tok);
-        assert_eq!(manager.observer_token().await.as_deref(), Some(cap_tok.as_str()));
+        assert_eq!(
+            manager.observer_token().await.as_deref(),
+            Some(cap_tok.as_str())
+        );
 
         assert!(manager.capitainerie_logout(player_id));
         assert!(!manager.is_capitainerie_authenticated(player_id));

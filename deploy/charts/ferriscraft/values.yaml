@@ -1,0 +1,134 @@
+global:
+  imageRegistry: ghcr.io/ferrislabs
+  imageTag: latest
+  imagePullPolicy: IfNotPresent
+  imagePullSecrets: []
+
+secrets:
+  # En production, fournir les noms de Secrets existants (créés hors Git / ExternalSecrets)
+  existingForwardingSecret: ""
+  # Valeur utilisée uniquement si existingForwardingSecret est vide (dev / k3d)
+  devForwardingSecret: "ferriscraft-dev-forwarding-secret"
+
+  existingOrchestratorTokenSecret: ""
+  devOrchestratorToken: ""
+
+  existingFerrisKeySecret: ""
+
+velocity:
+  replicas: 1
+  image:
+    repository: ferriscraft-velocity
+    tag: ""
+  onlineMode: true
+  showMaxPlayers: 100
+  motd: "<gold><bold>FerrisCraft</bold></gold> <dark_gray>•</dark_gray> <light_purple>Mini-Jeux & SheepWars</light_purple>"
+  javaOpts: "-Xms512M -Xmx512M -XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:MaxGCPauseMillis=200"
+  service:
+    type: LoadBalancer
+    port: 25565
+    nodePort: null
+    annotations: {}
+  resources:
+    requests:
+      cpu: 250m
+      memory: 640Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+orchestrator:
+  replicas: 1
+  image:
+    repository: ferriscraft-orchestrator
+    tag: ""
+  port: 8080
+  logLevel: info
+  queue:
+    minPlayers: 2
+  sheepwars:
+    # Nombre minimum de serveurs chauds (0 = scale-to-zero)
+    minReplicas: 1
+    # Nombre maximum k de serveurs SheepWars simultanés
+    maxReplicas: 5
+    # Serveurs en attente maintenus dès qu'il y a de la demande
+    standbyServers: 1
+    maxPlayers: 16
+    idleTtlSecs: 180
+    startingTimeoutSecs: 120
+    transferTimeoutSecs: 15
+    reconcileIntervalMs: 1000
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+lobby:
+  replicas: 1
+  rspigotImage:
+    repository: ferriscraft-rspigot
+    tag: ""
+  pluginImage:
+    repository: ferriscraft-lobby
+    tag: ""
+  port: 25565
+  grpcPort: 25580
+  maxPlayers: 100
+  ferriskey:
+    url: "https://auth.ferrislabs.fr"
+    realm: "capitainerie"
+    clientId: "minecraft"
+    scope: "openid profile email roles"
+  capitainerie:
+    url: ""
+    consoleUrl: ""
+    resource: ""
+    realm: ""
+    clientId: ""
+  resources:
+    rspigot:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+      limits:
+        cpu: "2"
+        memory: 2Gi
+    plugin:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+
+sheepwars:
+  rspigotImage:
+    repository: ferriscraft-rspigot
+    tag: ""
+  port: 25565
+  grpcPort: 25581
+  resources:
+    rspigot:
+      requests:
+        cpu: 500m
+        memory: 768Mi
+      limits:
+        cpu: "2"
+        memory: 1536Mi
+  # Conteneur plugin SheepWars (à activer par votre collègue une fois prêt)
+  pluginSidecar:
+    enabled: false
+    image: ghcr.io/ferrislabs/ferriscraft-sheepwars-plugin:latest
+    extraEnv: []
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+  nodeSelector: {}
+  tolerations: []

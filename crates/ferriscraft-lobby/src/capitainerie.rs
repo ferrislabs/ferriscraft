@@ -370,11 +370,7 @@ impl CapitainerieClient {
         Ok(Self::checked(resp).await?.json().await?)
     }
 
-    pub async fn card(
-        &self,
-        bearer: &str,
-        card_id: &str,
-    ) -> Result<CardDetail, CapitainerieError> {
+    pub async fn card(&self, bearer: &str, card_id: &str) -> Result<CardDetail, CapitainerieError> {
         let resp = self
             .http
             .get(self.url(&format!("/cards/{card_id}")))
@@ -776,7 +772,10 @@ pub fn format_dialog_lines(raw: &str, wrap_width: usize, max_lines: usize) -> Ve
             ("§e§l", "§e§l", h)
         } else if let Some(h) = trimmed.strip_prefix("# ") {
             ("§6§l", "§6§l", h)
-        } else if let Some(b) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+        } else if let Some(b) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
             ("§7• §f", "  §f", b)
         } else {
             ("§f", "§f", trimmed)
@@ -854,7 +853,10 @@ pub fn build_run_result_dialog(report: &TaskResultReport) -> Dialog {
         _ => format!("§c✖ {} — Échec", report.agent_name),
     };
     let mut dialog = Dialog::new(dialog_title)
-        .line(format!("§7Mission : §f{}", clip_text(&report.task_title, 72)))
+        .line(format!(
+            "§7Mission : §f{}",
+            clip_text(&report.task_title, 72)
+        ))
         .line("§8────────────────────────");
 
     for line in format_dialog_lines(&report.summary_text, 56, 20) {

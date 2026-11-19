@@ -6,6 +6,7 @@ pub mod config;
 pub mod hud;
 pub mod menus;
 pub mod npcs;
+pub mod orchestrator;
 pub mod plugin;
 pub mod prefs;
 

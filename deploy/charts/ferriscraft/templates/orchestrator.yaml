@@ -1,0 +1,117 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ferriscraft.fullname" . }}-orchestrator
+  labels:
+    {{- include "ferriscraft.labels" . | nindent 4 }}
+    app.kubernetes.io/component: orchestrator
+spec:
+  replicas: {{ .Values.orchestrator.replicas }}
+  selector:
+    matchLabels:
+      {{- include "ferriscraft.labels" . | nindent 6 }}
+      app.kubernetes.io/component: orchestrator
+  template:
+    metadata:
+      labels:
+        {{- include "ferriscraft.labels" . | nindent 8 }}
+        app.kubernetes.io/component: orchestrator
+    spec:
+      serviceAccountName: {{ include "ferriscraft.fullname" . }}-orchestrator
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: orchestrator
+          image: {{ include "ferriscraft.image" (dict "global" .Values.global "repository" .Values.orchestrator.image.repository "tag" .Values.orchestrator.image.tag) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.orchestrator.logLevel | quote }}
+            - name: ORCHESTRATOR_BIND
+              value: {{ printf "0.0.0.0:%d" (int .Values.orchestrator.port) | quote }}
+            - name: ORCHESTRATOR_BACKEND
+              value: "kubernetes"
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: ORCHESTRATOR_PUBLIC_URL
+              value: {{ printf "http://%s-orchestrator:%d" (include "ferriscraft.fullname" .) (int .Values.orchestrator.port) | quote }}
+            - name: LOBBY_SERVER_NAME
+              value: "lobby"
+            - name: QUEUE_MIN_PLAYERS
+              value: {{ .Values.orchestrator.queue.minPlayers | quote }}
+            - name: SHEEPWARS_MAX_PLAYERS
+              value: {{ .Values.orchestrator.sheepwars.maxPlayers | quote }}
+            - name: SHEEPWARS_MIN_REPLICAS
+              value: {{ .Values.orchestrator.sheepwars.minReplicas | quote }}
+            - name: SHEEPWARS_MAX_REPLICAS
+              value: {{ .Values.orchestrator.sheepwars.maxReplicas | quote }}
+            - name: SHEEPWARS_STANDBY_SERVERS
+              value: {{ .Values.orchestrator.sheepwars.standbyServers | quote }}
+            - name: SHEEPWARS_IDLE_TTL_SECS
+              value: {{ .Values.orchestrator.sheepwars.idleTtlSecs | quote }}
+            - name: SHEEPWARS_STARTING_TIMEOUT_SECS
+              value: {{ .Values.orchestrator.sheepwars.startingTimeoutSecs | quote }}
+            - name: TRANSFER_TIMEOUT_SECS
+              value: {{ .Values.orchestrator.sheepwars.transferTimeoutSecs | quote }}
+            - name: RECONCILE_INTERVAL_MS
+              value: {{ .Values.orchestrator.sheepwars.reconcileIntervalMs | quote }}
+            - name: SHEEPWARS_PORT
+              value: {{ .Values.sheepwars.port | quote }}
+            - name: SHEEPWARS_POD_TEMPLATE_PATH
+              value: "/etc/ferriscraft/template/pod-template.yaml"
+            {{- if (include "ferriscraft.orchestratorTokenSecretName" .) }}
+            - name: ORCHESTRATOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ferriscraft.orchestratorTokenSecretName" . }}
+                  key: token
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.orchestrator.port }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          {{- with .Values.orchestrator.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: pod-template
+              mountPath: /etc/ferriscraft/template
+              readOnly: true
+      volumes:
+        - name: pod-template
+          configMap:
+            name: {{ include "ferriscraft.fullname" . }}-sheepwars-template
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ferriscraft.fullname" . }}-orchestrator
+  labels:
+    {{- include "ferriscraft.labels" . | nindent 4 }}
+    app.kubernetes.io/component: orchestrator
+spec:
+  selector:
+    {{- include "ferriscraft.labels" . | nindent 4 }}
+    app.kubernetes.io/component: orchestrator
+  ports:
+    - name: http
+      port: {{ .Values.orchestrator.port }}
+      targetPort: http
+      protocol: TCP

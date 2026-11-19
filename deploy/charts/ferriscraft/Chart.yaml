@@ -1,0 +1,6 @@
+apiVersion: v2
+name: ferriscraft
+description: Réseau Minecraft FerrisCraft (Velocity, Lobby FerrisKey/Capitainerie, Orchestrateur & pool dynamique de k serveurs SheepWars)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

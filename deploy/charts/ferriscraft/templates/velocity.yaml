@@ -1,0 +1,98 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ferriscraft.fullname" . }}-velocity
+  labels:
+    {{- include "ferriscraft.labels" . | nindent 4 }}
+    app.kubernetes.io/component: velocity
+spec:
+  replicas: {{ .Values.velocity.replicas }}
+  selector:
+    matchLabels:
+      {{- include "ferriscraft.labels" . | nindent 6 }}
+      app.kubernetes.io/component: velocity
+  template:
+    metadata:
+      labels:
+        {{- include "ferriscraft.labels" . | nindent 8 }}
+        app.kubernetes.io/component: velocity
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: velocity
+          image: {{ include "ferriscraft.image" (dict "global" .Values.global "repository" .Values.velocity.image.repository "tag" .Values.velocity.image.tag) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          env:
+            - name: LOBBY_ADDRESS
+              value: {{ printf "%s-lobby:%d" (include "ferriscraft.fullname" .) (int .Values.lobby.port) | quote }}
+            - name: ORCHESTRATOR_URL
+              value: {{ printf "http://%s-orchestrator:%d" (include "ferriscraft.fullname" .) (int .Values.orchestrator.port) | quote }}
+            - name: VELOCITY_ONLINE_MODE
+              value: {{ .Values.velocity.onlineMode | quote }}
+            - name: SHOW_MAX_PLAYERS
+              value: {{ .Values.velocity.showMaxPlayers | quote }}
+            - name: VELOCITY_MOTD
+              value: {{ .Values.velocity.motd | quote }}
+            - name: JAVA_OPTS
+              value: {{ .Values.velocity.javaOpts | quote }}
+            {{- if (include "ferriscraft.orchestratorTokenSecretName" .) }}
+            - name: ORCHESTRATOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ferriscraft.orchestratorTokenSecretName" . }}
+                  key: token
+            {{- end }}
+          ports:
+            - name: minecraft
+              containerPort: 25565
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: minecraft
+            initialDelaySeconds: 4
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: minecraft
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          {{- with .Values.velocity.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: forwarding-secret
+              mountPath: /etc/ferriscraft/forwarding
+              readOnly: true
+      volumes:
+        - name: forwarding-secret
+          secret:
+            secretName: {{ include "ferriscraft.forwardingSecretName" . }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ferriscraft.fullname" . }}-velocity
+  labels:
+    {{- include "ferriscraft.labels" . | nindent 4 }}
+    app.kubernetes.io/component: velocity
+  {{- with .Values.velocity.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.velocity.service.type }}
+  selector:
+    {{- include "ferriscraft.labels" . | nindent 4 }}
+    app.kubernetes.io/component: velocity
+  ports:
+    - name: minecraft
+      port: {{ .Values.velocity.service.port }}
+      targetPort: minecraft
+      protocol: TCP
+      {{- if and (eq .Values.velocity.service.type "NodePort") .Values.velocity.service.nodePort }}
+      nodePort: {{ .Values.velocity.service.nodePort }}
+      {{- end }}

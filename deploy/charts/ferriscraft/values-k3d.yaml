@@ -1,0 +1,28 @@
+# Surcharges pour tests locaux sur k3d / Docker Desktop
+global:
+  imageTag: dev
+  imagePullPolicy: IfNotPresent
+
+velocity:
+  onlineMode: false
+  service:
+    type: LoadBalancer
+
+orchestrator:
+  queue:
+    minPlayers: 1
+  sheepwars:
+    minReplicas: 1
+    maxReplicas: 5
+    standbyServers: 1
+    idleTtlSecs: 60
+
+lobby:
+  ferriskey:
+    url: "http://host.k3d.internal:3333"
+    realm: "capitainerie"
+    clientId: "minecraft"
+  capitainerie:
+    url: "http://host.k3d.internal:4100"
+    consoleUrl: "http://host.k3d.internal:4080"
+    resource: "http://host.k3d.internal:4100"
