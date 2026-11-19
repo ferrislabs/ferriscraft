@@ -18,10 +18,11 @@ use crate::capitainerie::{
 };
 use crate::chat::ChatSystem;
 use crate::config::{ConfigError, EnvConfig, LayoutStore, WaypointPose};
+use crate::gadgets::{AuraTrail, GadgetManager, LobbyGadget};
 use crate::hud::{HubMetrics, HudManager, PlayerHudInput};
 use crate::menus::{
-    GamesMenuAction, MenuManager, OptionsMenuAction, apply_lobby_hotbar, decode_games_click,
-    decode_options_click,
+    GadgetsMenuAction, GamesMenuAction, MenuManager, OptionsMenuAction, apply_lobby_hotbar,
+    decode_gadgets_click, decode_games_click, decode_options_click,
 };
 use crate::npcs::{CaptainTurn, NpcClickTarget, NpcDirector};
 use crate::orchestrator::{OrchestratorClient, ToggleQueueOutcome};
@@ -52,6 +53,7 @@ struct SharedState {
     auth: Arc<AuthManager>,
     prefs: PrefsStore,
     menus: MenuManager,
+    gadgets: GadgetManager,
     hud: HudManager,
     chat: ChatSystem,
     npcs: Arc<NpcDirector>,
@@ -87,6 +89,7 @@ impl FerrisCraftLobby {
                 auth,
                 prefs: PrefsStore::default(),
                 menus: MenuManager::default(),
+                gadgets: GadgetManager::default(),
                 hud: HudManager::default(),
                 chat: ChatSystem::default(),
                 npcs,
@@ -132,6 +135,7 @@ impl FerrisCraftLobby {
         self.state
             .menus
             .refresh_open_options(player.uuid, &prefs, claims.as_ref());
+        self.state.menus.refresh_open_gadgets(player.uuid, &prefs);
 
         let (ping_ms, is_op) = match player.get_state().await {
             Ok(st) => (st.ping, st.op),
@@ -578,9 +582,281 @@ impl FerrisCraftLobby {
         });
     }
 
+    fn toggle_flight_for(&self, player: &Player) {
+        let updated = self
+            .state
+            .prefs
+            .update(player.uuid, |p| p.flight_enabled = !p.flight_enabled);
+        updated.apply_movement(player);
+        let claims = self.state.auth.claims_of(player.uuid);
+        self.state
+            .menus
+            .refresh_open_options(player.uuid, &updated, claims.as_ref());
+        self.state
+            .menus
+            .refresh_open_gadgets(player.uuid, &updated);
+
+        if updated.flight_enabled {
+            player.sound.play(
+                SoundCue::new(Sound::EntityBatTakeoff)
+                    .volume(0.75)
+                    .pitch(1.2),
+            );
+            player.world.particle.spawn(
+                ParticleBurst::new(Particle::Cloud, player.position)
+                    .count(12)
+                    .spread(Vector {
+                        x: 0.35,
+                        y: 0.25,
+                        z: 0.35,
+                    })
+                    .speed(0.05),
+            );
+            player
+                .action_bar
+                .send("§b✈ Vol dans le Lobby ACTIVÉ §7(Double-espace)");
+            player.message.send(
+                "§b✈ §aVol dans le Lobby activé ! Appuyez deux fois sur Espace pour décoller.",
+            );
+        } else {
+            player.sound.play(
+                SoundCue::new(Sound::UiButtonClick)
+                    .volume(0.7)
+                    .pitch(0.75),
+            );
+            player.action_bar.send("§7✈ Vol dans le Lobby DÉSACTIVÉ");
+            player.message.send("§7✈ Vol dans le Lobby désactivé.");
+        }
+    }
+
+    fn cycle_speed_for(&self, player: &Player) {
+        let updated = self
+            .state
+            .prefs
+            .update(player.uuid, |p| p.speed_tier = p.speed_tier.next());
+        updated.apply_movement(player);
+        let claims = self.state.auth.claims_of(player.uuid);
+        self.state
+            .menus
+            .refresh_open_options(player.uuid, &updated, claims.as_ref());
+        self.state
+            .menus
+            .refresh_open_gadgets(player.uuid, &updated);
+
+        player.sound.play(
+            SoundCue::new(Sound::EntityExperienceOrbPickup)
+                .volume(0.75)
+                .pitch(1.25),
+        );
+        player
+            .action_bar
+            .send(format!("§e⚡ Vitesse : {}", updated.speed_tier.label()));
+        player
+            .message
+            .send(format!("§e⚡ Vitesse réglée sur : {}", updated.speed_tier.label()));
+    }
+
+    fn cycle_trail_for(&self, player: &Player) {
+        let updated = self
+            .state
+            .prefs
+            .update(player.uuid, |p| p.aura_trail = p.aura_trail.next());
+        self.state
+            .menus
+            .refresh_open_gadgets(player.uuid, &updated);
+        player.sound.play(
+            SoundCue::new(Sound::EntityExperienceOrbPickup)
+                .volume(0.75)
+                .pitch(1.35),
+        );
+        if let Some(particle) = updated.aura_trail.particle() {
+            player.world.particle.spawn(
+                ParticleBurst::new(particle, player.position)
+                    .count(10)
+                    .spread(Vector {
+                        x: 0.35,
+                        y: 0.4,
+                        z: 0.35,
+                    })
+                    .speed(0.03),
+            );
+        }
+        player
+            .action_bar
+            .send(format!("§d✦ Traînée : {}", updated.aura_trail.label()));
+    }
+
+    fn equip_gadget_for(&self, player: &Player, gadget: Option<LobbyGadget>) {
+        let updated = self
+            .state
+            .prefs
+            .update(player.uuid, |p| p.equipped_gadget = gadget);
+        let claims = self.state.auth.claims_of(player.uuid);
+        apply_lobby_hotbar(player, claims.as_ref(), &updated);
+        self.state
+            .menus
+            .refresh_open_gadgets(player.uuid, &updated);
+
+        player.sound.play(
+            SoundCue::new(Sound::EntityItemPickup)
+                .volume(0.75)
+                .pitch(1.2),
+        );
+        match gadget {
+            Some(g) => {
+                player.action_bar.send(format!(
+                    "{} §aéquipé ! §7(Slot 7 · Clic droit)",
+                    g.title()
+                ));
+                player.message.send(format!(
+                    "§b✦ Gadget équipé : {} §7— clic droit en main (slot 7) pour l'utiliser !",
+                    g.title()
+                ));
+            }
+            None => {
+                player.action_bar.send("§7Gadget retiré de votre barre.");
+            }
+        }
+    }
+
+    fn open_gadgets_menu_for(&self, player: Player) {
+        let lobby = self.clone();
+        tokio::spawn(async move {
+            let cur_prefs = lobby.state.prefs.get(player.uuid);
+            let _ = lobby
+                .state
+                .menus
+                .open_gadgets(&player.server(), &player, &cur_prefs)
+                .await;
+        });
+    }
+
+    fn handle_menu_click(
+        &self,
+        player: Player,
+        clicked_inv: Option<&InventoryRef>,
+        slot: i32,
+    ) {
+        if self.state.menus.is_games_inventory(clicked_inv) {
+            if let Some(action) = decode_games_click(slot) {
+                player
+                    .sound
+                    .play(SoundCue::new(Sound::UiButtonClick).volume(0.7));
+                match action {
+                    GamesMenuAction::JoinSheepWars => self.join_sheepwars(player),
+                    GamesMenuAction::ComingSoon(game) => {
+                        player.inventory.close();
+                        player.message.send(format!(
+                            "§6§lFerrisCraft §8» §e{game} §7arrive très prochainement sur le réseau !"
+                        ));
+                    }
+                    GamesMenuAction::OpenGadgets => self.open_gadgets_menu_for(player),
+                    GamesMenuAction::TeleportPoi(poi) => self.teleport_to_poi(player, poi),
+                    GamesMenuAction::OpenOptions => {
+                        let lobby = self.clone();
+                        tokio::spawn(async move {
+                            let claims = lobby.state.auth.claims_of(player.uuid);
+                            let cur = lobby.state.prefs.get(player.uuid);
+                            let _ = lobby
+                                .state
+                                .menus
+                                .open_options(&player.server(), &player, &cur, claims.as_ref())
+                                .await;
+                        });
+                    }
+                }
+            }
+            return;
+        }
+
+        if self
+            .state
+            .menus
+            .is_player_options_inventory(player.uuid, clicked_inv)
+        {
+            if let Some(action) = decode_options_click(slot) {
+                player
+                    .sound
+                    .play(SoundCue::new(Sound::UiButtonClick).volume(0.7));
+                match action {
+                    OptionsMenuAction::ToggleVisibility => self.toggle_visibility(player),
+                    OptionsMenuAction::ToggleFlight => self.toggle_flight_for(&player),
+                    OptionsMenuAction::CycleSpeed => self.cycle_speed_for(&player),
+                    OptionsMenuAction::ToggleChatSounds => {
+                        let updated = self
+                            .state
+                            .prefs
+                            .update(player.uuid, |p| p.chat_sounds = !p.chat_sounds);
+                        let claims = self.state.auth.claims_of(player.uuid);
+                        self.state.menus.refresh_open_options(
+                            player.uuid,
+                            &updated,
+                            claims.as_ref(),
+                        );
+                        player.action_bar.send(if updated.chat_sounds {
+                            "§a🔔 Sons & Mentions tchat activés"
+                        } else {
+                            "§7🔕 Sons & Mentions tchat coupés"
+                        });
+                    }
+                    OptionsMenuAction::FerrisKeyAction => {
+                        player.inventory.close();
+                        if self.state.auth.is_authenticated(player.uuid) {
+                            self.state.auth.logout(player.uuid);
+                            player
+                                .message
+                                .send("§eVotre compte FerrisKey a été délié de cette session.");
+                            let lobby = self.clone();
+                            tokio::spawn(async move {
+                                lobby.refresh_single_player_ui(&player).await;
+                            });
+                        } else {
+                            self.start_ferriskey_login(player);
+                        }
+                    }
+                    OptionsMenuAction::BackToGames => {
+                        let lobby = self.clone();
+                        tokio::spawn(async move {
+                            let _ = lobby.state.menus.open_games(&player).await;
+                        });
+                    }
+                }
+            }
+            return;
+        }
+
+        if self
+            .state
+            .menus
+            .is_player_gadgets_inventory(player.uuid, clicked_inv)
+            && let Some(action) = decode_gadgets_click(slot)
+        {
+            player
+                .sound
+                .play(SoundCue::new(Sound::UiButtonClick).volume(0.7));
+            match action {
+                GadgetsMenuAction::Equip(gadget) => {
+                    self.equip_gadget_for(&player, Some(gadget));
+                }
+                GadgetsMenuAction::UnequipGadget => {
+                    self.equip_gadget_for(&player, None);
+                }
+                GadgetsMenuAction::ToggleFlight => self.toggle_flight_for(&player),
+                GadgetsMenuAction::CycleTrail => self.cycle_trail_for(&player),
+                GadgetsMenuAction::CycleSpeed => self.cycle_speed_for(&player),
+                GadgetsMenuAction::BackToGames => {
+                    let lobby = self.clone();
+                    tokio::spawn(async move {
+                        let _ = lobby.state.menus.open_games(&player).await;
+                    });
+                }
+            }
+        }
+    }
+
     fn show_whoami(&self, player: &Player) {
-        let mut msg = RichMessage::new()
-            .text("§8§m                                                  \n");
+        let mut msg =
+            RichMessage::new().text("§8§m                                                  \n");
         match self.state.auth.claims_of(player.uuid) {
             Some(claims) => {
                 let has_admin = player.permissions.has("ferriscraft.admin");
@@ -605,13 +881,11 @@ impl FerrisCraftLobby {
                     );
             }
             None => {
-                msg = msg
-                    .text("§eAucun compte FerrisKey Lobby n'est lié. ")
-                    .part(
-                        Part::new("§a§l[Se connecter]")
-                            .hover("§7Lancer la connexion FerrisKey (/login)")
-                            .click(Click::RunCommand("/login".to_owned())),
-                    );
+                msg = msg.text("§eAucun compte FerrisKey Lobby n'est lié. ").part(
+                    Part::new("§a§l[Se connecter]")
+                        .hover("§7Lancer la connexion FerrisKey (/login)")
+                        .click(Click::RunCommand("/login".to_owned())),
+                );
             }
         }
 
@@ -620,22 +894,18 @@ impl FerrisCraftLobby {
             msg = msg.text(format!("\n§7Capitainerie (realm §b{realm}§7) : "));
             match self.state.auth.capitainerie_claims_of(player.uuid) {
                 Some(cap_claims) => {
-                    msg = msg
-                        .text(format!("§a✔ {} ", cap_claims.username))
-                        .part(
-                            Part::new("§c[Délier]")
-                                .hover("§7Cliquez pour exécuter /caplogout")
-                                .click(Click::RunCommand("/caplogout".to_owned())),
-                        );
+                    msg = msg.text(format!("§a✔ {} ", cap_claims.username)).part(
+                        Part::new("§c[Délier]")
+                            .hover("§7Cliquez pour exécuter /caplogout")
+                            .click(Click::RunCommand("/caplogout".to_owned())),
+                    );
                 }
                 None => {
-                    msg = msg
-                        .text("§eNon lié ")
-                        .part(
-                            Part::new("§b[/caplogin]")
-                                .hover("§7Connecter votre compte Capitainerie")
-                                .click(Click::RunCommand("/caplogin".to_owned())),
-                        );
+                    msg = msg.text("§eNon lié ").part(
+                        Part::new("§b[/caplogin]")
+                            .hover("§7Connecter votre compte Capitainerie")
+                            .click(Click::RunCommand("/caplogin".to_owned())),
+                    );
                 }
             }
         }
@@ -716,11 +986,7 @@ impl FerrisCraftLobby {
                     _ => {}
                 }
 
-                let Ok(bearer) = lobby
-                    .state
-                    .auth
-                    .valid_capitainerie_token(player.uuid)
-                    .await
+                let Ok(bearer) = lobby.state.auth.valid_capitainerie_token(player.uuid).await
                 else {
                     break;
                 };
@@ -928,10 +1194,8 @@ impl FerrisCraftLobby {
                                 .subtitle(format!("§f{clipped_title}"))
                                 .times(10, 60, 20),
                         );
-                        p.action_bar.send(format!(
-                            "§a✔ {} a terminé : §f{clipped_title}",
-                            agent.name
-                        ));
+                        p.action_bar
+                            .send(format!("§a✔ {} a terminé : §f{clipped_title}", agent.name));
                     } else if detail.status == "cancelled" {
                         p.sound.play(
                             SoundCue::new(Sound::EntityVillagerNo)
@@ -943,10 +1207,8 @@ impl FerrisCraftLobby {
                                 .subtitle(format!("§f{clipped_title}"))
                                 .times(10, 50, 20),
                         );
-                        p.action_bar.send(format!(
-                            "§e⚠ {} — mission annulée",
-                            agent.name
-                        ));
+                        p.action_bar
+                            .send(format!("§e⚠ {} — mission annulée", agent.name));
                     } else {
                         p.sound.play(
                             SoundCue::new(Sound::EntityVillagerNo)
@@ -958,10 +1220,8 @@ impl FerrisCraftLobby {
                                 .subtitle(format!("§f{clipped_title}"))
                                 .times(10, 60, 20),
                         );
-                        p.action_bar.send(format!(
-                            "§c✖ {} — mission échouée",
-                            agent.name
-                        ));
+                        p.action_bar
+                            .send(format!("§c✖ {} — mission échouée", agent.name));
                     }
                     p.message
                         .send_rich(build_run_completion_message(&report, &click_key));
@@ -1165,6 +1425,8 @@ impl FerrisCraftLobby {
         let player = event.player();
         self.state.auth.cancel_pending(player.uuid);
         self.state.menus.discard_options(player.uuid);
+        self.state.menus.discard_gadgets(player.uuid);
+        self.state.gadgets.clear_player(player.uuid);
         self.state.hud.detach_player(player.uuid, &player.name);
         self.state.npcs.leave_captain_chat(player.uuid);
         self.state.chat.clear_player(player.uuid);
@@ -1235,6 +1497,12 @@ impl FerrisCraftLobby {
             Material::Emerald if !prefs.build_mode => {
                 self.show_whoami(&player);
             }
+            Material::Chest if !prefs.build_mode => {
+                player
+                    .sound
+                    .play(SoundCue::new(Sound::UiButtonClick).volume(0.7));
+                self.open_gadgets_menu_for(player);
+            }
             Material::LimeDye | Material::GrayDye if !prefs.build_mode => {
                 self.toggle_visibility(player);
             }
@@ -1253,122 +1521,29 @@ impl FerrisCraftLobby {
                         .await;
                 });
             }
+            other if !prefs.build_mode => {
+                if let Some(gadget) = LobbyGadget::from_material(&other)
+                    && prefs.equipped_gadget == Some(gadget)
+                {
+                    self.state.gadgets.activate(player, gadget);
+                }
+            }
             _ => {}
         }
     }
 
+    // Locked custom menus (Games, Options, Gadgets) are refused by rspigot and dispatched
+    // only to Observe (`&InventoryClick`) handlers in Phase::Settled.
+    async fn on_menu_click(&self, event: &InventoryClick) {
+        self.handle_menu_click(
+            event.player().clone(),
+            event.clicked_inventory(),
+            event.slot(),
+        );
+    }
+
     async fn on_inventory_click(&self, event: &mut InventoryClick) {
-        let player = event.player().clone();
-        let clicked_inv = event.clicked_inventory();
-
-        if self.state.menus.is_games_inventory(clicked_inv) {
-            event.cancel();
-            if let Some(action) = decode_games_click(event.slot()) {
-                player
-                    .sound
-                    .play(SoundCue::new(Sound::UiButtonClick).volume(0.7));
-                match action {
-                    GamesMenuAction::JoinSheepWars => self.join_sheepwars(player),
-                    GamesMenuAction::ComingSoon(game) => {
-                        player.inventory.close();
-                        player.message.send(format!(
-                            "§6§lFerrisCraft §8» §e{game} §7arrive très prochainement sur le réseau !"
-                        ));
-                    }
-                    GamesMenuAction::TeleportPoi(poi) => self.teleport_to_poi(player, poi),
-                    GamesMenuAction::OpenOptions => {
-                        let lobby = self.clone();
-                        tokio::spawn(async move {
-                            let claims = lobby.state.auth.claims_of(player.uuid);
-                            let cur = lobby.state.prefs.get(player.uuid);
-                            let _ = lobby
-                                .state
-                                .menus
-                                .open_options(&player.server(), &player, &cur, claims.as_ref())
-                                .await;
-                        });
-                    }
-                }
-            }
-            return;
-        }
-
-        if self
-            .state
-            .menus
-            .is_player_options_inventory(player.uuid, clicked_inv)
-        {
-            event.cancel();
-            if let Some(action) = decode_options_click(event.slot()) {
-                player
-                    .sound
-                    .play(SoundCue::new(Sound::UiButtonClick).volume(0.7));
-                match action {
-                    OptionsMenuAction::ToggleVisibility => self.toggle_visibility(player),
-                    OptionsMenuAction::ToggleFlight => {
-                        let updated = self
-                            .state
-                            .prefs
-                            .update(player.uuid, |p| p.flight_enabled = !p.flight_enabled);
-                        updated.apply_movement(&player);
-                        let claims = self.state.auth.claims_of(player.uuid);
-                        self.state.menus.refresh_open_options(
-                            player.uuid,
-                            &updated,
-                            claims.as_ref(),
-                        );
-                    }
-                    OptionsMenuAction::CycleSpeed => {
-                        let updated = self
-                            .state
-                            .prefs
-                            .update(player.uuid, |p| p.speed_tier = p.speed_tier.next());
-                        updated.apply_movement(&player);
-                        let claims = self.state.auth.claims_of(player.uuid);
-                        self.state.menus.refresh_open_options(
-                            player.uuid,
-                            &updated,
-                            claims.as_ref(),
-                        );
-                    }
-                    OptionsMenuAction::ToggleChatSounds => {
-                        let updated = self
-                            .state
-                            .prefs
-                            .update(player.uuid, |p| p.chat_sounds = !p.chat_sounds);
-                        let claims = self.state.auth.claims_of(player.uuid);
-                        self.state.menus.refresh_open_options(
-                            player.uuid,
-                            &updated,
-                            claims.as_ref(),
-                        );
-                    }
-                    OptionsMenuAction::FerrisKeyAction => {
-                        player.inventory.close();
-                        if self.state.auth.is_authenticated(player.uuid) {
-                            self.state.auth.logout(player.uuid);
-                            player
-                                .message
-                                .send("§eVotre compte FerrisKey a été délié de cette session.");
-                            let lobby = self.clone();
-                            tokio::spawn(async move {
-                                lobby.refresh_single_player_ui(&player).await;
-                            });
-                        } else {
-                            self.start_ferriskey_login(player);
-                        }
-                    }
-                    OptionsMenuAction::BackToGames => {
-                        let lobby = self.clone();
-                        tokio::spawn(async move {
-                            let _ = lobby.state.menus.open_games(&player).await;
-                        });
-                    }
-                }
-            }
-            return;
-        }
-
+        let player = event.player();
         // Prevent moving hotbar items if top view is a custom menu or player is not in build mode
         let top_is_custom = event.inventory().custom().is_some();
         if top_is_custom || !self.state.prefs.get(player.uuid).build_mode {
@@ -1749,6 +1924,13 @@ impl FerrisCraftLobby {
             return;
         }
 
+        let prefs = self.state.prefs.get(event.player().uuid);
+        if prefs.aura_trail != AuraTrail::None {
+            self.state
+                .gadgets
+                .emit_trail_if_due(event.player(), prefs.aura_trail);
+        }
+
         // Stepping into the Giant Purple Portal triggers SheepWars!
         if let Some(portal) = layout.pois.get("portal") {
             let portal_plane = portal.project_forward(2.5);
@@ -1803,6 +1985,33 @@ impl FerrisCraftLobby {
         {
             ctx.reply(format!("§cImpossible d'ouvrir vos options : {err}"));
         }
+    }
+
+    #[command("gadgets")]
+    async fn cmd_gadgets(&self, ctx: Context) {
+        let player = ctx.sender().clone();
+        player
+            .sound
+            .play(SoundCue::new(Sound::UiButtonClick).volume(0.7));
+        let prefs = self.state.prefs.get(player.uuid);
+        if let Err(err) = self
+            .state
+            .menus
+            .open_gadgets(&player.server(), &player, &prefs)
+            .await
+        {
+            ctx.reply(format!("§cImpossible d'ouvrir les gadgets : {err}"));
+        }
+    }
+
+    #[command("fly")]
+    async fn cmd_fly(&self, ctx: Context) {
+        self.toggle_flight_for(ctx.sender());
+    }
+
+    #[command("speed")]
+    async fn cmd_speed(&self, ctx: Context) {
+        self.cycle_speed_for(ctx.sender());
     }
 
     #[command("spawn")]
@@ -1944,6 +2153,7 @@ impl FerrisCraftLobby {
             ctx.reply("§a🛠 Mode construction du Lobby ACTIVÉ.");
         } else {
             player.game_mode.set(GameMode::Adventure);
+            updated.apply_movement(player);
             let claims = self.state.auth.claims_of(player.uuid);
             apply_lobby_hotbar(player, claims.as_ref(), &updated);
             ctx.reply("§e🛠 Mode construction du Lobby DÉSACTIVÉ.");

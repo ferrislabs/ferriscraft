@@ -3,6 +3,8 @@ use std::sync::RwLock;
 
 use rspigot_plugin::{Player, Uuid};
 
+use crate::gadgets::{AuraTrail, LobbyGadget};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpeedTier {
     Normal,
@@ -16,6 +18,14 @@ impl SpeedTier {
             Self::Normal => 0.2,
             Self::Fast => 0.28,
             Self::Sprint => 0.36,
+        }
+    }
+
+    pub const fn fly_speed(self) -> f32 {
+        match self {
+            Self::Normal => 0.10,
+            Self::Fast => 0.14,
+            Self::Sprint => 0.18,
         }
     }
 
@@ -43,6 +53,8 @@ pub struct PlayerPrefs {
     pub speed_tier: SpeedTier,
     pub chat_sounds: bool,
     pub build_mode: bool,
+    pub equipped_gadget: Option<LobbyGadget>,
+    pub aura_trail: AuraTrail,
 }
 
 impl Default for PlayerPrefs {
@@ -53,6 +65,8 @@ impl Default for PlayerPrefs {
             speed_tier: SpeedTier::Normal,
             chat_sounds: true,
             build_mode: false,
+            equipped_gadget: Some(LobbyGadget::FeatherDash),
+            aura_trail: AuraTrail::None,
         }
     }
 }
@@ -63,7 +77,7 @@ impl PlayerPrefs {
         if !self.flight_enabled {
             player.abilities.set_flying(false);
         }
-        player.abilities.set_fly_speed(0.08);
+        player.abilities.set_fly_speed(self.speed_tier.fly_speed());
         player
             .abilities
             .set_walk_speed(self.speed_tier.walk_speed());

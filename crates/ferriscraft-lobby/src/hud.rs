@@ -87,7 +87,7 @@ pub fn build_tab_list(input: &PlayerHudInput) -> TabList {
         input.metrics.online, input.metrics.max_players
     );
     let footer = format!(
-        "\n§7Grade : {} §8• §7Compte : {fk_status}\n§7Ping : §a{ping} ms §8• §7TPS : §a{tps:.1} §8• §7SheepWars : §d{} prêt(s)\n§6/menu §8• §d/sheepwars §8• §e/options §8• §b/login\n",
+        "\n§7Grade : {} §8• §7Compte : {fk_status}\n§7Ping : §a{ping} ms §8• §7TPS : §a{tps:.1} §8• §7SheepWars : §d{} prêt(s)\n§6/menu §8• §d/sheepwars §8• §b/gadgets §8• §b/fly §8• §e/options\n",
         input.rank.sidebar_label(),
         input.metrics.sheepwars_queued
     );
