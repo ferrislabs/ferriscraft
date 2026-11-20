@@ -15,18 +15,50 @@ if [[ ! -d "${RSPIGOT_DIR}" ]]; then
   exit 1
 fi
 
-build_image() {
-  local name="$1"
-  local dockerfile="$2"
-  shift 2
-  local ref="${REGISTRY}/${name}:${TAG}"
-  echo "=== Construction de ${ref} ==="
-  docker build \
-    -f "${ROOT_DIR}/deploy/docker/${dockerfile}" \
-    -t "${ref}" \
-    "$@" \
-    "${ROOT_DIR}"
+TARGETS=("$@")
+if [[ ${#TARGETS[@]} -eq 0 ]]; then
+  TARGETS=("default")
+fi
 
+target_image_name() {
+  case "$1" in
+    orchestrator) echo "ferriscraft-orchestrator" ;;
+    velocity) echo "ferriscraft-velocity" ;;
+    rspigot) echo "ferriscraft-rspigot" ;;
+    lobby) echo "ferriscraft-lobby" ;;
+    sheepwars) echo "ferriscraft-sheepwars-plugin" ;;
+    *)
+      echo "Cible inconnue : $1 (attendu : orchestrator | velocity | rspigot | lobby | sheepwars)" >&2
+      exit 1
+      ;;
+  esac
+}
+
+if [[ "${TARGETS[0]}" == "default" ]]; then
+  IMAGE_NAMES=("ferriscraft-orchestrator" "ferriscraft-velocity" "ferriscraft-rspigot" "ferriscraft-lobby" "ferriscraft-sheepwars-plugin")
+else
+  IMAGE_NAMES=()
+  for t in "${TARGETS[@]}"; do
+    IMAGE_NAMES+=("$(target_image_name "${t}")")
+  done
+fi
+
+echo "=== BuildKit Bake (${REGISTRY}/*:${TAG}) : ${TARGETS[*]} ==="
+(
+  cd "${ROOT_DIR}"
+  DOCKER_BUILDKIT=1 \
+  IMAGE_REGISTRY="${REGISTRY}" \
+  IMAGE_TAG="${TAG}" \
+  RSPIGOT_DIR="${RSPIGOT_DIR}" \
+    docker buildx bake \
+      -f "${ROOT_DIR}/docker-bake.hcl" \
+      --allow="fs.read=${RSPIGOT_DIR}" \
+      --load \
+      "${TARGETS[@]}"
+)
+
+for name in "${IMAGE_NAMES[@]}"; do
+  ref="${REGISTRY}/${name}:${TAG}"
   if [[ -n "${K3D_CLUSTER}" ]]; then
     echo "=== Import dans k3d (${K3D_CLUSTER}) : ${ref} ==="
     k3d image import -c "${K3D_CLUSTER}" "${ref}"
@@ -36,12 +68,6 @@ build_image() {
     echo "=== Push : ${ref} ==="
     docker push "${ref}"
   fi
-}
-
-build_image "ferriscraft-orchestrator" "Dockerfile.orchestrator"
-build_image "ferriscraft-velocity" "Dockerfile.velocity"
-build_image "ferriscraft-rspigot" "Dockerfile.rspigot" --build-context "rspigot=${RSPIGOT_DIR}"
-build_image "ferriscraft-lobby" "Dockerfile.lobby" --build-context "rspigot=${RSPIGOT_DIR}"
-build_image "ferriscraft-sheepwars-plugin" "Dockerfile.sheepwars" --build-context "rspigot=${RSPIGOT_DIR}"
+done
 
 echo "Images prêtes (${REGISTRY}/ferriscraft-*:${TAG})."

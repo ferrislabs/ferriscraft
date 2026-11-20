@@ -1,0 +1,42 @@
+# docker
+.dockerignore
+Dockerfile
+docker-bake.hcl
+
+# git & github
+/.git
+.gitignore
+/.github
+
+# rust build artifacts
+target
+**/target
+
+# docs & env
+/docs
+*.md
+LICENSE
+.env
+.env.*
+
+# helm & scripts
+/deploy/charts
+/deploy/scripts
+
+# unpacked/local minecraft runtime state
+/server/world
+/server/logs
+/server/spigot.yml
+/server/plugins.yml
+/server/*.json
+/server-sheepwars/world
+/server-sheepwars/logs
+/server-sheepwars/spigot.yml
+/server-sheepwars/plugins.yml
+/server-sheepwars/banned-ips.json
+/server-sheepwars/banned-players.json
+/server-sheepwars/ops.json
+/server-sheepwars/whitelist.json
+
+# java build artifacts
+/proxy/velocity-plugin/target

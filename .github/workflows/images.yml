@@ -3,7 +3,26 @@ name: Build & Publish Images
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/images.yml
+      - .dockerignore
+      - Dockerfile
+      - docker-bake.hcl
+      - Cargo.toml
+      - Cargo.lock
+      - crates/**
+      - proxy/**
+      - deploy/docker/**
+      - server/**
+      - server-sheepwars/**
+      - lobby.json
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   REGISTRY: ghcr.io
@@ -32,64 +51,45 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build & Push ferriscraft-orchestrator
-        uses: docker/build-push-action@v6
+      - name: Build Images (PR validation with read-only cache)
+        if: github.event_name == 'pull_request'
+        uses: docker/bake-action@v6
         with:
-          context: ferriscraft
-          file: ferriscraft/deploy/docker/Dockerfile.orchestrator
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.OWNER }}/ferriscraft-orchestrator:latest
-            ${{ env.REGISTRY }}/${{ env.OWNER }}/ferriscraft-orchestrator:${{ github.sha }}
+          workdir: ferriscraft
+          source: .
+          files: docker-bake.hcl
+          allow: |
+            fs.read=${{ github.workspace }}/rspigot
+          push: false
+          set: |
+            *.cache-from=type=gha,scope=ferriscraft-${{ runner.arch }}
+        env:
+          IMAGE_REGISTRY: ${{ env.REGISTRY }}/${{ env.OWNER }}
+          IMAGE_TAG: pr-${{ github.event.pull_request.number }}
+          RSPIGOT_DIR: ${{ github.workspace }}/rspigot
 
-      - name: Build & Push ferriscraft-velocity
-        uses: docker/build-push-action@v6
+      - name: Build & Push Images (BuildKit Bake)
+        if: github.event_name != 'pull_request'
+        uses: docker/bake-action@v6
         with:
-          context: ferriscraft
-          file: ferriscraft/deploy/docker/Dockerfile.velocity
+          workdir: ferriscraft
+          source: .
+          files: docker-bake.hcl
+          allow: |
+            fs.read=${{ github.workspace }}/rspigot
           push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.OWNER }}/ferriscraft-velocity:latest
-            ${{ env.REGISTRY }}/${{ env.OWNER }}/ferriscraft-velocity:${{ github.sha }}
-
-      - name: Build & Push ferriscraft-rspigot
-        uses: docker/build-push-action@v6
-        with:
-          context: ferriscraft
-          file: ferriscraft/deploy/docker/Dockerfile.rspigot
-          build-contexts: |
-            rspigot=rspigot
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.OWNER }}/ferriscraft-rspigot:latest
-            ${{ env.REGISTRY }}/${{ env.OWNER }}/ferriscraft-rspigot:${{ github.sha }}
-
-      - name: Build & Push ferriscraft-lobby
-        uses: docker/build-push-action@v6
-        with:
-          context: ferriscraft
-          file: ferriscraft/deploy/docker/Dockerfile.lobby
-          build-contexts: |
-            rspigot=rspigot
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.OWNER }}/ferriscraft-lobby:latest
-            ${{ env.REGISTRY }}/${{ env.OWNER }}/ferriscraft-lobby:${{ github.sha }}
-
-      - name: Build & Push ferriscraft-sheepwars-plugin
-        uses: docker/build-push-action@v6
-        with:
-          context: ferriscraft
-          file: ferriscraft/deploy/docker/Dockerfile.sheepwars
-          build-contexts: |
-            rspigot=rspigot
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.OWNER }}/ferriscraft-sheepwars-plugin:latest
-            ${{ env.REGISTRY }}/${{ env.OWNER }}/ferriscraft-sheepwars-plugin:${{ github.sha }}
+          set: |
+            *.cache-from=type=gha,scope=ferriscraft-${{ runner.arch }}
+            *.cache-to=type=gha,mode=max,scope=ferriscraft-${{ runner.arch }}
+        env:
+          IMAGE_REGISTRY: ${{ env.REGISTRY }}/${{ env.OWNER }}
+          IMAGE_TAG: latest
+          EXTRA_TAG: ${{ github.sha }}
+          RSPIGOT_DIR: ${{ github.workspace }}/rspigot
