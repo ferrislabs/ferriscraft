@@ -131,20 +131,22 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN cargo chef prepare --recipe-path recipe.json
 
-FROM chef AS plugins-builder
+FROM chef AS plugins-cook
 
 COPY --exclude=target --exclude=.git --exclude=rust-toolchain.toml --from=rspigot-src . /opt/minecraft/dev/rspigot
 WORKDIR /opt/ferrislabs/ferriscraft
 COPY --from=plugins-planner /opt/ferrislabs/ferriscraft/recipe.json recipe.json
 RUN --mount=type=cache,id=ferriscraft-cargo-registry-plugins,sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=ferriscraft-cargo-git-plugins,sharing=locked,target=/usr/local/cargo/git \
-    cargo chef cook --release --recipe-path recipe.json
+    cargo chef cook --release --bin ferriscraft-lobby --recipe-path recipe.json
+
+FROM plugins-cook AS plugins-builder
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN --mount=type=cache,id=ferriscraft-cargo-registry-plugins,sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=ferriscraft-cargo-git-plugins,sharing=locked,target=/usr/local/cargo/git \
-    cargo build --release --bin ferriscraft-lobby --bin ferriscraft-sheepwars
+    cargo build --release --bin ferriscraft-lobby
 
 FROM distroless-runtime AS lobby
 
@@ -152,9 +154,26 @@ COPY --from=plugins-builder /opt/ferrislabs/ferriscraft/target/release/ferriscra
 COPY --chown=65532:65532 lobby.json /app/lobby.json
 ENTRYPOINT ["/usr/local/bin/ferriscraft-lobby"]
 
+FROM chef AS sheepwars-cook
+
+COPY --exclude=target --exclude=.git --exclude=rust-toolchain.toml --from=rspigot-src . /opt/minecraft/dev/rspigot
+WORKDIR /opt/ferrislabs/ferriscraft
+COPY --from=plugins-planner /opt/ferrislabs/ferriscraft/recipe.json recipe.json
+RUN --mount=type=cache,id=ferriscraft-cargo-registry-plugins,sharing=locked,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=ferriscraft-cargo-git-plugins,sharing=locked,target=/usr/local/cargo/git \
+    cargo chef cook --release --bin ferriscraft-sheepwars --recipe-path recipe.json
+
+FROM sheepwars-cook AS sheepwars-builder
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN --mount=type=cache,id=ferriscraft-cargo-registry-plugins,sharing=locked,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=ferriscraft-cargo-git-plugins,sharing=locked,target=/usr/local/cargo/git \
+    cargo build --release --bin ferriscraft-sheepwars
+
 FROM distroless-runtime AS sheepwars
 
-COPY --from=plugins-builder /opt/ferrislabs/ferriscraft/target/release/ferriscraft-sheepwars /usr/local/bin/ferriscraft-sheepwars
+COPY --from=sheepwars-builder /opt/ferrislabs/ferriscraft/target/release/ferriscraft-sheepwars /usr/local/bin/ferriscraft-sheepwars
 ENTRYPOINT ["/usr/local/bin/ferriscraft-sheepwars"]
 
 # ==============================================================================

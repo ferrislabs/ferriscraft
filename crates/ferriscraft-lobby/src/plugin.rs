@@ -1963,7 +1963,7 @@ impl FerrisCraftLobby {
 
     #[command("menu")]
     async fn cmd_menu(&self, ctx: Context) {
-        let player = ctx.sender().clone();
+        let player = ctx.sender.clone();
         player
             .sound
             .play(SoundCue::new(Sound::UiButtonClick).volume(0.7));
@@ -1974,7 +1974,7 @@ impl FerrisCraftLobby {
 
     #[command("options")]
     async fn cmd_options(&self, ctx: Context) {
-        let player = ctx.sender().clone();
+        let player = ctx.sender.clone();
         let claims = self.state.auth.claims_of(player.uuid);
         let prefs = self.state.prefs.get(player.uuid);
         if let Err(err) = self
@@ -1989,7 +1989,7 @@ impl FerrisCraftLobby {
 
     #[command("gadgets")]
     async fn cmd_gadgets(&self, ctx: Context) {
-        let player = ctx.sender().clone();
+        let player = ctx.sender.clone();
         player
             .sound
             .play(SoundCue::new(Sound::UiButtonClick).volume(0.7));
@@ -2006,27 +2006,27 @@ impl FerrisCraftLobby {
 
     #[command("fly")]
     async fn cmd_fly(&self, ctx: Context) {
-        self.toggle_flight_for(ctx.sender());
+        self.toggle_flight_for(&ctx.sender);
     }
 
     #[command("speed")]
     async fn cmd_speed(&self, ctx: Context) {
-        self.cycle_speed_for(ctx.sender());
+        self.cycle_speed_for(&ctx.sender);
     }
 
     #[command("spawn")]
     async fn cmd_spawn(&self, ctx: Context) {
-        self.teleport_to_poi(ctx.sender().clone(), "spawn");
+        self.teleport_to_poi(ctx.sender.clone(), "spawn");
     }
 
     #[command("sheepwars")]
     async fn cmd_sheepwars(&self, ctx: Context) {
-        self.join_sheepwars(ctx.sender().clone());
+        self.join_sheepwars(ctx.sender.clone());
     }
 
     #[command("login")]
     async fn cmd_login(&self, ctx: Context) {
-        let player = ctx.sender().clone();
+        let player = ctx.sender.clone();
         if let Some(claims) = self.state.auth.claims_of(player.uuid) {
             ctx.reply(format!(
                 "§a✔ Vous êtes déjà connecté en tant que §f{}§a. Utilisez §e/logout §apour changer de compte.",
@@ -2039,7 +2039,7 @@ impl FerrisCraftLobby {
 
     #[command("logout")]
     async fn cmd_logout(&self, ctx: Context) {
-        let player = ctx.sender().clone();
+        let player = ctx.sender.clone();
         if self.state.auth.logout(player.uuid) {
             if !self.state.auth.uses_separate_capitainerie_auth() {
                 self.state.npcs.leave_captain_chat(player.uuid);
@@ -2053,7 +2053,7 @@ impl FerrisCraftLobby {
 
     #[command("caplogin")]
     async fn cmd_caplogin(&self, ctx: Context) {
-        let player = ctx.sender().clone();
+        let player = ctx.sender.clone();
         if !self.state.npcs.has_capitainerie() {
             ctx.reply("§7La passerelle Capitainerie n'est pas configurée sur ce lobby (CAPITAINERIE_URL).");
             return;
@@ -2082,7 +2082,7 @@ impl FerrisCraftLobby {
 
     #[command("caplogout")]
     async fn cmd_caplogout(&self, ctx: Context) {
-        let player = ctx.sender().clone();
+        let player = ctx.sender.clone();
         if !self.state.auth.uses_separate_capitainerie_auth() {
             ctx.reply("§7Capitainerie utilise la même session que le Lobby (/logout).");
             return;
@@ -2097,12 +2097,12 @@ impl FerrisCraftLobby {
 
     #[command("whoami")]
     async fn cmd_whoami(&self, ctx: Context) {
-        self.show_whoami(ctx.sender());
+        self.show_whoami(&ctx.sender);
     }
 
     #[command("mp")]
     async fn cmd_mp(&self, ctx: Context, target: Player, message: String) {
-        let sender = ctx.sender();
+        let sender = &ctx.sender;
         let body = message.trim();
         if body.is_empty() {
             ctx.reply("§cMessage vide.");
@@ -2119,7 +2119,7 @@ impl FerrisCraftLobby {
 
     #[command("r")]
     async fn cmd_reply(&self, ctx: Context, message: String) {
-        let sender = ctx.sender().clone();
+        let sender = ctx.sender.clone();
         let body = message.trim();
         if body.is_empty() {
             ctx.reply("§cMessage vide.");
@@ -2143,7 +2143,7 @@ impl FerrisCraftLobby {
 
     #[command("build", permission = "ferriscraft.admin")]
     async fn cmd_build(&self, ctx: Context) {
-        let player = ctx.sender();
+        let player = &ctx.sender;
         let updated = self
             .state
             .prefs
@@ -2168,7 +2168,7 @@ impl FerrisCraftLobby {
         arg1: Option<String>,
         arg2: Option<usize>,
     ) {
-        let player = ctx.sender().clone();
+        let player = ctx.sender.clone();
         let pose = WaypointPose::from_player(&player);
 
         match action.as_str() {
