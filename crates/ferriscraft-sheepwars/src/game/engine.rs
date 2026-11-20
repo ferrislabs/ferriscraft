@@ -42,6 +42,7 @@ struct Airborne {
     entity: Entity,
     velocity: Vec3,
     last_pos: Vec3,
+    last_ticks_lived: Option<i32>,
     rider_attached: bool,
 }
 
@@ -344,7 +345,6 @@ impl Game {
         if let Some(typed) = sheep.as_sheep() {
             typed.set_color(sheep_dye_color(kind));
         }
-        sheep.ai.set(false);
         sheep.flags.set_gravity(false);
         sheep.flags.set_invulnerable(true);
         sheep.name.set(display_name(kind));
@@ -371,6 +371,7 @@ impl Game {
                 entity: sheep,
                 velocity,
                 last_pos: origin,
+                last_ticks_lived: None,
                 rider_attached,
             });
         }
@@ -632,7 +633,6 @@ impl Game {
         let mut fall_updates: Vec<(PlayerId, u64)> = Vec::new();
 
         for mut airborne in flights {
-            airborne.flight.age += 1;
             let sheep = match airborne.entity.get_state().await {
                 Ok(sheep) => sheep,
                 Err(error) => {
@@ -646,6 +646,27 @@ impl Game {
                 airborne.entity.remove();
                 continue;
             }
+
+            let ticks_advanced = match airborne.last_ticks_lived {
+                None => {
+                    if sheep.ticks_lived <= 0 {
+                        airborne.last_ticks_lived = Some(sheep.ticks_lived);
+                        airborne.last_pos = pos;
+                        next.push(airborne);
+                        continue;
+                    }
+                    u32::try_from(sheep.ticks_lived).unwrap_or(1)
+                }
+                Some(prev) => {
+                    if sheep.ticks_lived <= prev {
+                        next.push(airborne);
+                        continue;
+                    }
+                    u32::try_from(sheep.ticks_lived - prev).unwrap_or(1)
+                }
+            };
+            airborne.last_ticks_lived = Some(sheep.ticks_lived);
+            airborne.flight.age += ticks_advanced;
 
             if airborne.rider_attached
                 && let Some(rider) = player_map.get(&airborne.flight.thrower)
@@ -746,7 +767,11 @@ impl Game {
                 let next_velocity = if let Some((target, _)) = seeker_target {
                     steer(pos, target, SEEKER_SPEED)
                 } else {
-                    step_ballistic(airborne.velocity)
+                    let mut v = airborne.velocity;
+                    for _ in 0..ticks_advanced {
+                        v = step_ballistic(v);
+                    }
+                    v
                 };
                 airborne.entity.set_velocity(vector(next_velocity));
                 airborne.velocity = next_velocity;
@@ -864,6 +889,7 @@ impl Game {
                     entity,
                     velocity,
                     last_pos: impact_pos,
+                    last_ticks_lived: None,
                     rider_attached: false,
                 })
                 .collect(),

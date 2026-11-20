@@ -124,7 +124,6 @@ pub async fn apply(
                 if let Some(sheep) = entity.as_sheep() {
                     sheep.set_color(sheep_dye_color(kind));
                 }
-                entity.ai.set(false);
                 entity.flags.set_gravity(false);
                 entity.flags.set_invulnerable(true);
                 entity.name.set(catalog::display_name(kind));
