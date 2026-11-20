@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 
 COPY --from=builder /src/rspigot/target/release/rspigot /usr/local/bin/rspigot
 COPY server/bukkit.yml server/permissions.yml server/server.properties server/spigot.yml.example server/world.zip /opt/ferriscraft/templates/lobby/
-COPY server-sheepwars/bukkit.yml server-sheepwars/permissions.yml server-sheepwars/server.properties server-sheepwars/spigot.yml.example server-sheepwars/world.zi[p] /opt/ferriscraft/templates/sheepwars/
+COPY server-sheepwars/bukkit.yml server-sheepwars/permissions.yml server-sheepwars/server.properties server-sheepwars/spigot.yml.example server-sheepwars/arena.jso[n] server-sheepwars/world.zi[p] /opt/ferriscraft/templates/sheepwars/
 COPY deploy/docker/rspigot-entrypoint.sh /usr/local/bin/rspigot-entrypoint.sh
 RUN chmod +x /usr/local/bin/rspigot-entrypoint.sh
 

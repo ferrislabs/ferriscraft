@@ -19,10 +19,12 @@ orchestrator:
 
 lobby:
   ferriskey:
-    url: "http://host.k3d.internal:3333"
+    url: "http://host.docker.internal:3333"
+    publicUrl: "http://localhost:3333"
     realm: "capitainerie"
     clientId: "minecraft"
   capitainerie:
-    url: "http://host.k3d.internal:4100"
-    consoleUrl: "http://host.k3d.internal:4080"
-    resource: "http://host.k3d.internal:4100"
+    url: "http://host.docker.internal:4100"
+    consoleUrl: "http://localhost:4080"
+    resource: "http://localhost:4100"
+

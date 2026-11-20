@@ -42,5 +42,6 @@ build_image "ferriscraft-orchestrator" "Dockerfile.orchestrator"
 build_image "ferriscraft-velocity" "Dockerfile.velocity"
 build_image "ferriscraft-rspigot" "Dockerfile.rspigot" --build-context "rspigot=${RSPIGOT_DIR}"
 build_image "ferriscraft-lobby" "Dockerfile.lobby" --build-context "rspigot=${RSPIGOT_DIR}"
+build_image "ferriscraft-sheepwars-plugin" "Dockerfile.sheepwars" --build-context "rspigot=${RSPIGOT_DIR}"
 
 echo "Images prêtes (${REGISTRY}/ferriscraft-*:${TAG})."

@@ -80,6 +80,10 @@ spec:
             {{- end }}
             - name: FERRISKEY_URL
               value: {{ .Values.lobby.ferriskey.url | quote }}
+            {{- if .Values.lobby.ferriskey.publicUrl }}
+            - name: FERRISKEY_PUBLIC_URL
+              value: {{ .Values.lobby.ferriskey.publicUrl | quote }}
+            {{- end }}
             - name: FERRISKEY_REALM
               value: {{ .Values.lobby.ferriskey.realm | quote }}
             - name: FERRISKEY_CLIENT_ID

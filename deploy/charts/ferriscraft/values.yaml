@@ -79,6 +79,7 @@ lobby:
   maxPlayers: 100
   ferriskey:
     url: "https://auth.ferrislabs.fr"
+    publicUrl: ""
     realm: "capitainerie"
     clientId: "minecraft"
     scope: "openid profile email roles"
@@ -118,10 +119,12 @@ sheepwars:
       limits:
         cpu: "2"
         memory: 1536Mi
-  # Conteneur plugin SheepWars (à activer par votre collègue une fois prêt)
+  # Sidecar plugin SheepWars (ferriscraft-sheepwars)
   pluginSidecar:
-    enabled: false
-    image: ghcr.io/ferrislabs/ferriscraft-sheepwars-plugin:latest
+    enabled: true
+    image:
+      repository: ferriscraft-sheepwars-plugin
+      tag: ""
     extraEnv: []
     resources:
       requests:
@@ -132,3 +135,4 @@ sheepwars:
         memory: 256Mi
   nodeSelector: {}
   tolerations: []
+

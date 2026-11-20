@@ -81,3 +81,15 @@ jobs:
           tags: |
             ${{ env.REGISTRY }}/${{ env.OWNER }}/ferriscraft-lobby:latest
             ${{ env.REGISTRY }}/${{ env.OWNER }}/ferriscraft-lobby:${{ github.sha }}
+
+      - name: Build & Push ferriscraft-sheepwars-plugin
+        uses: docker/build-push-action@v6
+        with:
+          context: ferriscraft
+          file: ferriscraft/deploy/docker/Dockerfile.sheepwars
+          build-contexts: |
+            rspigot=rspigot
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.OWNER }}/ferriscraft-sheepwars-plugin:latest
+            ${{ env.REGISTRY }}/${{ env.OWNER }}/ferriscraft-sheepwars-plugin:${{ github.sha }}

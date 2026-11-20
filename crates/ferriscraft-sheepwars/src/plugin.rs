@@ -1,0 +1,311 @@
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+
+use ferriscraft_protocol::{HeartbeatRequest, ServerPhase};
+use rspigot_plugin::prelude::*;
+use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
+
+use crate::SheepWarsConfig;
+use crate::arena::Arena;
+use crate::config::load_settings;
+use crate::game::{EndBehavior, Game, Session, VoidVerdict, kind_of};
+use crate::hud::{Hud, bossbar_title};
+use crate::orchestrator::SheepWarsOrchestratorClient;
+
+const ADMIN_PERMISSION: &str = "sheepwars.admin";
+const TICK: Duration = Duration::from_millis(50);
+const ACTIONS: [&str; 5] = ["join", "leave", "hub", "forcestart", "stop"];
+
+#[derive(Plugin)]
+pub struct SheepWarsPlugin {
+    config: SheepWarsConfig,
+    orchestrator: Option<Arc<SheepWarsOrchestratorClient>>,
+    game: OnceLock<Arc<Game>>,
+    looper: Mutex<Option<JoinHandle<()>>>,
+    heartbeat_task: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Default for SheepWarsPlugin {
+    fn default() -> Self {
+        Self::new(SheepWarsConfig::default())
+    }
+}
+
+impl SheepWarsPlugin {
+    pub fn new(config: SheepWarsConfig) -> Self {
+        let orchestrator = config.orchestrator_url.as_ref().map(|url| {
+            Arc::new(SheepWarsOrchestratorClient::new(
+                url.clone(),
+                config.orchestrator_token.clone(),
+            ))
+        });
+        Self {
+            config,
+            orchestrator,
+            game: OnceLock::new(),
+            looper: Mutex::new(None),
+            heartbeat_task: Mutex::new(None),
+        }
+    }
+
+    pub fn game(&self) -> Option<Arc<Game>> {
+        self.game.get().cloned()
+    }
+
+    async fn actions(&self, _player: &Player, typed: &str) -> Vec<String> {
+        ACTIONS
+            .iter()
+            .filter(|action| action.starts_with(typed))
+            .map(|action| (*action).to_owned())
+            .collect()
+    }
+
+    fn spawn_loop(game: Arc<Game>) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(TICK);
+            interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                game.tick().await;
+            }
+        })
+    }
+}
+
+#[listeners]
+impl SheepWarsPlugin {
+    async fn on_enable(&self, server: &Server) {
+        if let Some(orch) = &self.orchestrator {
+            let starting = HeartbeatRequest {
+                server_id: self.config.server_id.clone(),
+                address: None,
+                phase: ServerPhase::Starting,
+                player_count: 0,
+                max_players: u32::try_from(self.config.rules.max_players).unwrap_or(u32::MAX),
+                player_uuids: Vec::new(),
+            };
+            let _ = orch.send_heartbeat(&starting).await;
+        }
+
+        let arena_settings = load_settings(&self.config.arena_path);
+        let arena = match Arena::create(server, arena_settings).await {
+            Ok(arena) => arena,
+            Err(error) => {
+                tracing::error!("impossible de créer l'arène SheepWars : {error}");
+                return;
+            }
+        };
+
+        let end_behavior = if self.orchestrator.is_some() {
+            if self.config.ephemeral_pod {
+                EndBehavior::EphemeralPod
+            } else {
+                EndBehavior::ResetRound {
+                    return_to_lobby: true,
+                }
+            }
+        } else {
+            EndBehavior::ResetRound {
+                return_to_lobby: false,
+            }
+        };
+
+        let session = Session::new_with(
+            arena.layout.clone(),
+            self.config.rules,
+            self.config.end_delay_ticks,
+            end_behavior,
+        );
+        let bar = match server
+            .boss_bars
+            .create(
+                bossbar_title(session.round()),
+                BarColor::Purple,
+                BarStyle::Solid,
+                &[],
+            )
+            .await
+        {
+            Ok(bar) => bar,
+            Err(error) => {
+                tracing::error!("impossible de créer la boss bar : {error}");
+                return;
+            }
+        };
+        let reused = arena.reused;
+        let hud = Hud::new(server.scoreboard_manager.main_scoreboard());
+        let game = Arc::new(Game::new(
+            arena,
+            session,
+            hud,
+            bar,
+            self.config.clone(),
+            self.orchestrator.clone(),
+        ));
+        if self.game.set(Arc::clone(&game)).is_err() {
+            return;
+        }
+        if reused && let Err(error) = game.restore_platforms() {
+            tracing::warn!("impossible de restaurer les plateformes de l'arène : {error}");
+        }
+        match server.get_players().await {
+            Ok(players) => {
+                for player in players {
+                    game.admit(player).await;
+                }
+            }
+            Err(error) => tracing::warn!("impossible de lister les joueurs : {error}"),
+        }
+
+        if let Some(hb) = game.spawn_heartbeat_loop()
+            && let Ok(mut guard) = self.heartbeat_task.lock()
+        {
+            *guard = Some(hb);
+        }
+        if let Ok(mut looper) = self.looper.lock() {
+            *looper = Some(Self::spawn_loop(game));
+        }
+
+        tracing::info!(
+            server_id = %self.config.server_id,
+            orchestrator = ?self.config.orchestrator_url,
+            ephemeral = self.config.ephemeral_pod,
+            min_players = self.config.rules.min_players,
+            max_players = self.config.rules.max_players,
+            "ferriscraft-sheepwars initialisé"
+        );
+    }
+
+    async fn on_disable(&self) {
+        if let Ok(mut looper) = self.looper.lock()
+            && let Some(handle) = looper.take()
+        {
+            handle.abort();
+        }
+        if let Ok(mut hb) = self.heartbeat_task.lock()
+            && let Some(handle) = hb.take()
+        {
+            handle.abort();
+        }
+        if let Some(game) = self.game() {
+            game.close();
+        }
+    }
+
+    #[command("sheepwars")]
+    async fn sheepwars(&self, ctx: Context, #[suggest(Self::actions)] action: String) {
+        let Some(game) = self.game() else {
+            ctx.reply("§cLe jeu n'est pas prêt.");
+            return;
+        };
+        let player = ctx.sender();
+        let admin = player.permissions.has(ADMIN_PERMISSION);
+        match action.as_str() {
+            "join" => game.join(player).await,
+            "leave" => game.quit(player).await,
+            "hub" => game.send_player_hub(player).await,
+            "forcestart" | "stop" if !admin => ctx.reply("§cVous ne pouvez pas faire ça."),
+            "forcestart" => {
+                if let Err(error) = game.force_start().await {
+                    ctx.reply(format!("§c{error}"));
+                }
+            }
+            "stop" => game.stop().await,
+            other => ctx.reply(format!("§cAction inconnue : {other}")),
+        }
+    }
+
+    async fn on_chunk_load(&self, event: &ChunkLoad) {
+        if let Some(game) = self.game() {
+            game.on_chunk_load(event);
+        }
+    }
+
+    async fn on_player_join(&self, event: &PlayerJoin) {
+        if let Some(game) = self.game() {
+            game.admit(event.player().clone()).await;
+        }
+    }
+
+    async fn on_player_leave(&self, event: &PlayerLeave) {
+        if let Some(game) = self.game() {
+            game.release(event.player()).await;
+        }
+    }
+
+    async fn on_player_interact(&self, event: &mut PlayerInteract) {
+        let Some(game) = self.game() else { return };
+        let right_click = matches!(
+            event.action(),
+            Action::RightClickAir | Action::RightClickBlock
+        );
+        if !right_click || event.hand() != Some(EquipmentSlot::Hand) {
+            return;
+        }
+        let Some(kind) = kind_of(event.material()) else {
+            return;
+        };
+        event.cancel();
+        let player = event.player().clone();
+        tokio::spawn(async move {
+            game.throw(&player, kind).await;
+        });
+    }
+
+    async fn on_player_death(&self, event: &mut PlayerDeath) {
+        let Some(game) = self.game() else { return };
+        event.set_keep_inventory(true);
+        let player = event.player().clone();
+        tokio::spawn(async move { game.died(&player).await });
+    }
+
+    async fn on_player_respawn(&self, event: &mut PlayerRespawn) {
+        if let Some(game) = self.game() {
+            let location = game.respawn_location(event.player());
+            event.set_respawn_location(location);
+        }
+    }
+
+    async fn on_player_move(&self, event: &PlayerMove) {
+        let Some(game) = self.game() else { return };
+        let Some(to) = event.to() else { return };
+        match game.void_verdict(event.player(), to.position.y) {
+            VoidVerdict::Safe => {}
+            VoidVerdict::Kill => event.player().health.kill(),
+            VoidVerdict::ToLobby => {
+                let player = event.player().clone();
+                tokio::spawn(async move { game.rescue(&player).await });
+            }
+        }
+    }
+
+    async fn on_entity_damage(&self, event: &mut EntityDamage) {
+        let Some(game) = self.game() else { return };
+        if event.entity_type() == EntityType::Player && game.blocks_damage() {
+            event.cancel();
+        }
+    }
+
+    async fn on_entity_damage_by_entity(&self, event: &mut EntityDamageByEntity) {
+        let Some(game) = self.game() else { return };
+        let victim = event.entity().player();
+        if let (Some(attacker), Some(victim)) = (event.player(), victim)
+            && game.blocks_hit(attacker, victim)
+        {
+            event.cancel();
+        }
+    }
+
+    async fn on_food_level_change(&self, event: &mut FoodLevelChange) {
+        event.cancel();
+    }
+
+    async fn on_block_break(&self, event: &mut BlockBreak) {
+        event.cancel();
+    }
+
+    async fn on_block_place(&self, event: &mut BlockPlace) {
+        event.cancel();
+    }
+}

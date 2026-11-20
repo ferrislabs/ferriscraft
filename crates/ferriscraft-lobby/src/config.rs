@@ -27,6 +27,7 @@ pub enum ConfigError {
 #[derive(Debug, Clone)]
 pub struct EnvConfig {
     pub ferriskey_base_url: String,
+    pub ferriskey_public_url: Option<String>,
     pub ferriskey_realm: String,
     pub ferriskey_client_id: String,
     pub ferriskey_client_secret: Option<String>,
@@ -36,6 +37,7 @@ pub struct EnvConfig {
     pub capitainerie_resource: Option<String>,
     pub capitainerie_observer_token: Option<String>,
     pub capitainerie_ferriskey_url: String,
+    pub capitainerie_ferriskey_public_url: Option<String>,
     pub capitainerie_realm: String,
     pub capitainerie_client_id: String,
     pub capitainerie_client_secret: Option<String>,
@@ -63,6 +65,8 @@ impl EnvConfig {
             .unwrap_or_else(|| "http://127.0.0.1:3333".to_owned())
             .trim_end_matches('/')
             .to_owned();
+        let ferriskey_public_url =
+            non_empty_env("FERRISKEY_PUBLIC_URL").map(|url| url.trim_end_matches('/').to_owned());
         let ferriskey_realm =
             non_empty_env("FERRISKEY_REALM").unwrap_or_else(|| "capitainerie".to_owned());
         let ferriskey_client_id =
@@ -83,6 +87,15 @@ impl EnvConfig {
             .unwrap_or_else(|| ferriskey_base_url.clone())
             .trim_end_matches('/')
             .to_owned();
+        let capitainerie_ferriskey_public_url = non_empty_env("CAPITAINERIE_FERRISKEY_PUBLIC_URL")
+            .map(|url| url.trim_end_matches('/').to_owned())
+            .or_else(|| {
+                if capitainerie_ferriskey_url == ferriskey_base_url {
+                    ferriskey_public_url.clone()
+                } else {
+                    None
+                }
+            });
         let capitainerie_realm =
             non_empty_env("CAPITAINERIE_REALM").unwrap_or_else(|| ferriskey_realm.clone());
         let capitainerie_client_id =
@@ -124,6 +137,7 @@ impl EnvConfig {
 
         Self {
             ferriskey_base_url,
+            ferriskey_public_url,
             ferriskey_realm,
             ferriskey_client_id,
             ferriskey_client_secret,
@@ -133,6 +147,7 @@ impl EnvConfig {
             capitainerie_resource,
             capitainerie_observer_token,
             capitainerie_ferriskey_url,
+            capitainerie_ferriskey_public_url,
             capitainerie_realm,
             capitainerie_client_id,
             capitainerie_client_secret,
