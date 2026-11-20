@@ -32,8 +32,9 @@ pub const HEALING_THROW_POWER: f64 = 1.1;
 
 pub const QUAKE_RADIUS: f64 = 7.0;
 pub const QUAKE_LIFT: f64 = 1.25;
-pub const QUAKE_POWER: f32 = 2.5;
-pub const QUAKE_BREAKS_BLOCKS: bool = true;
+pub const QUAKE_PUSH: f64 = 0.85;
+pub const QUAKE_SLOWNESS_TICKS: i32 = 60;
+pub const QUAKE_SLOWNESS_AMPLIFIER: u8 = 1;
 
 pub const DARKNESS_RADIUS: f64 = 8.0;
 pub const DARKNESS_BLINDNESS_TICKS: i32 = 160;
@@ -49,8 +50,8 @@ pub const SPLIT_PARENT_BREAKS_BLOCKS: bool = true;
 pub const WARP_RADIUS: f64 = 8.0;
 pub const WARP_PUSH: f64 = 2.0;
 pub const WARP_LIFT: f64 = 0.85;
-pub const WARP_BLAST_POWER: f32 = 3.0;
-pub const WARP_BLAST_BREAKS_BLOCKS: bool = true;
+pub const WARP_BLINDNESS_TICKS: i32 = 40;
+pub const WARP_BLINDNESS_AMPLIFIER: u8 = 0;
 
 pub const INTERGALACTIC_METEORS: u32 = 8;
 pub const INTERGALACTIC_SPREAD: f64 = 8.0;

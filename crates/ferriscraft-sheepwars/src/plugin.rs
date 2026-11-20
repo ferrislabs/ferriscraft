@@ -288,16 +288,55 @@ impl SheepWarsPlugin {
                     && game.is_fall_protected(event.entity().uuid)))
         {
             event.cancel();
+            return;
+        }
+        if event.entity_type() == EntityType::Sheep
+            && game.is_managed_sheep(event.entity().entity_id)
+            && (game.blocks_damage()
+                || matches!(
+                    event.cause(),
+                    EntityDamageCause::Fall
+                        | EntityDamageCause::Suffocation
+                        | EntityDamageCause::Cramming
+                        | EntityDamageCause::Drowning
+                        | EntityDamageCause::Fire
+                        | EntityDamageCause::FireTick
+                        | EntityDamageCause::Lava
+                        | EntityDamageCause::BlockExplosion
+                        | EntityDamageCause::EntityExplosion
+                        | EntityDamageCause::Lightning
+                ))
+        {
+            event.cancel();
         }
     }
 
     async fn on_entity_damage_by_entity(&self, event: &mut EntityDamageByEntity) {
         let Some(game) = self.game() else { return };
-        let victim = event.entity().player.as_ref();
-        if let (Some(attacker), Some(victim)) = (event.player(), victim)
-            && game.blocks_hit(attacker, victim)
-        {
-            event.cancel();
+        let attacker = event
+            .player()
+            .or_else(|| event.damage_source().causing.as_ref().and_then(|e| e.player.as_ref()));
+        let Some(attacker) = attacker else { return };
+        if let Some(victim) = event.entity().player.as_ref() {
+            if game.blocks_hit(attacker, victim) {
+                event.cancel();
+            }
+            return;
+        }
+        if event.entity_type() == EntityType::Sheep {
+            game.record_sheep_damager(event.entity().entity_id, attacker);
+        }
+    }
+
+    async fn on_entity_death(&self, event: &mut EntityDeath) {
+        let Some(game) = self.game() else { return };
+        if event.entity_type() != EntityType::Sheep {
+            return;
+        }
+        let killer_uuid = event.damage_source().causing.as_ref().map(|e| e.uuid);
+        if game.on_sheep_killed(event.entity().entity_id, killer_uuid) {
+            event.set_drops(Vec::new());
+            event.set_dropped_exp(0);
         }
     }
 

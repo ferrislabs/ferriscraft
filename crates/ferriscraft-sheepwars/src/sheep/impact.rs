@@ -126,6 +126,11 @@ pub enum Action {
         strength: f64,
         lift: f64,
     },
+    SwapPositions {
+        team: TeamId,
+        center: Vec3,
+        radius: f64,
+    },
     Lightning {
         at: Vec3,
     },
@@ -246,22 +251,23 @@ pub fn plan(kind: SheepKind, at: Vec3, thrower_team: TeamId) -> Vec<Action> {
             sound(SoundKind::Teleport, at),
         ],
         SheepKind::Quake => vec![
-            Action::Explode {
-                at,
-                power: catalog::QUAKE_POWER,
-                breaks_blocks: catalog::QUAKE_BREAKS_BLOCKS,
-            },
-            Action::Velocity {
+            Action::Push {
                 team: enemies,
                 center: at,
                 radius: catalog::QUAKE_RADIUS,
-                velocity: Vec3 {
-                    x: 0.0,
-                    y: catalog::QUAKE_LIFT,
-                    z: 0.0,
-                },
+                strength: catalog::QUAKE_PUSH,
+                lift: catalog::QUAKE_LIFT,
+            },
+            Action::Effect {
+                team: enemies,
+                center: at,
+                radius: catalog::QUAKE_RADIUS,
+                effect: EffectKind::Slowness,
+                duration_ticks: catalog::QUAKE_SLOWNESS_TICKS,
+                amplifier: catalog::QUAKE_SLOWNESS_AMPLIFIER,
             },
             particle(ParticleKind::Explosion, at, 14),
+            particle(ParticleKind::LargeSmoke, at, 24),
             sound(SoundKind::Quake, at),
         ],
         SheepKind::Darkness => vec![
@@ -306,6 +312,11 @@ pub fn plan(kind: SheepKind, at: Vec3, thrower_team: TeamId) -> Vec<Action> {
             actions
         }
         SheepKind::Warp => vec![
+            Action::SwapPositions {
+                team: enemies,
+                center: at,
+                radius: catalog::WARP_RADIUS,
+            },
             Action::Push {
                 team: enemies,
                 center: at,
@@ -313,10 +324,13 @@ pub fn plan(kind: SheepKind, at: Vec3, thrower_team: TeamId) -> Vec<Action> {
                 strength: catalog::WARP_PUSH,
                 lift: catalog::WARP_LIFT,
             },
-            Action::Explode {
-                at,
-                power: catalog::WARP_BLAST_POWER,
-                breaks_blocks: catalog::WARP_BLAST_BREAKS_BLOCKS,
+            Action::Effect {
+                team: enemies,
+                center: at,
+                radius: catalog::WARP_RADIUS,
+                effect: EffectKind::Blindness,
+                duration_ticks: catalog::WARP_BLINDNESS_TICKS,
+                amplifier: catalog::WARP_BLINDNESS_AMPLIFIER,
             },
             particle(ParticleKind::Portal, at, 80),
             sound(SoundKind::Warp, at),
@@ -526,7 +540,7 @@ mod tests {
                 .iter()
                 .any(|a| matches!(
                     a,
-                    Action::Velocity { team: TeamId::Blue, velocity, .. } if velocity.y > 0.0
+                    Action::Push { team: TeamId::Blue, lift, .. } if *lift > 0.0
                 ))
         );
         assert!(
@@ -620,7 +634,7 @@ mod tests {
     }
 
     #[test]
-    fn darkness_applies_darkness_and_quake_explodes() {
+    fn darkness_applies_darkness_and_quake_and_warp_do_not_explode() {
         assert!(
             plan(SheepKind::Darkness, AT, TeamId::Red)
                 .iter()
@@ -634,9 +648,25 @@ mod tests {
                 ))
         );
         assert!(
-            plan(SheepKind::Quake, AT, TeamId::Red)
+            !plan(SheepKind::Quake, AT, TeamId::Red)
                 .iter()
-                .any(|a| matches!(a, Action::Explode { at, .. } if *at == AT))
+                .any(|a| matches!(a, Action::Explode { .. }))
         );
+        let warp = plan(SheepKind::Warp, AT, TeamId::Red);
+        assert!(!warp.iter().any(|a| matches!(a, Action::Explode { .. })));
+        assert!(warp.iter().any(|a| matches!(
+            a,
+            Action::SwapPositions {
+                team: TeamId::Blue,
+                ..
+            }
+        )));
+        assert!(warp.iter().any(|a| matches!(
+            a,
+            Action::Push {
+                team: TeamId::Blue,
+                ..
+            }
+        )));
     }
 }

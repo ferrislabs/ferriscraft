@@ -4,8 +4,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use ferriscraft_protocol::{HeartbeatRequest, ServerPhase};
 use futures_util::future::join_all;
 use rspigot_plugin::{
-    BossBar, ChunkLoad, Entity, EntityState, EntityType, GameMode, ItemRemoval, ItemStack,
-    Location, Player, Position, Rotation, Title, Uuid, Vector,
+    BossBar, ChunkLoad, Enchantment, Entity, EntityType, GameMode, InventorySlot, ItemRemoval,
+    ItemStack, Location, Material, Particle, ParticleBurst, Player, Position, Rotation, SlotItem,
+    Sound, SoundCue, Title, Uuid, Vector,
 };
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -13,7 +14,8 @@ use tokio::time::MissedTickBehavior;
 
 use super::display::lives_line;
 use super::flight::{
-    EYE_HEIGHT, Flight, LANDING_GRACE_TICKS, MAX_CONCURRENT_FLIGHTS, MAX_FLIGHT_TICKS, can_launch,
+    EYE_HEIGHT, Flight, LANDING_GRACE_TICKS, MAX_CONCURRENT_FLIGHTS, MAX_FLIGHT_TICKS,
+    SHEEP_FUSE_TICKS, arms_on_impact, can_launch, fuse_label,
 };
 use super::intent::Intent;
 use super::session::{ForceStartError, Session, VoidVerdict, launch_announcement};
@@ -47,6 +49,13 @@ struct Airborne {
 }
 
 #[derive(Debug)]
+struct ArmedSheep {
+    flight: Flight,
+    entity: Entity,
+    remaining_ticks: u32,
+}
+
+#[derive(Debug)]
 struct ActiveHealing {
     entity: Entity,
     team: TeamId,
@@ -59,7 +68,10 @@ struct State {
     session: Session,
     players: HashMap<PlayerId, Player>,
     flights: Vec<Airborne>,
+    armed: Vec<ArmedSheep>,
     healings: Vec<ActiveHealing>,
+    sheep_kinds: HashMap<i32, SheepKind>,
+    last_sheep_damager: HashMap<i32, PlayerId>,
     fall_protected_until: HashMap<PlayerId, u64>,
     hud: Hud,
     bar: BossBar,
@@ -93,7 +105,10 @@ impl Game {
                 session,
                 players: HashMap::new(),
                 flights: Vec::new(),
+                armed: Vec::new(),
                 healings: Vec::new(),
+                sheep_kinds: HashMap::new(),
+                last_sheep_damager: HashMap::new(),
                 fall_protected_until: HashMap::new(),
                 hud,
                 bar,
@@ -290,6 +305,54 @@ impl Game {
             .blocks_hit(player_id(attacker.uuid), player_id(victim.uuid))
     }
 
+    pub fn is_managed_sheep(&self, entity_id: i32) -> bool {
+        self.lock().sheep_kinds.contains_key(&entity_id)
+    }
+
+    pub fn record_sheep_damager(&self, entity_id: i32, attacker: &Player) {
+        let mut state = self.lock();
+        if state.sheep_kinds.contains_key(&entity_id) {
+            state
+                .last_sheep_damager
+                .insert(entity_id, player_id(attacker.uuid));
+        }
+    }
+
+    pub fn on_sheep_killed(&self, entity_id: i32, killer_uuid: Option<Uuid>) -> bool {
+        let mut state = self.lock();
+        let Some(kind) = state.sheep_kinds.remove(&entity_id) else {
+            return false;
+        };
+        let fallback = state.last_sheep_damager.remove(&entity_id);
+        state.flights.retain(|a| a.entity.entity_id != entity_id);
+        state.armed.retain(|a| a.entity.entity_id != entity_id);
+        state.healings.retain(|t| t.entity.entity_id != entity_id);
+
+        let killer_id = killer_uuid.map(player_id).or(fallback);
+        if let Some(killer_id) = killer_id
+            && state.session.is_playing()
+            && state
+                .session
+                .round()
+                .team_of(killer_id)
+                .and_then(|team| state.session.round().team(team).lives_of(killer_id))
+                .unwrap_or(0)
+                > 0
+            && let Some(killer) = state.players.get(&killer_id)
+        {
+            killer
+                .inventory
+                .add(ItemStack::new(sheep_wool(kind), 1).name(display_name(kind)));
+            killer
+                .message
+                .send(format!("§aVous avez récupéré un {}§a !", display_name(kind)));
+            killer
+                .sound
+                .play(SoundCue::new(Sound::EntityItemPickup));
+        }
+        true
+    }
+
     pub fn void_verdict(&self, player: &Player, y: f64) -> VoidVerdict {
         self.lock().session.void_verdict(player_id(player.uuid), y)
     }
@@ -346,8 +409,9 @@ impl Game {
             typed.set_color(sheep_dye_color(kind));
         }
         sheep.flags.set_gravity(false);
-        sheep.flags.set_invulnerable(true);
+        sheep.flags.set_invulnerable(false);
         sheep.name.set(display_name(kind));
+        sheep.name.set_visible(true);
 
         let velocity = throw_velocity(yaw, pitch, launch_power(kind));
         sheep.set_velocity(vector(velocity));
@@ -366,6 +430,7 @@ impl Game {
                 let deadline = state.ticks + u64::from(MAX_FLIGHT_TICKS) + 40;
                 state.fall_protected_until.insert(id, deadline);
             }
+            state.sheep_kinds.insert(sheep.entity_id, kind);
             state.flights.push(Airborne {
                 flight: Flight::new(kind, team, id),
                 entity: sheep,
@@ -385,6 +450,7 @@ impl Game {
         let intents = self.lock().session.tick();
         self.run(intents).await;
         self.advance_flights().await;
+        self.advance_armed().await;
         self.advance_healings().await;
         self.refresh();
         self.check_phase_changed();
@@ -395,9 +461,14 @@ impl Game {
         for airborne in state.flights.drain(..) {
             airborne.entity.remove();
         }
+        for armed in state.armed.drain(..) {
+            armed.entity.remove();
+        }
         for totem in state.healings.drain(..) {
             totem.entity.remove();
         }
+        state.sheep_kinds.clear();
+        state.last_sheep_damager.clear();
         state.fall_protected_until.clear();
         state.hud.close();
         state.bar.remove();
@@ -489,6 +560,11 @@ impl Game {
                     player.food.set_saturation(5.0);
                 }
             }
+            Intent::GiveStarterKit { player } => {
+                if let Some(player) = self.player(player) {
+                    give_starter_kit(&player);
+                }
+            }
             Intent::Give { player, kind } => {
                 if let Some(player) = self.player(player) {
                     player
@@ -565,9 +641,14 @@ impl Game {
         for airborne in state.flights.drain(..) {
             airborne.entity.remove();
         }
+        for armed in state.armed.drain(..) {
+            armed.entity.remove();
+        }
         for totem in state.healings.drain(..) {
             totem.entity.remove();
         }
+        state.sheep_kinds.clear();
+        state.last_sheep_damager.clear();
         state.fall_protected_until.clear();
         for player in state.players.values() {
             for team in TeamId::ALL {
@@ -604,6 +685,12 @@ impl Game {
         }
     }
 
+    fn claim_sheep(&self, entity_id: i32) -> bool {
+        let mut state = self.lock();
+        state.last_sheep_damager.remove(&entity_id);
+        state.sheep_kinds.remove(&entity_id).is_some()
+    }
+
     async fn advance_flights(&self) {
         let (flights, players_with_teams, player_map, current_ticks, void_fall_y) = {
             let mut state = self.lock();
@@ -629,20 +716,29 @@ impl Game {
 
         let mut next = Vec::with_capacity(flights.len());
         let mut children = Vec::new();
+        let mut new_armed = Vec::new();
         let mut new_healings = Vec::new();
+        let mut removed_ids = Vec::new();
         let mut fall_updates: Vec<(PlayerId, u64)> = Vec::new();
 
         for mut airborne in flights {
+            let entity_id = airborne.entity.entity_id;
             let sheep = match airborne.entity.get_state().await {
                 Ok(sheep) => sheep,
                 Err(error) => {
                     tracing::warn!("mouton perdu en vol : {error}");
+                    removed_ids.push(entity_id);
                     airborne.entity.remove();
                     continue;
                 }
             };
+            if sheep.health.is_some_and(|health| health <= 0.0) || !self.is_managed_sheep(entity_id)
+            {
+                continue;
+            }
             let pos = vec3(sheep.entity.position);
             if pos.y < void_fall_y {
+                removed_ids.push(entity_id);
                 airborne.entity.remove();
                 continue;
             }
@@ -742,7 +838,7 @@ impl Game {
                     }
                     airborne.entity.ai.set(false);
                     airborne.entity.flags.set_gravity(true);
-                    airborne.entity.flags.set_invulnerable(true);
+                    airborne.entity.flags.set_invulnerable(false);
                     airborne.entity.set_velocity(vector(Vec3::ZERO));
                     airborne.entity.name.set(display_name(SheepKind::Healing));
                     airborne.entity.name.set_visible(true);
@@ -753,14 +849,42 @@ impl Game {
                         pulse_in: HEALING_PULSE_TICKS,
                         pulses: 0,
                     });
+                } else if arms_on_impact(airborne.flight.kind) && !target_hit {
+                    airborne.entity.ai.set(false);
+                    airborne.entity.flags.set_gravity(true);
+                    airborne.entity.flags.set_invulnerable(false);
+                    airborne.entity.flags.set_glowing(true);
+                    airborne.entity.set_velocity(vector(Vec3::ZERO));
+                    airborne
+                        .entity
+                        .name
+                        .set(fuse_label(airborne.flight.kind, SHEEP_FUSE_TICKS));
+                    airborne.entity.name.set_visible(true);
+                    self.arena
+                        .world
+                        .sound
+                        .play(SoundCue::new(Sound::EntityTntPrimed).at(position(pos)));
+                    new_armed.push(ArmedSheep {
+                        flight: airborne.flight,
+                        entity: airborne.entity,
+                        remaining_ticks: SHEEP_FUSE_TICKS,
+                    });
                 } else {
                     if airborne.flight.kind == SheepKind::Boarding && airborne.rider_attached {
                         fall_updates.push((airborne.flight.thrower, current_ticks + 60));
                     }
-                    children.extend(
-                        self.land(&airborne, &sheep, &players_with_teams, &player_map)
+                    if self.claim_sheep(entity_id) {
+                        children.extend(
+                            self.land_at(
+                                airborne.flight,
+                                pos,
+                                airborne.rider_attached,
+                                &players_with_teams,
+                                &player_map,
+                            )
                             .await,
-                    );
+                        );
+                    }
                     airborne.entity.remove();
                 }
             } else {
@@ -781,16 +905,136 @@ impl Game {
         }
 
         let mut state = self.lock();
+        for id in removed_ids {
+            state.sheep_kinds.remove(&id);
+            state.last_sheep_damager.remove(&id);
+        }
         state
             .fall_protected_until
             .retain(|_, until| *until >= current_ticks);
         for (id, deadline) in fall_updates {
             state.fall_protected_until.insert(id, deadline);
         }
+        new_armed.retain(|armed| state.sheep_kinds.contains_key(&armed.entity.entity_id));
+        new_healings.retain(|totem| state.sheep_kinds.contains_key(&totem.entity.entity_id));
+        next.retain(|airborne| state.sheep_kinds.contains_key(&airborne.entity.entity_id));
+        for child in &children {
+            state
+                .sheep_kinds
+                .insert(child.entity.entity_id, child.flight.kind);
+        }
+        state.armed.extend(new_armed);
         state.healings.extend(new_healings);
         next.extend(children);
         next.truncate(MAX_CONCURRENT_FLIGHTS.saturating_sub(state.flights.len()));
         state.flights.extend(next);
+    }
+
+    async fn advance_armed(&self) {
+        let (armed, players_with_teams, player_map, void_fall_y) = {
+            let mut state = self.lock();
+            if state.armed.is_empty() {
+                return;
+            }
+            let teams: HashMap<PlayerId, TeamId> = state.session.standing().into_iter().collect();
+            let players_with_teams: Vec<(Player, TeamId)> = teams
+                .into_iter()
+                .filter_map(|(id, team)| state.players.get(&id).cloned().map(|p| (p, team)))
+                .collect();
+            let player_map = state.players.clone();
+            let void_fall_y = state.session.layout().settings().void_fall_y;
+            (
+                std::mem::take(&mut state.armed),
+                players_with_teams,
+                player_map,
+                void_fall_y,
+            )
+        };
+
+        let mut next_armed = Vec::with_capacity(armed.len());
+        let mut children = Vec::new();
+        let mut removed_ids = Vec::new();
+
+        for mut armed_sheep in armed {
+            let entity_id = armed_sheep.entity.entity_id;
+            let sheep = match armed_sheep.entity.get_state().await {
+                Ok(sheep) => sheep,
+                Err(error) => {
+                    tracing::warn!("mouton armé perdu : {error}");
+                    removed_ids.push(entity_id);
+                    armed_sheep.entity.remove();
+                    continue;
+                }
+            };
+            if sheep.health.is_some_and(|health| health <= 0.0) || !self.is_managed_sheep(entity_id)
+            {
+                continue;
+            }
+            let pos = vec3(sheep.entity.position);
+            if pos.y < void_fall_y {
+                removed_ids.push(entity_id);
+                armed_sheep.entity.remove();
+                continue;
+            }
+
+            armed_sheep.remaining_ticks = armed_sheep.remaining_ticks.saturating_sub(1);
+            if armed_sheep.remaining_ticks == 0 {
+                if self.claim_sheep(entity_id) {
+                    children.extend(
+                        self.land_at(
+                            armed_sheep.flight,
+                            pos,
+                            false,
+                            &players_with_teams,
+                            &player_map,
+                        )
+                        .await,
+                    );
+                }
+                armed_sheep.entity.remove();
+            } else {
+                if armed_sheep.remaining_ticks.is_multiple_of(4) {
+                    armed_sheep
+                        .entity
+                        .name
+                        .set(fuse_label(armed_sheep.flight.kind, armed_sheep.remaining_ticks));
+                }
+                if matches!(armed_sheep.remaining_ticks, 40 | 20 | 10) {
+                    self.arena
+                        .world
+                        .sound
+                        .play(SoundCue::new(Sound::BlockNoteBlockHat).at(position(pos)));
+                    self.arena.world.particle.spawn(
+                        ParticleBurst::new(
+                            Particle::Smoke,
+                            position(Vec3 {
+                                x: pos.x,
+                                y: pos.y + 0.6,
+                                z: pos.z,
+                            }),
+                        )
+                        .count(4),
+                    );
+                }
+                next_armed.push(armed_sheep);
+            }
+        }
+
+        let mut state = self.lock();
+        for id in removed_ids {
+            state.sheep_kinds.remove(&id);
+            state.last_sheep_damager.remove(&id);
+        }
+        next_armed.retain(|armed| state.sheep_kinds.contains_key(&armed.entity.entity_id));
+        for child in &children {
+            state
+                .sheep_kinds
+                .insert(child.entity.entity_id, child.flight.kind);
+        }
+        let room = MAX_CONCURRENT_FLIGHTS.saturating_sub(state.flights.len());
+        children.truncate(room);
+        state.flights.extend(children);
+        state.armed.extend(next_armed);
     }
 
     async fn advance_healings(&self) {
@@ -813,22 +1057,31 @@ impl Game {
         };
 
         let mut next_healings = Vec::with_capacity(healings.len());
+        let mut removed_ids = Vec::new();
         for mut totem in healings {
+            let entity_id = totem.entity.entity_id;
             totem.remaining_ticks = totem.remaining_ticks.saturating_sub(1);
             let sheep = match totem.entity.get_state().await {
                 Ok(sheep) => sheep,
                 Err(error) => {
                     tracing::warn!("mouton soigneur perdu : {error}");
+                    removed_ids.push(entity_id);
                     totem.entity.remove();
                     continue;
                 }
             };
+            if sheep.health.is_some_and(|health| health <= 0.0) || !self.is_managed_sheep(entity_id)
+            {
+                continue;
+            }
             let pos = vec3(sheep.entity.position);
             if pos.y < void_fall_y {
+                removed_ids.push(entity_id);
                 totem.entity.remove();
                 continue;
             }
             if totem.remaining_ticks == 0 {
+                removed_ids.push(entity_id);
                 let _ = apply(
                     &self.arena.world,
                     None,
@@ -858,13 +1111,20 @@ impl Game {
             next_healings.push(totem);
         }
 
-        self.lock().healings.extend(next_healings);
+        let mut state = self.lock();
+        for id in removed_ids {
+            state.sheep_kinds.remove(&id);
+            state.last_sheep_damager.remove(&id);
+        }
+        next_healings.retain(|totem| state.sheep_kinds.contains_key(&totem.entity.entity_id));
+        state.healings.extend(next_healings);
     }
 
-    async fn land(
+    async fn land_at(
         &self,
-        airborne: &Airborne,
-        sheep: &EntityState,
+        flight: Flight,
+        impact_pos: Vec3,
+        rider_attached: bool,
         players: &[(Player, TeamId)],
         player_map: &HashMap<PlayerId, Player>,
     ) -> Vec<Airborne> {
@@ -873,10 +1133,9 @@ impl Game {
             team,
             thrower,
             ..
-        } = airborne.flight;
-        let impact_pos = vec3(sheep.entity.position);
+        } = flight;
         let actions = plan(kind, impact_pos, team);
-        let thrower_player = if kind == SheepKind::Boarding && !airborne.rider_attached {
+        let thrower_player = if kind == SheepKind::Boarding && !rider_attached {
             None
         } else {
             player_map.get(&thrower)
@@ -898,6 +1157,39 @@ impl Game {
                 Vec::new()
             }
         }
+    }
+}
+
+fn give_starter_kit(player: &Player) {
+    player.inventory.set(SlotItem::new(
+        InventorySlot::Hotbar(0),
+        Some(
+            ItemStack::new(Material::IronSword, 1)
+                .name("§fÉpée de combat")
+                .enchant(Enchantment::Unbreaking, 3),
+        ),
+    ));
+    player.inventory.set(SlotItem::new(
+        InventorySlot::Hotbar(1),
+        Some(
+            ItemStack::new(Material::Bow, 1)
+                .name("§eArc de combat")
+                .enchant(Enchantment::Infinity, 1)
+                .enchant(Enchantment::Unbreaking, 3),
+        ),
+    ));
+    player.inventory.set(SlotItem::new(
+        InventorySlot::Main(0),
+        Some(ItemStack::new(Material::Arrow, 1)),
+    ));
+    player.inventory.set_held_slot(0);
+}
+
+const fn position(vec: Vec3) -> Position {
+    Position {
+        x: vec.x,
+        y: vec.y,
+        z: vec.z,
     }
 }
 

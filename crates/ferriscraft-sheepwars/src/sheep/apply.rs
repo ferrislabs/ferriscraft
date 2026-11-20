@@ -25,6 +25,7 @@ pub async fn apply(
                 | Action::Ignite { .. }
                 | Action::Velocity { .. }
                 | Action::Push { .. }
+                | Action::SwapPositions { .. }
         )
     });
     let live_players = if needs_player_states {
@@ -116,6 +117,27 @@ pub async fn apply(
                     player.movement.set_velocity(vector(velocity));
                 }
             }
+            Action::SwapPositions {
+                team,
+                center,
+                radius,
+            } => {
+                let targets: Vec<(&Player, Position)> =
+                    matching_players(&live_players, center, radius, team)
+                        .map(|(player, state)| (player, state.player.position))
+                        .collect();
+                if targets.len() >= 2 {
+                    for (index, (player, _)) in targets.iter().enumerate() {
+                        let destination = targets[(index + 1) % targets.len()].1;
+                        if let Err(error) = player.location.teleport(destination).await {
+                            tracing::warn!(
+                                "échec téléportation distorsion pour {} : {error}",
+                                player.name
+                            );
+                        }
+                    }
+                }
+            }
             Action::Lightning { at } => {
                 world.spawn(EntityType::LightningBolt, position(at)).await?;
             }
@@ -125,8 +147,9 @@ pub async fn apply(
                     sheep.set_color(sheep_dye_color(kind));
                 }
                 entity.flags.set_gravity(false);
-                entity.flags.set_invulnerable(true);
+                entity.flags.set_invulnerable(false);
                 entity.name.set(catalog::display_name(kind));
+                entity.name.set_visible(true);
                 entity.set_velocity(vector(velocity));
                 spawned.push((kind, entity, velocity));
             }
@@ -330,10 +353,9 @@ const fn sound(kind: SoundKind) -> Sound {
         SoundKind::Thunder => Sound::EntityLightningBoltThunder,
         SoundKind::Heal => Sound::EntityPlayerLevelup,
         SoundKind::HealTick => Sound::EntityExperienceOrbPickup,
-        SoundKind::Teleport => Sound::EntityEndermanTeleport,
+        SoundKind::Teleport | SoundKind::Warp => Sound::EntityEndermanTeleport,
         SoundKind::Darkness => Sound::EntityGhastShoot,
         SoundKind::Split => Sound::EntitySheepAmbient,
-        SoundKind::Warp => Sound::EntityEnderDragonShoot,
         SoundKind::Intergalactic => Sound::EntityWitherSpawn,
     }
 }
