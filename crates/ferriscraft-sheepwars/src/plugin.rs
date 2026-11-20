@@ -199,7 +199,7 @@ impl SheepWarsPlugin {
             ctx.reply("§cLe jeu n'est pas prêt.");
             return;
         };
-        let player = ctx.sender();
+        let player = &ctx.sender;
         let admin = player.permissions.has(ADMIN_PERMISSION);
         match action.as_str() {
             "join" => game.join(player).await,
@@ -282,14 +282,18 @@ impl SheepWarsPlugin {
 
     async fn on_entity_damage(&self, event: &mut EntityDamage) {
         let Some(game) = self.game() else { return };
-        if event.entity_type() == EntityType::Player && game.blocks_damage() {
+        if event.entity_type() == EntityType::Player
+            && (game.blocks_damage()
+                || (event.cause() == EntityDamageCause::Fall
+                    && game.is_fall_protected(event.entity().uuid)))
+        {
             event.cancel();
         }
     }
 
     async fn on_entity_damage_by_entity(&self, event: &mut EntityDamageByEntity) {
         let Some(game) = self.game() else { return };
-        let victim = event.entity().player();
+        let victim = event.entity().player.as_ref();
         if let (Some(attacker), Some(victim)) = (event.player(), victim)
             && game.blocks_hit(attacker, victim)
         {

@@ -1,40 +1,55 @@
 use super::launch::DEFAULT_THROW_POWER;
 use crate::domain::SheepKind;
 
-pub const INCENDIARY_POWER: f32 = 6.0;
+pub const INCENDIARY_POWER: f32 = 5.5;
 pub const INCENDIARY_BREAKS_BLOCKS: bool = true;
+pub const INCENDIARY_FIRE_RADIUS: f64 = 6.0;
+pub const INCENDIARY_FIRE_TICKS: i32 = 120;
+pub const INCENDIARY_IGNITE_BLOCKS: u32 = 7;
+pub const INCENDIARY_FIRE_SPREAD: f64 = 3.2;
 
-pub const FROZEN_RADIUS: f64 = 5.0;
-pub const FROZEN_SLOWNESS_TICKS: i32 = 200;
+pub const LIGHTNING_STRIKES: u32 = 3;
+pub const LIGHTNING_SPREAD: f64 = 2.5;
+
+pub const FROZEN_RADIUS: f64 = 6.0;
+pub const FROZEN_SLOWNESS_TICKS: i32 = 160;
 pub const FROZEN_SLOWNESS_AMPLIFIER: u8 = 2;
-pub const FROZEN_ICE_RADIUS: i32 = 2;
+pub const FROZEN_ICE_RADIUS: i32 = 3;
 
-pub const SEEKER_POWER: f32 = 2.0;
-pub const SEEKER_SPEED: f64 = 0.8;
-pub const SEEKER_RANGE: f64 = 20.0;
+pub const SEEKER_POWER: f32 = 3.5;
+pub const SEEKER_BREAKS_BLOCKS: bool = true;
+pub const SEEKER_SPEED: f64 = 1.25;
+pub const SEEKER_RANGE: f64 = 64.0;
+pub const SEEKER_DETONATE_DISTANCE: f64 = 1.9;
 
-pub const HEALING_RADIUS: f64 = 5.0;
-pub const HEALING_REGENERATION_TICKS: i32 = 100;
+pub const HEALING_RADIUS: f64 = 6.0;
+pub const HEALING_REGENERATION_TICKS: i32 = 60;
 pub const HEALING_REGENERATION_AMPLIFIER: u8 = 1;
-pub const HEALING_THROW_POWER: f64 = 0.5;
+pub const HEALING_DURATION_TICKS: u32 = 20 * 12;
+pub const HEALING_PULSE_TICKS: u32 = 20;
+pub const HEALING_PULSE_HEALTH: f32 = 2.0;
+pub const HEALING_THROW_POWER: f64 = 1.1;
 
-pub const QUAKE_RADIUS: f64 = 6.0;
-pub const QUAKE_LIFT: f64 = 1.2;
+pub const QUAKE_RADIUS: f64 = 7.0;
+pub const QUAKE_LIFT: f64 = 1.25;
+pub const QUAKE_POWER: f32 = 2.5;
+pub const QUAKE_BREAKS_BLOCKS: bool = true;
 
-pub const DARKNESS_RADIUS: f64 = 6.0;
+pub const DARKNESS_RADIUS: f64 = 8.0;
 pub const DARKNESS_BLINDNESS_TICKS: i32 = 160;
 pub const DARKNESS_BLINDNESS_AMPLIFIER: u8 = 0;
 
 pub const SPLIT_COUNT: u32 = 4;
-pub const SPLIT_HORIZONTAL_SPEED: f64 = 0.5;
-pub const SPLIT_VERTICAL_SPEED: f64 = 0.6;
+pub const SPLIT_HORIZONTAL_SPEED: f64 = 0.85;
+pub const SPLIT_VERTICAL_SPEED: f64 = 0.75;
 pub const SPLIT_CHILD: SheepKind = SheepKind::Seeker;
-pub const SPLIT_PARENT_POWER: f32 = 2.0;
+pub const SPLIT_PARENT_POWER: f32 = 2.5;
+pub const SPLIT_PARENT_BREAKS_BLOCKS: bool = true;
 
 pub const WARP_RADIUS: f64 = 8.0;
 pub const WARP_PUSH: f64 = 2.0;
-pub const WARP_LIFT: f64 = 0.8;
-pub const WARP_BLAST_POWER: f32 = 2.5;
+pub const WARP_LIFT: f64 = 0.85;
+pub const WARP_BLAST_POWER: f32 = 3.0;
 pub const WARP_BLAST_BREAKS_BLOCKS: bool = true;
 
 pub const INTERGALACTIC_METEORS: u32 = 8;
