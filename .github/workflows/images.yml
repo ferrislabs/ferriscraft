@@ -63,6 +63,7 @@ jobs:
         uses: docker/bake-action@v6
         with:
           workdir: ferriscraft
+          source: .
           files: docker-bake.hcl
           allow: |
             fs.read=${{ github.workspace }}/rspigot
@@ -79,6 +80,7 @@ jobs:
         uses: docker/bake-action@v6
         with:
           workdir: ferriscraft
+          source: .
           files: docker-bake.hcl
           allow: |
             fs.read=${{ github.workspace }}/rspigot
