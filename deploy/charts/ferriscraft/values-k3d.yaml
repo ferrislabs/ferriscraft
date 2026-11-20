@@ -28,3 +28,19 @@ lobby:
     consoleUrl: "http://localhost:4080"
     resource: "http://localhost:4100"
 
+s3:
+  enabled: true
+  endpoint: "http://ferriscraft-rustfs:9000"
+  bucket: "ferriscraft-maps"
+  prefix: "maps/"
+  region: "us-east-1"
+  pathStyle: true
+  cacheTtlSecs: 10
+  devAccessKeyId: "ferriscraft"
+  devSecretAccessKey: "ferriscraft-dev-s3-secret"
+
+rustfs:
+  enabled: true
+  persistence:
+    enabled: true
+    size: 2Gi

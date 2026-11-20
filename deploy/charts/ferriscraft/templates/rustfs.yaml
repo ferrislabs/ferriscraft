@@ -1,0 +1,120 @@
+{{- if .Values.rustfs.enabled }}
+{{- if .Values.rustfs.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "ferriscraft.fullname" . }}-rustfs-data
+  labels:
+    {{- include "ferriscraft.labels" . | nindent 4 }}
+    app.kubernetes.io/component: rustfs
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- if .Values.rustfs.persistence.storageClass }}
+  storageClassName: {{ .Values.rustfs.persistence.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.rustfs.persistence.size }}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ferriscraft.fullname" . }}-rustfs
+  labels:
+    {{- include "ferriscraft.labels" . | nindent 4 }}
+    app.kubernetes.io/component: rustfs
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "ferriscraft.labels" . | nindent 6 }}
+      app.kubernetes.io/component: rustfs
+  template:
+    metadata:
+      labels:
+        {{- include "ferriscraft.labels" . | nindent 8 }}
+        app.kubernetes.io/component: rustfs
+    spec:
+      securityContext:
+        fsGroup: 10001
+      containers:
+        - name: rustfs
+          image: "{{ .Values.rustfs.image.repository }}:{{ .Values.rustfs.image.tag }}"
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          env:
+            - name: RUSTFS_VOLUMES
+              value: "/data"
+            - name: RUSTFS_ADDRESS
+              value: ":9000"
+            - name: RUSTFS_CONSOLE_ADDRESS
+              value: ":9001"
+            - name: RUSTFS_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ferriscraft.s3SecretName" . }}
+                  key: accessKeyId
+            - name: RUSTFS_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ferriscraft.s3SecretName" . }}
+                  key: secretAccessKey
+          ports:
+            - name: s3
+              containerPort: 9000
+              protocol: TCP
+            - name: console
+              containerPort: 9001
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: s3
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health/ready
+              port: s3
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          {{- with .Values.rustfs.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          {{- if .Values.rustfs.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "ferriscraft.fullname" . }}-rustfs-data
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ferriscraft.fullname" . }}-rustfs
+  labels:
+    {{- include "ferriscraft.labels" . | nindent 4 }}
+    app.kubernetes.io/component: rustfs
+spec:
+  selector:
+    {{- include "ferriscraft.labels" . | nindent 4 }}
+    app.kubernetes.io/component: rustfs
+  ports:
+    - name: s3
+      port: 9000
+      targetPort: s3
+      protocol: TCP
+    - name: console
+      port: 9001
+      targetPort: console
+      protocol: TCP
+{{- end }}

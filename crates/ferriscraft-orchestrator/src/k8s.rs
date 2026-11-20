@@ -14,6 +14,8 @@ use uuid::Uuid;
 use crate::api::AppState;
 use crate::config::OrchestratorConfig;
 
+use crate::s3::{MapCatalog, S3Client, sanitize_k8s_label};
+
 const SHEEPWARS_SELECTOR: &str =
     "app.kubernetes.io/component=sheepwars,app.kubernetes.io/managed-by=ferriscraft-orchestrator";
 
@@ -39,6 +41,7 @@ pub fn build_sheepwars_pod(
     pod_name: &str,
     config: &OrchestratorConfig,
     template: Option<&PodTemplateSpec>,
+    selected_map: Option<&str>,
 ) -> Pod {
     let mut labels = BTreeMap::new();
     labels.insert(
@@ -54,6 +57,12 @@ pub fn build_sheepwars_pod(
         "ferriscraft-orchestrator".to_owned(),
     );
     labels.insert("ferriscraft.io/server-id".to_owned(), pod_name.to_owned());
+    if let Some(map_name) = selected_map {
+        let label = sanitize_k8s_label(map_name);
+        if !label.is_empty() {
+            labels.insert("ferriscraft.io/map".to_owned(), label);
+        }
+    }
 
     let mut annotations = BTreeMap::new();
     if let Some(tpl) = template
@@ -77,6 +86,14 @@ pub fn build_sheepwars_pod(
 
     spec.restart_policy = Some("Never".to_owned());
 
+    if let Some(init_containers) = &mut spec.init_containers {
+        for container in init_containers {
+            if let Some(map_name) = selected_map {
+                upsert_env(&mut container.env, "SHEEPWARS_MAP_NAME", map_name);
+            }
+        }
+    }
+
     for container in &mut spec.containers {
         upsert_env(&mut container.env, "SERVER_ID", pod_name);
         upsert_env(
@@ -94,6 +111,9 @@ pub fn build_sheepwars_pod(
             "SERVER_PORT",
             &config.sheepwars_port.to_string(),
         );
+        if let Some(map_name) = selected_map {
+            upsert_env(&mut container.env, "SHEEPWARS_MAP_NAME", map_name);
+        }
     }
 
     Pod {
@@ -209,6 +229,51 @@ fn is_pod_terminating_or_done(pod: &Pod) -> bool {
     )
 }
 
+struct MapDiscoveryState {
+    client: S3Client,
+    catalog: MapCatalog,
+    last_refresh: Option<Instant>,
+}
+
+impl MapDiscoveryState {
+    fn new(client: S3Client) -> Self {
+        Self {
+            client,
+            catalog: MapCatalog::default(),
+            last_refresh: None,
+        }
+    }
+
+    async fn refresh_if_due(&mut self, ttl: Duration) {
+        let now = Instant::now();
+        let retry_interval = if self.catalog.maps().is_empty() {
+            ttl.min(Duration::from_secs(3))
+        } else {
+            ttl
+        };
+        if let Some(last) = self.last_refresh
+            && now.duration_since(last) < retry_interval
+        {
+            return;
+        }
+        self.last_refresh = Some(now);
+        match self.client.list_maps().await {
+            Ok(maps) => {
+                if self.catalog.update(maps) {
+                    tracing::info!(
+                        maps = ?self.catalog.maps(),
+                        bucket = %self.client.config().bucket,
+                        "Catalogue des maps SheepWars mis à jour depuis S3"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(%err, "Impossible de lister les maps S3");
+            }
+        }
+    }
+}
+
 pub async fn run_k8s_reconcile_loop(state: AppState, config: OrchestratorConfig) {
     let client = match Client::try_default().await {
         Ok(c) => c,
@@ -220,18 +285,42 @@ pub async fn run_k8s_reconcile_loop(state: AppState, config: OrchestratorConfig)
     let pods_api: Api<Pod> = Api::namespaced(client, &config.k8s_namespace);
     let template = load_pod_template(&config);
 
+    let mut map_discovery = config
+        .s3
+        .as_ref()
+        .and_then(|s3_cfg| match S3Client::new(s3_cfg.clone()) {
+            Ok(client) => Some(MapDiscoveryState::new(client)),
+            Err(err) => {
+                tracing::error!(%err, "Configuration endpoint S3 invalide");
+                None
+            }
+        });
+
     tracing::info!(
         namespace = %config.k8s_namespace,
         min_replicas = config.min_replicas,
         max_replicas = config.max_replicas,
         queue_min_players = config.queue_min_players,
+        s3_enabled = map_discovery.is_some(),
+        fixed_map = ?config.fixed_map,
         "Réconciliateur Kubernetes SheepWars démarré"
     );
 
     let mut ticker = tokio::time::interval(config.reconcile_interval);
     loop {
         ticker.tick().await;
-        if let Err(err) = reconcile_once(&state, &config, &pods_api, template.as_ref()).await {
+        if let Some(discovery) = map_discovery.as_mut() {
+            discovery.refresh_if_due(config.s3_cache_ttl).await;
+        }
+        if let Err(err) = reconcile_once(
+            &state,
+            &config,
+            &pods_api,
+            template.as_ref(),
+            map_discovery.as_mut(),
+        )
+        .await
+        {
             tracing::warn!(%err, "Erreur lors de la réconciliation Kubernetes");
         }
     }
@@ -242,6 +331,7 @@ async fn reconcile_once(
     config: &OrchestratorConfig,
     pods_api: &Api<Pod>,
     template: Option<&PodTemplateSpec>,
+    mut map_discovery: Option<&mut MapDiscoveryState>,
 ) -> Result<(), kube::Error> {
     let lp = ListParams::default().labels(SHEEPWARS_SELECTOR);
     let list = pods_api.list(&lp).await?;
@@ -299,10 +389,26 @@ async fn reconcile_once(
     }
 
     for _ in 0..actions.servers_to_create {
+        let selected_map: Option<String> = if let Some(fixed) = &config.fixed_map {
+            Some(fixed.clone())
+        } else if let Some(discovery) = map_discovery.as_deref_mut() {
+            match discovery.catalog.next_map() {
+                Some(map) => Some(map.to_owned()),
+                None => {
+                    tracing::warn!(
+                        "Création de Pod SheepWars différée : aucune map disponible dans S3"
+                    );
+                    break;
+                }
+            }
+        } else {
+            None
+        };
+
         let short = Uuid::new_v4().simple().to_string();
         let pod_name = format!("sheepwars-{}", &short[..6]);
-        let pod = build_sheepwars_pod(&pod_name, config, template);
-        tracing::info!(%pod_name, "Création d'un nouveau Pod SheepWars");
+        let pod = build_sheepwars_pod(&pod_name, config, template, selected_map.as_deref());
+        tracing::info!(%pod_name, map = ?selected_map, "Création d'un nouveau Pod SheepWars");
         match pods_api.create(&PostParams::default(), &pod).await {
             Ok(_) => {
                 let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
@@ -316,4 +422,92 @@ async fn reconcile_once(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::BackendMode;
+
+    fn test_config() -> OrchestratorConfig {
+        OrchestratorConfig {
+            bind_addr: "127.0.0.1:8080".parse().unwrap(),
+            backend: BackendMode::Kubernetes,
+            api_token: None,
+            lobby_server_name: "lobby".to_owned(),
+            queue_min_players: 1,
+            max_players_per_server: 16,
+            min_replicas: 1,
+            max_replicas: 5,
+            standby_servers: 1,
+            idle_ttl: Duration::from_secs(60),
+            starting_timeout: Duration::from_secs(120),
+            transfer_timeout: Duration::from_secs(15),
+            reconcile_interval: Duration::from_secs(1),
+            k8s_namespace: "ferriscraft".to_owned(),
+            pod_template_path: None,
+            sheepwars_image: "ghcr.io/ferrislabs/ferriscraft-rspigot:dev".to_owned(),
+            sheepwars_port: 25565,
+            forwarding_secret_name: "ferriscraft-forwarding".to_owned(),
+            orchestrator_public_url: "http://ferriscraft-orchestrator:8080".to_owned(),
+            static_servers: Vec::new(),
+            s3: None,
+            s3_cache_ttl: Duration::from_secs(30),
+            fixed_map: None,
+        }
+    }
+
+    #[test]
+    fn build_sheepwars_pod_injects_map_into_init_containers_and_labels() {
+        let template = PodTemplateSpec {
+            metadata: None,
+            spec: Some(PodSpec {
+                init_containers: Some(vec![Container {
+                    name: "map-sync".to_owned(),
+                    ..Default::default()
+                }]),
+                containers: vec![
+                    Container {
+                        name: "rspigot".to_owned(),
+                        ..Default::default()
+                    },
+                    Container {
+                        name: "sheepwars-plugin".to_owned(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+        };
+
+        let pod = build_sheepwars_pod(
+            "sheepwars-abc123",
+            &test_config(),
+            Some(&template),
+            Some("steampunk"),
+        );
+
+        let labels = pod.metadata.labels.as_ref().unwrap();
+        assert_eq!(labels.get("ferriscraft.io/map").unwrap(), "steampunk");
+
+        let spec = pod.spec.as_ref().unwrap();
+        let init_env = spec.init_containers.as_ref().unwrap()[0]
+            .env
+            .as_ref()
+            .unwrap();
+        assert!(
+            init_env
+                .iter()
+                .any(|e| e.name == "SHEEPWARS_MAP_NAME" && e.value.as_deref() == Some("steampunk"))
+        );
+
+        for container in &spec.containers {
+            let envs = container.env.as_ref().unwrap();
+            assert!(
+                envs.iter().any(
+                    |e| e.name == "SHEEPWARS_MAP_NAME" && e.value.as_deref() == Some("steampunk")
+                )
+            );
+        }
+    }
 }

@@ -28,3 +28,11 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- printf "%s-orch-token" (include "ferriscraft.fullname" .) -}}
 {{- end -}}
 {{- end -}}
+
+{{- define "ferriscraft.s3SecretName" -}}
+{{- if .Values.s3.existingSecret -}}
+{{- .Values.s3.existingSecret -}}
+{{- else if .Values.s3.enabled -}}
+{{- printf "%s-s3" (include "ferriscraft.fullname" .) -}}
+{{- end -}}
+{{- end -}}

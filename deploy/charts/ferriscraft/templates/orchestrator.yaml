@@ -7,12 +7,16 @@ metadata:
     app.kubernetes.io/component: orchestrator
 spec:
   replicas: {{ .Values.orchestrator.replicas }}
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "ferriscraft.labels" . | nindent 6 }}
       app.kubernetes.io/component: orchestrator
   template:
     metadata:
+      annotations:
+        checksum/sheepwars-template: {{ include (print $.Template.BasePath "/sheepwars-template-cm.yaml") . | sha256sum }}
       labels:
         {{- include "ferriscraft.labels" . | nindent 8 }}
         app.kubernetes.io/component: orchestrator
@@ -69,6 +73,34 @@ spec:
                 secretKeyRef:
                   name: {{ include "ferriscraft.orchestratorTokenSecretName" . }}
                   key: token
+            {{- end }}
+            {{- if .Values.s3.enabled }}
+            - name: S3_ENDPOINT
+              value: {{ .Values.s3.endpoint | quote }}
+            - name: S3_BUCKET
+              value: {{ .Values.s3.bucket | quote }}
+            - name: S3_PREFIX
+              value: {{ .Values.s3.prefix | quote }}
+            - name: S3_REGION
+              value: {{ .Values.s3.region | quote }}
+            - name: S3_PATH_STYLE
+              value: {{ .Values.s3.pathStyle | quote }}
+            - name: S3_CACHE_TTL_SECS
+              value: {{ .Values.s3.cacheTtlSecs | quote }}
+            {{- if .Values.s3.fixedMap }}
+            - name: SHEEPWARS_MAP
+              value: {{ .Values.s3.fixedMap | quote }}
+            {{- end }}
+            - name: S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ferriscraft.s3SecretName" . }}
+                  key: accessKeyId
+            - name: S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ferriscraft.s3SecretName" . }}
+                  key: secretAccessKey
             {{- end }}
           ports:
             - name: http

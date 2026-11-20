@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use thiserror::Error;
 
+use crate::s3::{S3Config, S3Error};
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("adresse d'écoute invalide ({0}) : {1}")]
@@ -12,6 +14,8 @@ pub enum ConfigError {
     InvalidBackend(String),
     #[error("entrée statique invalide ({0}) : format attendu 'nom=host:port'")]
     InvalidStaticServer(String),
+    #[error("{0}")]
+    InvalidS3(#[from] S3Error),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +52,9 @@ pub struct OrchestratorConfig {
     pub forwarding_secret_name: String,
     pub orchestrator_public_url: String,
     pub static_servers: Vec<StaticServerSpec>,
+    pub s3: Option<S3Config>,
+    pub s3_cache_ttl: Duration,
+    pub fixed_map: Option<String>,
 }
 
 fn non_empty_env(name: &str) -> Option<String> {
@@ -174,6 +181,9 @@ impl OrchestratorConfig {
             orchestrator_public_url: non_empty_env("ORCHESTRATOR_PUBLIC_URL")
                 .unwrap_or_else(|| "http://ferriscraft-orchestrator:8080".to_owned()),
             static_servers,
+            s3: S3Config::from_env()?,
+            s3_cache_ttl: Duration::from_secs(parse_u64_env("S3_CACHE_TTL_SECS", 30).max(1)),
+            fixed_map: non_empty_env("SHEEPWARS_MAP"),
         })
     }
 }
