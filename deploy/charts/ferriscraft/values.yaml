@@ -136,3 +136,36 @@ sheepwars:
   nodeSelector: {}
   tolerations: []
 
+# Stockage S3 multi-maps pour les arènes SheepWars
+s3:
+  enabled: false
+  endpoint: ""
+  bucket: "ferriscraft-maps"
+  prefix: "maps/"
+  region: "us-east-1"
+  pathStyle: true
+  cacheTtlSecs: 30
+  # Optionnel : forcer une map fixe (sinon rotation automatique parmi les maps S3)
+  fixedMap: ""
+  # En production, fournir un Secret existant contenant accessKeyId et secretAccessKey
+  existingSecret: ""
+  devAccessKeyId: ""
+  devSecretAccessKey: ""
+
+# Serveur S3 compatible local (uniquement pour dev / k3d)
+rustfs:
+  enabled: false
+  image:
+    repository: rustfs/rustfs
+    tag: latest
+  persistence:
+    enabled: false
+    size: 2Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi

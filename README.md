@@ -71,13 +71,19 @@ Variables principales :
 cargo run --release -p ferriscraft-lobby
 ```
 
-### Terminal 4 *(optionnel)* — Serveur `rspigot` SheepWars (`:25567`, gRPC `:25581`)
+### Terminal 4 — Serveur `rspigot` SheepWars (`:25567`, gRPC `:25581`)
 
 ```bash
 /opt/minecraft/dev/rspigot/target/release/rspigot --world-dir ./server-sheepwars
 ```
 
-*(Le plugin SheepWars se connectera ensuite avec `RSPIGOT_URL=http://127.0.0.1:25581`, et pourra renvoyer les joueurs au Hub en fin de partie via `player.connection.transfer("lobby.localhost", 25565).await`.)*
+### Terminal 5 — Plugin `ferriscraft-sheepwars`
+
+```bash
+RSPIGOT_URL=http://127.0.0.1:25581 RSPIGOT_PLUGIN_NAME=ferriscraft-sheepwars cargo run --release -p ferriscraft-sheepwars
+```
+
+*(Optionnel : ajouter `ORCHESTRATOR_URL=http://127.0.0.1:8080` et `SERVER_ID=sheepwars-1` si l'orchestrateur local tourne ; sinon le plugin enchaîne les manches sur place. En jeu : `/sheepwars join|leave|hub` et admin `/sheepwars forcestart|stop`.)*
 
 ---
 
@@ -122,7 +128,8 @@ Composants de gestion de flotte :
 |---|---|---|
 | **`ferriscraft-orchestrator`** | File d'attente FIFO, matchmaking par lots, scaling dynamique de `min` à `k` (`SHEEPWARS_MAX_REPLICAS`) Pods SheepWars via `kube-rs`, flux SSE proxy | [`crates/ferriscraft-orchestrator`](./crates/ferriscraft-orchestrator) |
 | **`ferriscraft-velocity`** | Plugin Velocity 4.3.1 enregistrant dynamiquement les Pods `sheepwars-*` et transférant les joueurs sans déconnexion client | [`proxy/velocity-plugin`](./proxy/velocity-plugin) |
-| **`ferriscraft-protocol`** | Contrat JSON partagé (queue, heartbeat, phases, retours Hub) pour le futur plugin SheepWars | [`crates/ferriscraft-protocol`](./crates/ferriscraft-protocol) |
+| **`ferriscraft-sheepwars`** | Plugin de mini-jeu SheepWars (arène, moutons spéciaux, HUD, heartbeat orchestrateur, retour au Hub) | [`crates/ferriscraft-sheepwars`](./crates/ferriscraft-sheepwars) |
+| **`ferriscraft-protocol`** | Contrat JSON partagé (queue, heartbeat, phases, retours Hub) | [`crates/ferriscraft-protocol`](./crates/ferriscraft-protocol) |
 
 ### Construire les images Docker (avec contexte `rspigot` local)
 
@@ -153,5 +160,17 @@ helm upgrade --install ferriscraft ./deploy/charts/ferriscraft \
   --set orchestrator.queue.minPlayers=8
 ```
 
-Voir [`docs/SHEEPWARS_PLUGIN_CONTRACT.md`](./docs/SHEEPWARS_PLUGIN_CONTRACT.md) pour brancher le futur plugin SheepWars en sidecar.
+### Maps SheepWars multi-arènes sur S3
+
+En mode S3 (`s3.enabled=true`), l'orchestrateur découvre les maps complètes sous `s3://<bucket>/<prefix><nom>/{world.zip,arena.json}`, effectue une rotation à la création de chaque Pod SheepWars et injecte la map choisie via l'`initContainer` `map-sync` (`/usr/local/bin/ferriscraft-map-sync`). En dev local (`values-k3d.yaml`), un serveur **RustFS** compatible S3 est déployé dans le cluster.
+
+Téléverser une nouvelle map (vers `k3d-ferriscraft` via port-forward automatique, ou vers un `S3_ENDPOINT` externe) :
+
+```bash
+./deploy/scripts/upload-map.sh steampunk server-sheepwars
+# ou explicitement :
+./deploy/scripts/upload-map.sh ma-map /chemin/world.zip /chemin/arena.json
+```
+
+Voir [`docs/SHEEPWARS_PLUGIN_CONTRACT.md`](./docs/SHEEPWARS_PLUGIN_CONTRACT.md) pour les variables d'environnement et le contrat du sidecar `ferriscraft-sheepwars`.
 
