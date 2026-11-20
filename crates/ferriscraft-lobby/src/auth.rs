@@ -348,6 +348,8 @@ enum AuthScope {
 }
 
 struct RealmTarget<'a> {
+    internal_base_url: &'a str,
+    public_base_url: Option<&'a str>,
     device_auth_url: String,
     token_url: String,
     client_id: &'a str,
@@ -355,6 +357,23 @@ struct RealmTarget<'a> {
     scope: &'a str,
     resource: Option<&'a str>,
     dedicated_capitainerie: bool,
+}
+
+fn authority_of_url(url: &str) -> Option<&str> {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme.split('/').next()?.trim();
+    (!authority.is_empty()).then_some(authority)
+}
+
+fn rewrite_public_url(url: &str, internal_base: &str, public_base: &str) -> String {
+    let internal = internal_base.trim_end_matches('/');
+    let public = public_base.trim_end_matches('/');
+    if let Some(rest) = url.strip_prefix(internal)
+        && (rest.is_empty() || rest.starts_with('/'))
+    {
+        return format!("{public}{rest}");
+    }
+    url.to_owned()
 }
 
 struct SessionStore {
@@ -564,6 +583,8 @@ impl AuthManager {
     fn target_for(&self, scope: AuthScope) -> RealmTarget<'_> {
         match self.effective_scope(scope) {
             AuthScope::Lobby => RealmTarget {
+                internal_base_url: self.config.ferriskey_base_url.as_str(),
+                public_base_url: self.config.ferriskey_public_url.as_deref(),
                 device_auth_url: self.config.device_auth_url(),
                 token_url: self.config.token_url(),
                 client_id: self.config.ferriskey_client_id.as_str(),
@@ -577,6 +598,8 @@ impl AuthManager {
                 dedicated_capitainerie: false,
             },
             AuthScope::Capitainerie => RealmTarget {
+                internal_base_url: self.config.capitainerie_ferriskey_url.as_str(),
+                public_base_url: self.config.capitainerie_ferriskey_public_url.as_deref(),
                 device_auth_url: self.config.capitainerie_device_auth_url(),
                 token_url: self.config.capitainerie_token_url(),
                 client_id: self.config.capitainerie_client_id.as_str(),
@@ -586,6 +609,19 @@ impl AuthManager {
                 dedicated_capitainerie: true,
             },
         }
+    }
+
+    fn post_oauth_form(
+        &self,
+        url: &str,
+        public_base_url: Option<&str>,
+        form: &[(&str, &str)],
+    ) -> reqwest::RequestBuilder {
+        let mut req = self.http.post(url).form(form);
+        if let Some(authority) = public_base_url.and_then(authority_of_url) {
+            req = req.header(reqwest::header::HOST, authority);
+        }
+        req
     }
 
     pub fn session_of(&self, uuid: Uuid) -> Option<PlayerSession> {
@@ -660,9 +696,7 @@ impl AuthManager {
         }
 
         let response = self
-            .http
-            .post(target.device_auth_url)
-            .form(&form)
+            .post_oauth_form(&target.device_auth_url, target.public_base_url, &form)
             .send()
             .await?;
 
@@ -672,7 +706,14 @@ impl AuthManager {
             return Err(AuthError::Rejected { status, message });
         }
 
-        let device: DeviceAuthorization = response.json().await?;
+        let mut device: DeviceAuthorization = response.json().await?;
+        if let Some(public_base) = target.public_base_url {
+            device.verification_uri =
+                rewrite_public_url(&device.verification_uri, target.internal_base_url, public_base);
+            device.verification_uri_complete = device
+                .verification_uri_complete
+                .map(|uri| rewrite_public_url(&uri, target.internal_base_url, public_base));
+        }
         let rx = store.register_pending(player_uuid);
         Ok((device, rx))
     }
@@ -735,7 +776,10 @@ impl AuthManager {
                 form.push(("resource", resource));
             }
 
-            let response = self.http.post(&target.token_url).form(&form).send().await?;
+            let response = self
+                .post_oauth_form(&target.token_url, target.public_base_url, &form)
+                .send()
+                .await?;
 
             if response.status().is_success() {
                 let granted: TokenSuccess = response.json().await?;
@@ -825,7 +869,10 @@ impl AuthManager {
             form.push(("resource", resource));
         }
 
-        let response = self.http.post(&target.token_url).form(&form).send().await?;
+        let response = self
+            .post_oauth_form(&target.token_url, target.public_base_url, &form)
+            .send()
+            .await?;
 
         if !response.status().is_success() {
             store.logout(player_uuid);
@@ -964,6 +1011,7 @@ mod tests {
 
         let cfg = EnvConfig {
             ferriskey_base_url: format!("http://{addr}"),
+            ferriskey_public_url: None,
             ferriskey_realm: "ferriscraft".to_owned(),
             ferriskey_client_id: "ferriscraft-lobby".to_owned(),
             ferriskey_client_secret: None,
@@ -973,6 +1021,7 @@ mod tests {
             capitainerie_resource: None,
             capitainerie_observer_token: None,
             capitainerie_ferriskey_url: format!("http://{addr}"),
+            capitainerie_ferriskey_public_url: None,
             capitainerie_realm: "ferriscraft".to_owned(),
             capitainerie_client_id: "ferriscraft-lobby".to_owned(),
             capitainerie_client_secret: None,
@@ -1109,6 +1158,7 @@ mod tests {
 
         let cfg = EnvConfig {
             ferriskey_base_url: format!("http://{addr}"),
+            ferriskey_public_url: None,
             ferriskey_realm: "ferriscraft".to_owned(),
             ferriskey_client_id: "ferriscraft-lobby".to_owned(),
             ferriskey_client_secret: Some("lobby-secret".to_owned()),
@@ -1118,6 +1168,7 @@ mod tests {
             capitainerie_resource: Some("http://localhost:4100".to_owned()),
             capitainerie_observer_token: None,
             capitainerie_ferriskey_url: format!("http://{addr}"),
+            capitainerie_ferriskey_public_url: None,
             capitainerie_realm: "capitainerie".to_owned(),
             capitainerie_client_id: "minecraft".to_owned(),
             capitainerie_client_secret: None,
@@ -1170,5 +1221,104 @@ mod tests {
         assert!(manager.capitainerie_logout(player_id));
         assert!(!manager.is_capitainerie_authenticated(player_id));
         assert!(manager.is_authenticated(player_id));
+    }
+
+    #[tokio::test]
+    async fn device_flow_uses_public_url_host_header_and_rewrites_verification_uris() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let internal_url = format!("http://{addr}");
+        let internal_for_route = internal_url.clone();
+
+        let app = Router::new()
+            .route(
+                "/realms/capitainerie/protocol/openid-connect/auth/device",
+                post(move |headers: axum::http::HeaderMap| {
+                    let internal_resp = internal_for_route.clone();
+                    async move {
+                        let host = headers
+                            .get(axum::http::header::HOST)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_owned);
+                        assert_eq!(host.as_deref(), Some("localhost:3333"));
+                        Json(json!({
+                            "device_code": "dc-pub",
+                            "user_code": "PUB-99",
+                            "verification_uri": format!("{internal_resp}/realms/capitainerie/device"),
+                            "verification_uri_complete": format!("{internal_resp}/realms/capitainerie/device?user_code=PUB-99"),
+                            "expires_in": 300,
+                            "interval": 1
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/realms/capitainerie/protocol/openid-connect/token",
+                post(|headers: axum::http::HeaderMap| async move {
+                    let host = headers
+                        .get(axum::http::header::HOST)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
+                    assert_eq!(host.as_deref(), Some("localhost:3333"));
+                    let jwt = make_jwt(&json!({
+                        "sub": "u-pub",
+                        "preferred_username": "pub_user",
+                        "iss": "http://localhost:3333/realms/capitainerie"
+                    }));
+                    Json(json!({
+                        "access_token": jwt,
+                        "refresh_token": "rt-pub",
+                        "expires_in": 600
+                    }))
+                }),
+            );
+
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let cfg = EnvConfig {
+            ferriskey_base_url: internal_url.clone(),
+            ferriskey_public_url: Some("http://localhost:3333".to_owned()),
+            ferriskey_realm: "capitainerie".to_owned(),
+            ferriskey_client_id: "minecraft".to_owned(),
+            ferriskey_client_secret: None,
+            ferriskey_scope: "openid profile email".to_owned(),
+            capitainerie_url: None,
+            capitainerie_console_url: None,
+            capitainerie_resource: None,
+            capitainerie_observer_token: None,
+            capitainerie_ferriskey_url: internal_url,
+            capitainerie_ferriskey_public_url: Some("http://localhost:3333".to_owned()),
+            capitainerie_realm: "capitainerie".to_owned(),
+            capitainerie_client_id: "minecraft".to_owned(),
+            capitainerie_client_secret: None,
+            capitainerie_scope: "openid profile email".to_owned(),
+            capitainerie_sessions_path: PathBuf::new(),
+            sheepwars_transfer: None,
+            sheepwars_backend: None,
+            sheepwars_world: None,
+            orchestrator_url: None,
+            orchestrator_token: None,
+            layout_path: PathBuf::new(),
+            sessions_path: PathBuf::new(),
+        };
+
+        let manager = AuthManager::new(cfg);
+        let player_id = Uuid::new_v4();
+        let (device, cancel_rx) = manager.start_device_flow(player_id).await.expect("start");
+        assert_eq!(
+            device.verification_uri,
+            "http://localhost:3333/realms/capitainerie/device"
+        );
+        assert_eq!(
+            device.browser_url(),
+            "http://localhost:3333/realms/capitainerie/device?user_code=PUB-99"
+        );
+        let session = manager
+            .poll_device_flow(player_id, &device, cancel_rx)
+            .await
+            .expect("poll succeeds");
+        assert_eq!(session.claims.username, "pub_user");
     }
 }

@@ -1,14 +1,16 @@
 # Contrat d'intégration du plugin SheepWars ↔ Orchestrateur FerrisCraft
 
-Ce document décrit comment le futur plugin **SheepWars** (exécuté en sidecar dans chaque Pod `sheepwars-*`) s'intègre avec `ferriscraft-orchestrator` et `ferriscraft-velocity`.
+Ce document décrit comment le plugin **`ferriscraft-sheepwars`** ([`crates/ferriscraft-sheepwars`](../crates/ferriscraft-sheepwars)) — exécuté en sidecar dans chaque Pod `sheepwars-*` — s'intègre avec `ferriscraft-orchestrator` et `ferriscraft-velocity`.
 
-Les DTOs Rust partagés sont déjà disponibles dans le crate [`crates/ferriscraft-protocol`](../crates/ferriscraft-protocol/src/lib.rs).
+Les DTOs Rust partagés sont disponibles dans le crate [`crates/ferriscraft-protocol`](../crates/ferriscraft-protocol/src/lib.rs).
 
 ---
 
-## 1. Variables d'environnement injectées automatiquement dans le Pod
+## 1. Variables d'environnement
 
-L'orchestrateur injecte ces variables dans chaque conteneur du Pod SheepWars :
+### Injectées automatiquement dans le Pod
+
+L'orchestrateur et le template Helm injectent ces variables dans chaque conteneur du Pod SheepWars :
 
 | Variable | Exemple | Rôle |
 |---|---|---|
@@ -16,13 +18,27 @@ L'orchestrateur injecte ces variables dans chaque conteneur du Pod SheepWars :
 | `ORCHESTRATOR_URL` | `http://ferriscraft-orchestrator:8080` | URL HTTP interne du control plane |
 | `ORCHESTRATOR_TOKEN` | *(optionnel)* | Jeton Bearer (`Authorization: Bearer <token>`) si activé |
 | `RSPIGOT_URL` | `http://127.0.0.1:25581` | Endpoint gRPC du conteneur `rspigot` local au Pod |
+| `RSPIGOT_PLUGIN_NAME` | `ferriscraft-sheepwars` | Nom d'enregistrement du plugin gRPC |
 | `SHEEPWARS_MAX_PLAYERS` | `16` | Capacité maximale configurée pour l'arène |
+
+### Paramètres optionnels du plugin (`ferriscraft-sheepwars`)
+
+| Variable | Défaut | Rôle |
+|---|---|---|
+| `SHEEPWARS_MIN_PLAYERS` | `2` | Nombre minimum de joueurs pour lancer le compte à rebours |
+| `SHEEPWARS_COUNTDOWN_SECS` | `15` | Durée du compte à rebours avant le début de la partie |
+| `SHEEPWARS_SHEEP_INTERVAL_SECS` | `20` | Intervalle de distribution des moutons |
+| `SHEEPWARS_LIVES` | `3` | Nombre de vies par joueur |
+| `SHEEPWARS_END_DELAY_SECS` | `10` | Délai de célébration avant le retour au Hub |
+| `SHEEPWARS_EPHEMERAL` | `true` si `ORCHESTRATOR_URL` est défini | Termine en phase `ending` pour recyclage du Pod K8s (sinon réinitialise l'arène pour une nouvelle manche) |
+| `SHEEPWARS_HEARTBEAT_INTERVAL_MS` | `2000` | Cadence d'envoi du heartbeat (minimum `500` ms) |
+| `SHEEPWARS_ARENA_PATH` | `arena.json` (`/tmp/arena.json` en K8s) | Chemin JSON optionnel de personnalisation d'arène |
 
 ---
 
 ## 2. Cycle de vie d'une partie (`ServerPhase`)
 
-Envoyer un heartbeat toutes les **2 à 3 secondes** sur `POST ${ORCHESTRATOR_URL}/api/v1/servers/heartbeat` :
+Un heartbeat est envoyé toutes les **2 secondes** (et immédiatement à chaque connexion, déconnexion ou transition de phase) sur `POST ${ORCHESTRATOR_URL}/api/v1/servers/heartbeat` :
 
 ```json
 {
@@ -41,7 +57,7 @@ Valeurs de `phase` :
 | `starting` | Pod en cours d'initialisation (non joignable par la file) |
 | `waiting` | Serveur prêt : l'orchestrateur y dispatche les joueurs de la file jusqu'à `max_players` |
 | `countdown` | Compte à rebours avant lancement : continue d'accepter les joueurs restants si places libres |
-| `in_game` | Partie lancée : retiré du matchmaking, l'orchestrateur provisionne un nouveau serveur `waiting` si la file demande (jusqu'à `k` max) |
+| `in_game` | Partie lancée (inclut la célébration) : retiré du matchmaking, l'orchestrateur provisionne un nouveau serveur `waiting` si la file demande (jusqu'à `k` max) |
 | `ending` | Partie terminée : désenregistré de Velocity puis **Pod supprimé proprement** dès `player_count == 0` (et remplacé par un Pod vierge si besoin) |
 
 > Sans plugin SheepWars actif, l'orchestrateur passe automatiquement le Pod en `waiting` dès que le port Minecraft TCP (`25565`) répond, afin de valider la file d'attente, le routage Velocity et le scaling sur `k` Pods.
@@ -50,9 +66,9 @@ Valeurs de `phase` :
 
 ## 3. Retourner les joueurs au Hub en fin de partie
 
-Lorsque la partie se termine (ou via `/hub` géré aussi par Velocity) :
+Lorsque la partie se termine (ou via `/sheepwars hub` / `/hub`) :
 
-1. Appeler pour chaque joueur :
+1. Appel pour chaque joueur :
    ```http
    POST ${ORCHESTRATOR_URL}/api/v1/players/{player_uuid}/send-lobby
    Content-Type: application/json
@@ -61,7 +77,7 @@ Lorsque la partie se termine (ou via `/hub` géré aussi par Velocity) :
    ```
    Velocity re-bascule instantanément le joueur sur `lobby` sans déconnexion.
 
-2. Passer le serveur en phase `ending` :
+2. Passage du serveur en phase `ending` :
    ```http
    POST ${ORCHESTRATOR_URL}/api/v1/servers/${SERVER_ID}/phase
    Content-Type: application/json
@@ -72,13 +88,16 @@ Lorsque la partie se termine (ou via `/hub` géré aussi par Velocity) :
 
 ---
 
-## 4. Déployer le plugin SheepWars dans Helm
+## 4. Déploiement dans Helm
 
-Dans [`deploy/charts/ferriscraft/values.yaml`](../deploy/charts/ferriscraft/values.yaml) :
+Le sidecar `ferriscraft-sheepwars` est activé par défaut dans [`deploy/charts/ferriscraft/values.yaml`](../deploy/charts/ferriscraft/values.yaml) :
 
 ```yaml
 sheepwars:
   pluginSidecar:
     enabled: true
-    image: ghcr.io/ferrislabs/ferriscraft-sheepwars-plugin:latest
+    image:
+      repository: ferriscraft-sheepwars-plugin
+      tag: ""
+    extraEnv: []
 ```

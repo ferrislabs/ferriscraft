@@ -20,20 +20,16 @@ if [[ ! -f "${DATA_DIR}/server.properties" && -f "${TEMPLATE_DIR}/server.propert
   cp "${TEMPLATE_DIR}/server.properties" "${DATA_DIR}/server.properties"
 fi
 
-# Always refresh arena world on SheepWars pods, or unpack once for Lobby
-if [[ "${MODE}" == "sheepwars" ]]; then
-  rm -rf "${DATA_DIR}/world"
+# Unpack world once (if not already populated by an initContainer) and copy arena.json
+if [[ ! -d "${DATA_DIR}/world" ]]; then
   if [[ -f "${TEMPLATE_DIR}/world.zip" ]]; then
     unzip -q -o "${TEMPLATE_DIR}/world.zip" -d "${DATA_DIR}"
   elif [[ -d "${TEMPLATE_DIR}/world" ]]; then
     cp -R "${TEMPLATE_DIR}/world" "${DATA_DIR}/world"
   fi
-elif [[ ! -d "${DATA_DIR}/world" ]]; then
-  if [[ -f "${TEMPLATE_DIR}/world.zip" ]]; then
-    unzip -q -o "${TEMPLATE_DIR}/world.zip" -d "${DATA_DIR}"
-  elif [[ -d "${TEMPLATE_DIR}/world" ]]; then
-    cp -R "${TEMPLATE_DIR}/world" "${DATA_DIR}/world"
-  fi
+fi
+if [[ "${MODE}" == "sheepwars" && ! -f "${DATA_DIR}/arena.json" && -f "${TEMPLATE_DIR}/arena.json" ]]; then
+  cp "${TEMPLATE_DIR}/arena.json" "${DATA_DIR}/arena.json"
 fi
 
 # Resolve Velocity forwarding secret (mounted Secret file or env var)

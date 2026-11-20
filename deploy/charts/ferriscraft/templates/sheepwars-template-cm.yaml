@@ -68,11 +68,21 @@ data:
               mountPath: /data
         {{- if .Values.sheepwars.pluginSidecar.enabled }}
         - name: sheepwars-plugin
+          {{- if kindIs "string" .Values.sheepwars.pluginSidecar.image }}
           image: {{ .Values.sheepwars.pluginSidecar.image }}
+          {{- else }}
+          image: {{ include "ferriscraft.image" (dict "global" .Values.global "repository" .Values.sheepwars.pluginSidecar.image.repository "tag" .Values.sheepwars.pluginSidecar.image.tag) }}
+          {{- end }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           env:
             - name: RSPIGOT_URL
               value: {{ printf "http://127.0.0.1:%d" (int .Values.sheepwars.grpcPort) | quote }}
+            - name: RSPIGOT_PLUGIN_NAME
+              value: "ferriscraft-sheepwars"
+            - name: SHEEPWARS_EPHEMERAL
+              value: "true"
+            - name: SHEEPWARS_ARENA_PATH
+              value: "/data/arena.json"
             {{- if (include "ferriscraft.orchestratorTokenSecretName" .) }}
             - name: ORCHESTRATOR_TOKEN
               valueFrom:
@@ -87,6 +97,10 @@ data:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+          volumeMounts:
+            - name: world-data
+              mountPath: /data
+              readOnly: true
         {{- end }}
       volumes:
         - name: forwarding-secret

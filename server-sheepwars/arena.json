@@ -1,0 +1,34 @@
+{
+  "prebuilt": true,
+  "world_name": "minecraft:overworld",
+  "lobby": {
+    "x": 24.5,
+    "y": 193.0,
+    "z": 5.5
+  },
+  "void_fall_y": 90.0,
+  "red": {
+    "spawn": {
+      "x": -93.5,
+      "y": 156.0,
+      "z": -17.5
+    },
+    "dispenser": {
+      "x": -93,
+      "y": 156,
+      "z": -17
+    }
+  },
+  "blue": {
+    "spawn": {
+      "x": -48.5,
+      "y": 156.0,
+      "z": 24.5
+    },
+    "dispenser": {
+      "x": -48,
+      "y": 156,
+      "z": 24
+    }
+  }
+}
