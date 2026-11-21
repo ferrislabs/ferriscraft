@@ -91,18 +91,36 @@ WORKDIR /src/rspigot
 COPY --exclude=target --exclude=.git --exclude=rust-toolchain.toml --from=rspigot-src . .
 RUN cargo chef prepare --recipe-path recipe.json
 
-FROM chef AS rspigot-builder
+FROM chef AS rspigot-cook
 
+ARG CARGO_PROFILE_RELEASE_LTO=false
+ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+    CARGO_PROFILE_RELEASE_LTO=${CARGO_PROFILE_RELEASE_LTO}
 WORKDIR /src/rspigot
 COPY --from=rspigot-planner /src/rspigot/recipe.json recipe.json
 RUN --mount=type=cache,id=ferriscraft-cargo-registry-rspigot,sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=ferriscraft-cargo-git-rspigot,sharing=locked,target=/usr/local/cargo/git \
-    cargo chef cook --release --recipe-path recipe.json
+    --mount=type=cache,id=ferriscraft-cargo-target-rspigot,sharing=locked,target=/src/rspigot/target \
+    cargo chef cook --release -p rspigot --recipe-path recipe.json
+
+FROM rspigot-cook AS rspigot-deps-builder
 
 COPY --exclude=target --exclude=.git --exclude=rust-toolchain.toml --from=rspigot-src . .
+RUN printf 'fn main() {}\n' > apps/rspigot/src/main.rs
 RUN --mount=type=cache,id=ferriscraft-cargo-registry-rspigot,sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=ferriscraft-cargo-git-rspigot,sharing=locked,target=/usr/local/cargo/git \
+    --mount=type=cache,id=ferriscraft-cargo-target-rspigot,sharing=locked,target=/src/rspigot/target \
     cargo build --release -p rspigot
+
+FROM rspigot-deps-builder AS rspigot-builder
+
+COPY --from=rspigot-src apps/rspigot ./apps/rspigot
+RUN --mount=type=cache,id=ferriscraft-cargo-registry-rspigot,sharing=locked,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=ferriscraft-cargo-git-rspigot,sharing=locked,target=/usr/local/cargo/git \
+    --mount=type=cache,id=ferriscraft-cargo-target-rspigot,sharing=locked,target=/src/rspigot/target \
+    touch apps/rspigot/src/main.rs \
+    && cargo build --release -p rspigot \
+    && cp /src/rspigot/target/release/rspigot /usr/local/bin/rspigot
 
 FROM ${DEBIAN_RUNTIME_IMAGE} AS rspigot
 
@@ -112,7 +130,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         unzip \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=rspigot-builder /src/rspigot/target/release/rspigot /usr/local/bin/rspigot
+COPY --from=rspigot-builder /usr/local/bin/rspigot /usr/local/bin/rspigot
 COPY server/bukkit.yml server/permissions.yml server/server.properties server/spigot.yml.example server/world.zip /opt/ferriscraft/templates/lobby/
 COPY server-sheepwars/bukkit.yml server-sheepwars/permissions.yml server-sheepwars/server.properties server-sheepwars/spigot.yml.example server-sheepwars/arena.jso[n] server-sheepwars/world.zi[p] /opt/ferriscraft/templates/sheepwars/
 COPY --chmod=0755 deploy/docker/rspigot-entrypoint.sh /usr/local/bin/rspigot-entrypoint.sh
@@ -131,30 +149,55 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN cargo chef prepare --recipe-path recipe.json
 
-FROM chef AS plugins-builder
+FROM chef AS plugins-cook
+
+ARG CARGO_PROFILE_RELEASE_LTO=false
+ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+    CARGO_PROFILE_RELEASE_LTO=${CARGO_PROFILE_RELEASE_LTO}
+COPY --exclude=target --exclude=.git --exclude=rust-toolchain.toml --from=rspigot-src . /opt/minecraft/dev/rspigot
+WORKDIR /opt/ferrislabs/ferriscraft
+COPY --from=plugins-planner /opt/ferrislabs/ferriscraft/recipe.json recipe.json
+RUN --mount=type=cache,id=ferriscraft-cargo-registry-plugins,sharing=locked,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=ferriscraft-cargo-git-plugins,sharing=locked,target=/usr/local/cargo/git \
+    --mount=type=cache,id=ferriscraft-cargo-target-lobby,sharing=locked,target=/opt/ferrislabs/ferriscraft/target \
+    cargo chef cook --release --bin ferriscraft-lobby --recipe-path recipe.json
+
+FROM plugins-cook AS plugins-builder
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN --mount=type=cache,id=ferriscraft-cargo-registry-plugins,sharing=locked,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=ferriscraft-cargo-git-plugins,sharing=locked,target=/usr/local/cargo/git \
+    --mount=type=cache,id=ferriscraft-cargo-target-lobby,sharing=locked,target=/opt/ferrislabs/ferriscraft/target \
+    cargo build --release --bin ferriscraft-lobby \
+    && cp /opt/ferrislabs/ferriscraft/target/release/ferriscraft-lobby /usr/local/bin/ferriscraft-lobby
+
+FROM distroless-runtime AS lobby
+
+COPY --from=plugins-builder /usr/local/bin/ferriscraft-lobby /usr/local/bin/ferriscraft-lobby
+COPY --chown=65532:65532 lobby.json /app/lobby.json
+ENTRYPOINT ["/usr/local/bin/ferriscraft-lobby"]
+
+FROM chef AS sheepwars-cook
 
 COPY --exclude=target --exclude=.git --exclude=rust-toolchain.toml --from=rspigot-src . /opt/minecraft/dev/rspigot
 WORKDIR /opt/ferrislabs/ferriscraft
 COPY --from=plugins-planner /opt/ferrislabs/ferriscraft/recipe.json recipe.json
 RUN --mount=type=cache,id=ferriscraft-cargo-registry-plugins,sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=ferriscraft-cargo-git-plugins,sharing=locked,target=/usr/local/cargo/git \
-    cargo chef cook --release --recipe-path recipe.json
+    cargo chef cook --release --bin ferriscraft-sheepwars --recipe-path recipe.json
+
+FROM sheepwars-cook AS sheepwars-builder
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN --mount=type=cache,id=ferriscraft-cargo-registry-plugins,sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=ferriscraft-cargo-git-plugins,sharing=locked,target=/usr/local/cargo/git \
-    cargo build --release --bin ferriscraft-lobby --bin ferriscraft-sheepwars
-
-FROM distroless-runtime AS lobby
-
-COPY --from=plugins-builder /opt/ferrislabs/ferriscraft/target/release/ferriscraft-lobby /usr/local/bin/ferriscraft-lobby
-COPY --chown=65532:65532 lobby.json /app/lobby.json
-ENTRYPOINT ["/usr/local/bin/ferriscraft-lobby"]
+    cargo build --release --bin ferriscraft-sheepwars
 
 FROM distroless-runtime AS sheepwars
 
-COPY --from=plugins-builder /opt/ferrislabs/ferriscraft/target/release/ferriscraft-sheepwars /usr/local/bin/ferriscraft-sheepwars
+COPY --from=sheepwars-builder /opt/ferrislabs/ferriscraft/target/release/ferriscraft-sheepwars /usr/local/bin/ferriscraft-sheepwars
 ENTRYPOINT ["/usr/local/bin/ferriscraft-sheepwars"]
 
 # ==============================================================================

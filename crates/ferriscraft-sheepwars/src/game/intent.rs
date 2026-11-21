@@ -11,6 +11,7 @@ pub enum Intent {
     SyncTeams,
     Teleport { player: PlayerId, to: Point },
     ClearInventory { player: PlayerId },
+    GiveStarterKit { player: PlayerId },
     Give { player: PlayerId, kind: SheepKind },
     Respawn { player: PlayerId },
     Spectate { player: PlayerId },

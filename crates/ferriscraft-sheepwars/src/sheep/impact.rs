@@ -36,6 +36,7 @@ pub struct Cell {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockKind {
     Ice,
+    Fire,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +56,7 @@ pub enum SoundKind {
     Ice,
     Thunder,
     Heal,
+    HealTick,
     Teleport,
     Quake,
     Darkness,
@@ -68,6 +70,7 @@ pub enum EffectKind {
     Slowness,
     Regeneration,
     Blindness,
+    Darkness,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -98,6 +101,18 @@ pub enum Action {
         duration_ticks: i32,
         amplifier: u8,
     },
+    Heal {
+        team: TeamId,
+        center: Vec3,
+        radius: f64,
+        amount: f32,
+    },
+    Ignite {
+        team: TeamId,
+        center: Vec3,
+        radius: f64,
+        fire_ticks: i32,
+    },
     Velocity {
         team: TeamId,
         center: Vec3,
@@ -110,6 +125,11 @@ pub enum Action {
         radius: f64,
         strength: f64,
         lift: f64,
+    },
+    SwapPositions {
+        team: TeamId,
+        center: Vec3,
+        radius: f64,
     },
     Lightning {
         at: Vec3,
@@ -124,19 +144,64 @@ pub enum Action {
     },
 }
 
+pub fn healing_pulse(at: Vec3, team: TeamId, with_chime: bool) -> Vec<Action> {
+    let mut actions = vec![
+        Action::Heal {
+            team,
+            center: at,
+            radius: catalog::HEALING_RADIUS,
+            amount: catalog::HEALING_PULSE_HEALTH,
+        },
+        Action::Effect {
+            team,
+            center: at,
+            radius: catalog::HEALING_RADIUS,
+            effect: EffectKind::Regeneration,
+            duration_ticks: catalog::HEALING_REGENERATION_TICKS,
+            amplifier: catalog::HEALING_REGENERATION_AMPLIFIER,
+        },
+        particle(ParticleKind::Heart, at, 14),
+    ];
+    if with_chime {
+        actions.push(sound(SoundKind::HealTick, at));
+    }
+    actions
+}
+
 pub fn plan(kind: SheepKind, at: Vec3, thrower_team: TeamId) -> Vec<Action> {
     let enemies = thrower_team.other();
     match kind {
-        SheepKind::Incendiary => vec![
-            Action::Explode {
-                at,
-                power: catalog::INCENDIARY_POWER,
-                breaks_blocks: catalog::INCENDIARY_BREAKS_BLOCKS,
-            },
-            particle(ParticleKind::Explosion, at, 5),
-            particle(ParticleKind::Flame, at, 60),
-            sound(SoundKind::Explode, at),
-        ],
+        SheepKind::Incendiary => {
+            let mut actions = vec![
+                Action::Explode {
+                    at,
+                    power: catalog::INCENDIARY_POWER,
+                    breaks_blocks: catalog::INCENDIARY_BREAKS_BLOCKS,
+                },
+                Action::Ignite {
+                    team: enemies,
+                    center: at,
+                    radius: catalog::INCENDIARY_FIRE_RADIUS,
+                    fire_ticks: catalog::INCENDIARY_FIRE_TICKS,
+                },
+            ];
+            for index in 0..catalog::INCENDIARY_IGNITE_BLOCKS {
+                let spot = spiral_point(
+                    at,
+                    index,
+                    catalog::INCENDIARY_IGNITE_BLOCKS,
+                    catalog::INCENDIARY_FIRE_SPREAD,
+                );
+                actions.push(Action::SetBlock {
+                    at: spot.cell(),
+                    block: BlockKind::Fire,
+                });
+            }
+            actions.push(particle(ParticleKind::Explosion, at, 6));
+            actions.push(particle(ParticleKind::Flame, at, 70));
+            actions.push(sound(SoundKind::Explode, at));
+            actions
+        }
         SheepKind::Frozen => {
             let mut actions = disc(at.cell(), catalog::FROZEN_ICE_RADIUS, -1, BlockKind::Ice);
             actions.push(Action::Effect {
@@ -155,40 +220,54 @@ pub fn plan(kind: SheepKind, at: Vec3, thrower_team: TeamId) -> Vec<Action> {
             Action::Explode {
                 at,
                 power: catalog::SEEKER_POWER,
-                breaks_blocks: false,
+                breaks_blocks: catalog::SEEKER_BREAKS_BLOCKS,
             },
-            particle(ParticleKind::Crit, at, 30),
+            particle(ParticleKind::Crit, at, 35),
+            sound(SoundKind::Explode, at),
         ],
-        SheepKind::Lightning => vec![Action::Lightning { at }, sound(SoundKind::Thunder, at)],
-        SheepKind::Healing => vec![
-            Action::Effect {
-                team: thrower_team,
-                center: at,
-                radius: catalog::HEALING_RADIUS,
-                effect: EffectKind::Regeneration,
-                duration_ticks: catalog::HEALING_REGENERATION_TICKS,
-                amplifier: catalog::HEALING_REGENERATION_AMPLIFIER,
-            },
-            particle(ParticleKind::Heart, at, 20),
-            sound(SoundKind::Heal, at),
-        ],
+        SheepKind::Lightning => {
+            let mut actions = vec![Action::Lightning { at }];
+            for index in 1..catalog::LIGHTNING_STRIKES {
+                actions.push(Action::Lightning {
+                    at: spiral_point(
+                        at,
+                        index,
+                        catalog::LIGHTNING_STRIKES,
+                        catalog::LIGHTNING_SPREAD,
+                    ),
+                });
+            }
+            actions.push(sound(SoundKind::Thunder, at));
+            actions
+        }
+        SheepKind::Healing => {
+            let mut actions = healing_pulse(at, thrower_team, false);
+            actions.push(sound(SoundKind::Heal, at));
+            actions
+        }
         SheepKind::Boarding => vec![
             Action::TeleportThrower { to: at },
             particle(ParticleKind::Portal, at, 50),
             sound(SoundKind::Teleport, at),
         ],
         SheepKind::Quake => vec![
-            Action::Velocity {
+            Action::Push {
                 team: enemies,
                 center: at,
                 radius: catalog::QUAKE_RADIUS,
-                velocity: Vec3 {
-                    x: 0.0,
-                    y: catalog::QUAKE_LIFT,
-                    z: 0.0,
-                },
+                strength: catalog::QUAKE_PUSH,
+                lift: catalog::QUAKE_LIFT,
             },
-            particle(ParticleKind::Explosion, at, 10),
+            Action::Effect {
+                team: enemies,
+                center: at,
+                radius: catalog::QUAKE_RADIUS,
+                effect: EffectKind::Slowness,
+                duration_ticks: catalog::QUAKE_SLOWNESS_TICKS,
+                amplifier: catalog::QUAKE_SLOWNESS_AMPLIFIER,
+            },
+            particle(ParticleKind::Explosion, at, 14),
+            particle(ParticleKind::LargeSmoke, at, 24),
             sound(SoundKind::Quake, at),
         ],
         SheepKind::Darkness => vec![
@@ -200,14 +279,22 @@ pub fn plan(kind: SheepKind, at: Vec3, thrower_team: TeamId) -> Vec<Action> {
                 duration_ticks: catalog::DARKNESS_BLINDNESS_TICKS,
                 amplifier: catalog::DARKNESS_BLINDNESS_AMPLIFIER,
             },
-            particle(ParticleKind::LargeSmoke, at, 60),
+            Action::Effect {
+                team: enemies,
+                center: at,
+                radius: catalog::DARKNESS_RADIUS,
+                effect: EffectKind::Darkness,
+                duration_ticks: catalog::DARKNESS_BLINDNESS_TICKS,
+                amplifier: catalog::DARKNESS_BLINDNESS_AMPLIFIER,
+            },
+            particle(ParticleKind::LargeSmoke, at, 70),
             sound(SoundKind::Darkness, at),
         ],
         SheepKind::Splitting => {
             let mut actions = vec![Action::Explode {
                 at,
                 power: catalog::SPLIT_PARENT_POWER,
-                breaks_blocks: false,
+                breaks_blocks: catalog::SPLIT_PARENT_BREAKS_BLOCKS,
             }];
             actions.extend((0..catalog::SPLIT_COUNT).map(|index| {
                 let angle = TAU * f64::from(index) / f64::from(catalog::SPLIT_COUNT);
@@ -225,6 +312,11 @@ pub fn plan(kind: SheepKind, at: Vec3, thrower_team: TeamId) -> Vec<Action> {
             actions
         }
         SheepKind::Warp => vec![
+            Action::SwapPositions {
+                team: enemies,
+                center: at,
+                radius: catalog::WARP_RADIUS,
+            },
             Action::Push {
                 team: enemies,
                 center: at,
@@ -232,10 +324,13 @@ pub fn plan(kind: SheepKind, at: Vec3, thrower_team: TeamId) -> Vec<Action> {
                 strength: catalog::WARP_PUSH,
                 lift: catalog::WARP_LIFT,
             },
-            Action::Explode {
-                at,
-                power: catalog::WARP_BLAST_POWER,
-                breaks_blocks: catalog::WARP_BLAST_BREAKS_BLOCKS,
+            Action::Effect {
+                team: enemies,
+                center: at,
+                radius: catalog::WARP_RADIUS,
+                effect: EffectKind::Blindness,
+                duration_ticks: catalog::WARP_BLINDNESS_TICKS,
+                amplifier: catalog::WARP_BLINDNESS_AMPLIFIER,
             },
             particle(ParticleKind::Portal, at, 80),
             sound(SoundKind::Warp, at),
@@ -258,15 +353,24 @@ pub fn plan(kind: SheepKind, at: Vec3, thrower_team: TeamId) -> Vec<Action> {
 
 const GOLDEN_ANGLE: f64 = 2.399_963_229_728_653;
 
-fn meteor_point(center: Vec3, index: u32) -> Vec3 {
-    let share = f64::from(index + 1) / f64::from(catalog::INTERGALACTIC_METEORS);
-    let distance = catalog::INTERGALACTIC_SPREAD * share.sqrt();
+fn spiral_point(center: Vec3, index: u32, count: u32, spread: f64) -> Vec3 {
+    let share = f64::from(index + 1) / f64::from(count.max(1));
+    let distance = spread * share.sqrt();
     let angle = GOLDEN_ANGLE * f64::from(index);
     Vec3 {
         x: center.x + angle.cos() * distance,
         y: center.y,
         z: center.z + angle.sin() * distance,
     }
+}
+
+fn meteor_point(center: Vec3, index: u32) -> Vec3 {
+    spiral_point(
+        center,
+        index,
+        catalog::INTERGALACTIC_METEORS,
+        catalog::INTERGALACTIC_SPREAD,
+    )
 }
 
 pub fn outward_velocity(center: Vec3, target: Vec3, strength: f64, lift: f64) -> Vec3 {
@@ -436,7 +540,7 @@ mod tests {
                 .iter()
                 .any(|a| matches!(
                     a,
-                    Action::Velocity { team: TeamId::Blue, velocity, .. } if velocity.y > 0.0
+                    Action::Push { team: TeamId::Blue, lift, .. } if *lift > 0.0
                 ))
         );
         assert!(
@@ -477,5 +581,92 @@ mod tests {
         for (index, child) in children.iter().enumerate() {
             assert!(!children[index + 1..].contains(child));
         }
+    }
+
+    #[test]
+    fn incendiary_explodes_ignites_enemies_and_places_fire() {
+        let actions = plan(SheepKind::Incendiary, AT, TeamId::Red);
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Explode { power, breaks_blocks: true, .. } if *power >= catalog::INCENDIARY_POWER
+        )));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Ignite { team: TeamId::Blue, fire_ticks, .. } if *fire_ticks > 0
+        )));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::SetBlock {
+                block: BlockKind::Fire,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn lightning_strikes_multiple_points_and_healing_pulses_heal_and_regen() {
+        let strikes = plan(SheepKind::Lightning, AT, TeamId::Red)
+            .into_iter()
+            .filter(|a| matches!(a, Action::Lightning { .. }))
+            .count();
+        assert_eq!(strikes, catalog::LIGHTNING_STRIKES as usize);
+
+        let pulse = healing_pulse(AT, TeamId::Blue, true);
+        assert!(pulse.iter().any(|a| matches!(
+            a,
+            Action::Heal { team: TeamId::Blue, amount, .. } if *amount > 0.0
+        )));
+        assert!(pulse.iter().any(|a| matches!(
+            a,
+            Action::Effect {
+                team: TeamId::Blue,
+                effect: EffectKind::Regeneration,
+                ..
+            }
+        )));
+        assert!(pulse.iter().any(|a| matches!(
+            a,
+            Action::Sound {
+                kind: SoundKind::HealTick,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn darkness_applies_darkness_and_quake_and_warp_do_not_explode() {
+        assert!(
+            plan(SheepKind::Darkness, AT, TeamId::Red)
+                .iter()
+                .any(|a| matches!(
+                    a,
+                    Action::Effect {
+                        team: TeamId::Blue,
+                        effect: EffectKind::Darkness,
+                        ..
+                    }
+                ))
+        );
+        assert!(
+            !plan(SheepKind::Quake, AT, TeamId::Red)
+                .iter()
+                .any(|a| matches!(a, Action::Explode { .. }))
+        );
+        let warp = plan(SheepKind::Warp, AT, TeamId::Red);
+        assert!(!warp.iter().any(|a| matches!(a, Action::Explode { .. })));
+        assert!(warp.iter().any(|a| matches!(
+            a,
+            Action::SwapPositions {
+                team: TeamId::Blue,
+                ..
+            }
+        )));
+        assert!(warp.iter().any(|a| matches!(
+            a,
+            Action::Push {
+                team: TeamId::Blue,
+                ..
+            }
+        )));
     }
 }

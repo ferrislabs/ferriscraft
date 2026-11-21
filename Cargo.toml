@@ -48,6 +48,9 @@ all = { level = "warn", priority = -1 }
 lto = "thin"
 codegen-units = 1
 
+[profile.release.package."*"]
+codegen-units = 16
+
 [profile.dev]
 debug = "line-tables-only"
 

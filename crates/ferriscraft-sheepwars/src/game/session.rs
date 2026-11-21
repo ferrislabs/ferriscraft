@@ -371,6 +371,7 @@ impl Session {
                 for team in TeamId::ALL {
                     for player in self.round.team(team).members() {
                         intents.push(Intent::ClearInventory { player });
+                        intents.push(Intent::GiveStarterKit { player });
                         intents.push(Intent::Teleport {
                             player,
                             to: self.layout.spawn_of(team),
@@ -491,6 +492,8 @@ mod tests {
         }));
         assert!(intents.contains(&Intent::ClearInventory { player: A }));
         assert!(intents.contains(&Intent::ClearInventory { player: B }));
+        assert!(intents.contains(&Intent::GiveStarterKit { player: A }));
+        assert!(intents.contains(&Intent::GiveStarterKit { player: B }));
     }
 
     #[test]
