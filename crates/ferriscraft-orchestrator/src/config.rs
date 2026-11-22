@@ -44,6 +44,9 @@ pub struct OrchestratorConfig {
     pub idle_ttl: Duration,
     pub starting_timeout: Duration,
     pub transfer_timeout: Duration,
+    pub empty_grace: Duration,
+    pub ending_timeout: Duration,
+    pub heartbeat_timeout: Duration,
     pub reconcile_interval: Duration,
     pub k8s_namespace: String,
     pub pod_template_path: Option<PathBuf>,
@@ -166,6 +169,12 @@ impl OrchestratorConfig {
                 120,
             )),
             transfer_timeout: Duration::from_secs(parse_u64_env("TRANSFER_TIMEOUT_SECS", 15)),
+            empty_grace: Duration::from_secs(parse_u64_env("SHEEPWARS_EMPTY_GRACE_SECS", 30)),
+            ending_timeout: Duration::from_secs(parse_u64_env("SHEEPWARS_ENDING_TIMEOUT_SECS", 60)),
+            heartbeat_timeout: Duration::from_secs(parse_u64_env(
+                "SHEEPWARS_HEARTBEAT_TIMEOUT_SECS",
+                30,
+            )),
             reconcile_interval: Duration::from_millis(
                 parse_u64_env("RECONCILE_INTERVAL_MS", 1000).max(200),
             ),

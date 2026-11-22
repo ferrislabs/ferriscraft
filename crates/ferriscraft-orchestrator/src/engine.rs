@@ -27,6 +27,9 @@ pub struct FleetPolicy {
     pub idle_ttl: Duration,
     pub starting_timeout: Duration,
     pub transfer_timeout: Duration,
+    pub empty_grace: Duration,
+    pub ending_timeout: Duration,
+    pub heartbeat_timeout: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -56,10 +59,54 @@ struct ManagedServer {
     created_at: Instant,
     last_heartbeat: Option<Instant>,
     last_non_empty_at: Instant,
+    phase_since: Instant,
+    empty_since: Option<Instant>,
     registered_on_proxy: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletionReason {
+    RoundEnded,
+    EndingTimeout,
+    EmptyInGame,
+    HeartbeatLost,
+    StartingTimeout,
+    IdleExcess,
+}
+
+impl DeletionReason {
+    pub const fn is_abnormal(self) -> bool {
+        matches!(
+            self,
+            Self::EndingTimeout | Self::EmptyInGame | Self::HeartbeatLost | Self::StartingTimeout
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerDeletion {
+    pub server_id: String,
+    pub reason: DeletionReason,
+}
+
 impl ManagedServer {
+    fn set_phase(&mut self, now: Instant, phase: ServerPhase) -> bool {
+        if self.phase == phase {
+            return false;
+        }
+        self.phase = phase;
+        self.phase_since = now;
+        true
+    }
+
+    fn heartbeat_lost(&self, now: Instant, timeout: Duration) -> bool {
+        self.has_plugin_heartbeat
+            && self.phase != ServerPhase::Starting
+            && self
+                .last_heartbeat
+                .is_some_and(|at| now.saturating_duration_since(at) >= timeout)
+    }
+
     fn ready_for_proxy(&self) -> bool {
         self.address.is_some()
             && self.tcp_ready
@@ -92,7 +139,7 @@ impl ManagedServer {
 pub struct TickActions {
     pub proxy_events: Vec<ProxyEvent>,
     pub servers_to_create: usize,
-    pub servers_to_delete: Vec<String>,
+    pub servers_to_delete: Vec<ServerDeletion>,
 }
 
 pub struct FleetEngine {
@@ -222,6 +269,8 @@ impl FleetEngine {
                 created_at: now,
                 last_heartbeat: None,
                 last_non_empty_at: now,
+                phase_since: now,
+                empty_since: None,
                 registered_on_proxy: false,
             });
     }
@@ -251,6 +300,8 @@ impl FleetEngine {
                 created_at: now,
                 last_heartbeat: None,
                 last_non_empty_at: now,
+                phase_since: now,
+                empty_since: None,
                 registered_on_proxy: false,
             });
 
@@ -264,13 +315,13 @@ impl FleetEngine {
         entry.tcp_ready = tcp_ready;
 
         if failed_or_terminating {
-            entry.phase = ServerPhase::Ending;
+            entry.set_phase(now, ServerPhase::Ending);
         } else if !entry.has_plugin_heartbeat {
             if tcp_ready && entry.phase == ServerPhase::Starting {
-                entry.phase = ServerPhase::Waiting;
+                entry.set_phase(now, ServerPhase::Waiting);
                 entry.last_heartbeat = Some(now);
             } else if !tcp_ready && entry.phase == ServerPhase::Waiting {
-                entry.phase = ServerPhase::Starting;
+                entry.set_phase(now, ServerPhase::Starting);
             }
         }
 
@@ -306,10 +357,10 @@ impl FleetEngine {
         }
     }
 
-    pub fn mark_deleting(&mut self, server_id: &str) -> Option<ProxyEvent> {
+    pub fn mark_deleting(&mut self, now: Instant, server_id: &str) -> Option<ProxyEvent> {
         self.deleting.insert(server_id.to_owned());
         let server = self.servers.get_mut(server_id)?;
-        server.phase = ServerPhase::Ending;
+        server.set_phase(now, ServerPhase::Ending);
         if server.registered_on_proxy {
             server.registered_on_proxy = false;
             Some(ProxyEvent::ServerRemove {
@@ -338,6 +389,8 @@ impl FleetEngine {
                 created_at: now,
                 last_heartbeat: Some(now),
                 last_non_empty_at: now,
+                phase_since: now,
+                empty_since: None,
                 registered_on_proxy: false,
             });
 
@@ -345,9 +398,13 @@ impl FleetEngine {
         if let Some(addr) = req.address {
             entry.address = Some(addr);
         }
-        let phase_changed = entry.phase != req.phase;
-        entry.phase = req.phase;
+        let phase_changed = entry.set_phase(now, req.phase);
         entry.player_count = req.player_count;
+        if req.player_count == 0 {
+            entry.empty_since.get_or_insert(now);
+        } else {
+            entry.empty_since = None;
+        }
         entry.max_players = max_players;
         entry.tcp_ready = true;
         entry.has_plugin_heartbeat = true;
@@ -385,8 +442,7 @@ impl FleetEngine {
             return Err(EngineError::UnknownServer(server_id.to_owned()));
         };
         let mut events = Vec::new();
-        let changed = server.phase != phase;
-        server.phase = phase;
+        let changed = server.set_phase(now, phase);
         server.has_plugin_heartbeat = true;
         server.last_heartbeat = Some(now);
         Self::sync_proxy_registration(server, changed, &mut events);
@@ -467,11 +523,11 @@ impl FleetEngine {
         // 3. Plan scaling actions (create up to k max, delete Ending/stuck/excess idle servers).
         let (to_create, to_delete) = self.plan_fleet_actions(now);
         actions.servers_to_create = to_create;
-        for id in to_delete {
-            if let Some(ev) = self.mark_deleting(&id) {
+        for deletion in to_delete {
+            if let Some(ev) = self.mark_deleting(now, &deletion.server_id) {
                 actions.proxy_events.push(ev);
             }
-            actions.servers_to_delete.push(id);
+            actions.servers_to_delete.push(deletion);
         }
 
         actions
@@ -571,28 +627,54 @@ impl FleetEngine {
         events
     }
 
-    fn plan_fleet_actions(&self, now: Instant) -> (usize, Vec<String>) {
+    fn reap_reason(&self, now: Instant, s: &ManagedServer, pending: u32) -> Option<DeletionReason> {
+        let in_phase = now.saturating_duration_since(s.phase_since);
+        let empty_for = s
+            .empty_since
+            .map(|since| now.saturating_duration_since(since));
+        match s.phase {
+            ServerPhase::Ending if s.player_count == 0 && pending == 0 => {
+                Some(DeletionReason::RoundEnded)
+            }
+            ServerPhase::Ending if in_phase >= self.policy.ending_timeout => {
+                Some(DeletionReason::EndingTimeout)
+            }
+            ServerPhase::Starting
+                if now.saturating_duration_since(s.created_at) >= self.policy.starting_timeout =>
+            {
+                Some(DeletionReason::StartingTimeout)
+            }
+            _ if s.heartbeat_lost(now, self.policy.heartbeat_timeout) => {
+                Some(DeletionReason::HeartbeatLost)
+            }
+            ServerPhase::InGame
+                if pending == 0
+                    && empty_for.is_some_and(|empty| empty >= self.policy.empty_grace) =>
+            {
+                Some(DeletionReason::EmptyInGame)
+            }
+            _ => None,
+        }
+    }
+
+    fn plan_fleet_actions(&self, now: Instant) -> (usize, Vec<ServerDeletion>) {
         let mut to_delete = Vec::new();
         let pending_by_server = self.pending_transfer_counts();
 
-        // Delete servers in Ending state (once drained of live players) or stuck in Starting too long.
         for s in self.servers.values() {
             if self.deleting.contains(&s.server_id) {
                 continue;
             }
             let pending = pending_by_server.get(&s.server_id).copied().unwrap_or(0);
-            if s.phase == ServerPhase::Ending && s.player_count == 0 && pending == 0 {
-                to_delete.push(s.server_id.clone());
-                continue;
-            }
-            if s.phase == ServerPhase::Starting
-                && now.saturating_duration_since(s.created_at) >= self.policy.starting_timeout
-            {
-                to_delete.push(s.server_id.clone());
+            if let Some(reason) = self.reap_reason(now, s, pending) {
+                to_delete.push(ServerDeletion {
+                    server_id: s.server_id.clone(),
+                    reason,
+                });
             }
         }
 
-        let delete_set: HashSet<&str> = to_delete.iter().map(String::as_str).collect();
+        let delete_set: HashSet<&str> = to_delete.iter().map(|d| d.server_id.as_str()).collect();
 
         let active_total = self
             .servers
@@ -668,7 +750,10 @@ impl FleetEngine {
                 {
                     break;
                 }
-                to_delete.push(cand.server_id.clone());
+                to_delete.push(ServerDeletion {
+                    server_id: cand.server_id.clone(),
+                    reason: DeletionReason::IdleExcess,
+                });
                 remaining_active -= 1;
                 remaining_available -= 1;
             }
@@ -841,6 +926,9 @@ mod tests {
             idle_ttl: Duration::from_secs(60),
             starting_timeout: Duration::from_secs(120),
             transfer_timeout: Duration::from_secs(15),
+            empty_grace: Duration::from_secs(30),
+            ending_timeout: Duration::from_secs(60),
+            heartbeat_timeout: Duration::from_secs(30),
         }
     }
 
@@ -1064,7 +1152,13 @@ mod tests {
         )));
 
         let tick1 = engine.tick(t0 + Duration::from_secs(1));
-        assert_eq!(tick1.servers_to_delete, vec!["sheepwars-1".to_owned()]);
+        assert_eq!(
+            tick1.servers_to_delete,
+            vec![ServerDeletion {
+                server_id: "sheepwars-1".to_owned(),
+                reason: DeletionReason::RoundEnded,
+            }]
+        );
 
         // Re-add a 3rd idle Waiting server and expire idle TTL -> excess above min_replicas=1 is scaled down
         engine.remove_server("sheepwars-1");
@@ -1078,5 +1172,142 @@ mod tests {
         );
         let tick2 = engine.tick(t0 + Duration::from_secs(70));
         assert_eq!(tick2.servers_to_delete.len(), 1);
+    }
+
+    fn infra(engine: &mut FleetEngine, now: Instant, id: &str) {
+        engine.upsert_infra_server(
+            now,
+            id.to_owned(),
+            Some(id.to_owned()),
+            Some("10.0.0.10:25565".to_owned()),
+            true,
+            false,
+        );
+    }
+
+    fn heartbeat(
+        engine: &mut FleetEngine,
+        now: Instant,
+        id: &str,
+        phase: ServerPhase,
+        players: u32,
+    ) {
+        let player_uuids = (0..players)
+            .map(|n| Uuid::from_u128(u128::from(n) + 1))
+            .collect();
+        engine.apply_heartbeat(
+            now,
+            HeartbeatRequest {
+                server_id: id.to_owned(),
+                address: None,
+                phase,
+                player_count: players,
+                max_players: 4,
+                player_uuids,
+            },
+        );
+    }
+
+    fn deleted(actions: &TickActions) -> Vec<(&str, DeletionReason)> {
+        actions
+            .servers_to_delete
+            .iter()
+            .map(|d| (d.server_id.as_str(), d.reason))
+            .collect()
+    }
+
+    #[test]
+    fn ending_server_with_stale_players_is_reaped_after_ending_timeout() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        infra(&mut engine, t0, "sheepwars-1");
+        heartbeat(&mut engine, t0, "sheepwars-1", ServerPhase::InGame, 2);
+        heartbeat(&mut engine, t0, "sheepwars-1", ServerPhase::Ending, 2);
+
+        for secs in [20, 40, 59] {
+            let now = t0 + Duration::from_secs(secs);
+            heartbeat(&mut engine, now, "sheepwars-1", ServerPhase::Ending, 2);
+            assert!(deleted(&engine.tick(now)).is_empty(), "reaped at {secs}s");
+        }
+        assert_eq!(
+            deleted(&engine.tick(t0 + Duration::from_secs(60))),
+            [("sheepwars-1", DeletionReason::EndingTimeout)]
+        );
+    }
+
+    #[test]
+    fn in_game_server_left_empty_is_reaped_after_grace() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        infra(&mut engine, t0, "sheepwars-1");
+        heartbeat(&mut engine, t0, "sheepwars-1", ServerPhase::InGame, 2);
+        heartbeat(
+            &mut engine,
+            t0 + Duration::from_secs(5),
+            "sheepwars-1",
+            ServerPhase::InGame,
+            0,
+        );
+
+        let t_grace = t0 + Duration::from_secs(34);
+        heartbeat(&mut engine, t_grace, "sheepwars-1", ServerPhase::InGame, 0);
+        assert!(deleted(&engine.tick(t_grace)).is_empty());
+
+        let t_after = t0 + Duration::from_secs(35);
+        heartbeat(&mut engine, t_after, "sheepwars-1", ServerPhase::InGame, 0);
+        assert_eq!(
+            deleted(&engine.tick(t_after)),
+            [("sheepwars-1", DeletionReason::EmptyInGame)]
+        );
+    }
+
+    #[test]
+    fn a_player_coming_back_resets_the_empty_grace() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        infra(&mut engine, t0, "sheepwars-1");
+        heartbeat(&mut engine, t0, "sheepwars-1", ServerPhase::InGame, 0);
+        heartbeat(
+            &mut engine,
+            t0 + Duration::from_secs(20),
+            "sheepwars-1",
+            ServerPhase::InGame,
+            1,
+        );
+        let later = t0 + Duration::from_secs(40);
+        heartbeat(&mut engine, later, "sheepwars-1", ServerPhase::InGame, 0);
+        assert!(deleted(&engine.tick(later)).is_empty());
+    }
+
+    #[test]
+    fn server_whose_plugin_goes_silent_is_reaped() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        infra(&mut engine, t0, "sheepwars-1");
+        heartbeat(&mut engine, t0, "sheepwars-1", ServerPhase::InGame, 2);
+
+        assert!(deleted(&engine.tick(t0 + Duration::from_secs(29))).is_empty());
+        assert_eq!(
+            deleted(&engine.tick(t0 + Duration::from_secs(30))),
+            [("sheepwars-1", DeletionReason::HeartbeatLost)]
+        );
+    }
+
+    #[test]
+    fn server_without_plugin_heartbeat_is_not_reaped_for_silence() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        infra(&mut engine, t0, "sheepwars-1");
+        assert!(deleted(&engine.tick(t0 + Duration::from_secs(300))).is_empty());
+    }
+
+    #[test]
+    fn reaped_server_is_reported_once() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        infra(&mut engine, t0, "sheepwars-1");
+        heartbeat(&mut engine, t0, "sheepwars-1", ServerPhase::Ending, 0);
+        assert_eq!(deleted(&engine.tick(t0)).len(), 1);
+        assert!(deleted(&engine.tick(t0 + Duration::from_secs(1))).is_empty());
     }
 }

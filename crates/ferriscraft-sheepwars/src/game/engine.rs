@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use ferriscraft_protocol::{HeartbeatRequest, ServerPhase};
 use futures_util::future::join_all;
@@ -10,7 +11,7 @@ use rspigot_plugin::{
 };
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use tokio::time::MissedTickBehavior;
+use tokio::time::{Instant, MissedTickBehavior};
 
 use super::display::lives_line;
 use super::effects::Effects;
@@ -34,6 +35,7 @@ use crate::sheep::{
 
 pub const HUD_REFRESH_TICKS: u64 = 5;
 pub const ACTION_BAR_REFRESH_TICKS: u64 = 20;
+const HEARTBEAT_FAILURE_LOG_EVERY: Duration = Duration::from_secs(30);
 
 pub fn player_id(uuid: Uuid) -> PlayerId {
     PlayerId(uuid.as_u128())
@@ -128,14 +130,32 @@ impl Game {
         Some(tokio::spawn(async move {
             let mut interval = tokio::time::interval(interval_dur);
             interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            let mut last_failure_log: Option<Instant> = None;
             loop {
                 let payload = game.heartbeat_payload();
-                if let Err(err) = orchestrator.send_heartbeat(&payload).await {
-                    tracing::debug!(
-                        server_id = %payload.server_id,
-                        phase = ?payload.phase,
-                        "Échec envoi heartbeat orchestrateur : {err}"
-                    );
+                match orchestrator.send_heartbeat(&payload).await {
+                    Ok(()) => {
+                        if last_failure_log.take().is_some() {
+                            tracing::info!(
+                                server_id = %payload.server_id,
+                                "Heartbeat orchestrateur rétabli"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        let now = Instant::now();
+                        if last_failure_log
+                            .is_none_or(|at| now.duration_since(at) >= HEARTBEAT_FAILURE_LOG_EVERY)
+                        {
+                            last_failure_log = Some(now);
+                            tracing::warn!(
+                                server_id = %payload.server_id,
+                                phase = ?payload.phase,
+                                players = payload.player_count,
+                                "Échec envoi heartbeat orchestrateur : {err}"
+                            );
+                        }
+                    }
                 }
                 tokio::select! {
                     _ = interval.tick() => {}
