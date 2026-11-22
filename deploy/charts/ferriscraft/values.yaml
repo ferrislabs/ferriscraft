@@ -60,6 +60,10 @@ orchestrator:
     emptyGraceSecs: 30
     endingTimeoutSecs: 60
     heartbeatTimeoutSecs: 30
+    # Serveurs SheepWars en objets SheepWarsServer (docs/specs/sheepwars-crd.md).
+    # L'AppProject ArgoCD doit autoriser CustomResourceDefinition avant d'activer.
+    crd:
+      enabled: false
     reconcileIntervalMs: 1000
   resources:
     requests:

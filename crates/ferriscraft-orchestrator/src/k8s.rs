@@ -1,19 +1,23 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use k8s_openapi::api::core::v1::{
     Container, ContainerPort, EmptyDirVolumeSource, EnvVar, Pod, PodSpec, PodTemplateSpec, Probe,
     SecretVolumeSource, TCPSocketAction, Volume, VolumeMount,
 };
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::Client;
-use kube::api::{Api, DeleteParams, ListParams, PostParams};
+use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams, PostParams, PropagationPolicy};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::api::AppState;
 use crate::config::OrchestratorConfig;
+use crate::crd::{
+    SheepWarsServer, SheepWarsServerStatus, desired_status, needs_patch, new_server,
+    owner_reference,
+};
 use crate::engine::ServerDeletion;
 
 use crate::s3::{MapCatalog, S3Client, hex_lower, sanitize_k8s_label};
@@ -302,7 +306,10 @@ pub async fn run_k8s_reconcile_loop(state: AppState, config: OrchestratorConfig)
             return;
         }
     };
-    let pods_api: Api<Pod> = Api::namespaced(client, &config.k8s_namespace);
+    let pods_api: Api<Pod> = Api::namespaced(client.clone(), &config.k8s_namespace);
+    let servers_api: Option<Api<SheepWarsServer>> = config
+        .use_crd
+        .then(|| Api::namespaced(client, &config.k8s_namespace));
     let template = load_pod_template(&config);
     let current_hash = template_hash(&config, template.as_ref());
 
@@ -334,31 +341,207 @@ pub async fn run_k8s_reconcile_loop(state: AppState, config: OrchestratorConfig)
         if let Some(discovery) = map_discovery.as_mut() {
             discovery.refresh_if_due(config.s3_cache_ttl).await;
         }
-        if let Err(err) = reconcile_once(
-            &state,
-            &config,
-            &pods_api,
-            template.as_ref(),
-            &current_hash,
-            map_discovery.as_mut(),
-        )
-        .await
-        {
+        let ctx = ReconcileCtx {
+            state: &state,
+            config: &config,
+            pods_api: &pods_api,
+            servers_api: servers_api.as_ref(),
+            template: template.as_ref(),
+            current_hash: &current_hash,
+        };
+        if let Err(err) = reconcile_once(&ctx, map_discovery.as_mut()).await {
             tracing::warn!(%err, "Erreur lors de la réconciliation Kubernetes");
         }
     }
 }
 
+struct ReconcileCtx<'a> {
+    state: &'a AppState,
+    config: &'a OrchestratorConfig,
+    pods_api: &'a Api<Pod>,
+    servers_api: Option<&'a Api<SheepWarsServer>>,
+    template: Option<&'a PodTemplateSpec>,
+    current_hash: &'a str,
+}
+
+fn attach_owner(pod: &mut Pod, owner: Option<OwnerReference>) {
+    if let Some(owner) = owner {
+        pod.metadata
+            .owner_references
+            .get_or_insert_with(Vec::new)
+            .push(owner);
+    }
+}
+
+async fn list_servers(api: &Api<SheepWarsServer>) -> HashMap<String, SheepWarsServer> {
+    match api.list(&ListParams::default()).await {
+        Ok(list) => list
+            .items
+            .into_iter()
+            .filter_map(|server| Some((server.metadata.name.clone()?, server)))
+            .collect(),
+        Err(err) => {
+            tracing::warn!(%err, "Impossible de lister les SheepWarsServer");
+            HashMap::new()
+        }
+    }
+}
+
+async fn delete_server_object(api: &Api<SheepWarsServer>, name: &str) {
+    let dp = DeleteParams {
+        propagation_policy: Some(PropagationPolicy::Background),
+        ..Default::default()
+    };
+    if let Err(err) = api.delete(name, &dp).await {
+        tracing::warn!(%name, %err, "Échec suppression SheepWarsServer");
+    }
+}
+
+async fn delete_server(
+    ctx: &ReconcileCtx<'_>,
+    server_id: &str,
+    objects: &mut HashMap<String, SheepWarsServer>,
+) {
+    if let Some(api) = ctx.servers_api
+        && objects.remove(server_id).is_some()
+    {
+        delete_server_object(api, server_id).await;
+        return;
+    }
+    if let Err(err) = ctx
+        .pods_api
+        .delete(server_id, &DeleteParams::default())
+        .await
+    {
+        tracing::warn!(%server_id, %err, "Échec suppression Pod SheepWars");
+    }
+}
+
+async fn create_bare_pod(pods_api: &Api<Pod>, pod_name: &str, pod: &Pod) -> bool {
+    match pods_api.create(&PostParams::default(), pod).await {
+        Ok(_) => true,
+        Err(err) => {
+            tracing::error!(%pod_name, %err, "Échec création Pod SheepWars");
+            false
+        }
+    }
+}
+
+async fn create_owned_pod(
+    ctx: &ReconcileCtx<'_>,
+    api: &Api<SheepWarsServer>,
+    pod_name: &str,
+    mut pod: Pod,
+    map: Option<&str>,
+) -> bool {
+    let server = new_server(
+        pod_name,
+        &ctx.config.k8s_namespace,
+        pod.metadata.labels.clone().unwrap_or_default(),
+        ctx.current_hash,
+        map,
+    );
+    let created = match api.create(&PostParams::default(), &server).await {
+        Ok(created) => created,
+        Err(err) => {
+            tracing::warn!(%pod_name, %err, "Échec création SheepWarsServer");
+            return false;
+        }
+    };
+    attach_owner(&mut pod, owner_reference(&created));
+    if create_bare_pod(ctx.pods_api, pod_name, &pod).await {
+        return true;
+    }
+    delete_server_object(api, pod_name).await;
+    false
+}
+
+async fn delete_orphan_objects(
+    ctx: &ReconcileCtx<'_>,
+    api: &Api<SheepWarsServer>,
+    pod_names: &HashSet<String>,
+    objects: &mut HashMap<String, SheepWarsServer>,
+) {
+    let Ok(timeout) = chrono::Duration::from_std(ctx.config.starting_timeout) else {
+        return;
+    };
+    let now = chrono::Utc::now();
+    let orphans: Vec<String> = objects
+        .iter()
+        .filter(|(name, server)| {
+            !pod_names.contains(*name)
+                && server.metadata.deletion_timestamp.is_none()
+                && server
+                    .metadata
+                    .creation_timestamp
+                    .as_ref()
+                    .is_some_and(|created| now - created.0 > timeout)
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in orphans {
+        tracing::info!(%name, "Suppression d'un SheepWarsServer sans Pod");
+        delete_server_object(api, &name).await;
+        objects.remove(&name);
+    }
+}
+
+async fn sync_statuses(
+    ctx: &ReconcileCtx<'_>,
+    api: &Api<SheepWarsServer>,
+    objects: &HashMap<String, SheepWarsServer>,
+) {
+    let summaries = {
+        let engine = ctx.state.engine.lock().unwrap_or_else(|e| e.into_inner());
+        engine.snapshot(Instant::now()).servers
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    for summary in &summaries {
+        let Some(object) = objects.get(&summary.server_id) else {
+            continue;
+        };
+        let current: Option<&SheepWarsServerStatus> = object.status.as_ref();
+        let desired = desired_status(summary, current, &now);
+        if !needs_patch(&desired, current) {
+            continue;
+        }
+        let patch = Patch::Merge(serde_json::json!({ "status": desired }));
+        if let Err(err) = api
+            .patch_status(&summary.server_id, &PatchParams::default(), &patch)
+            .await
+        {
+            tracing::warn!(server_id = %summary.server_id, %err, "Échec mise à jour du statut SheepWarsServer");
+        }
+    }
+}
+
 async fn reconcile_once(
-    state: &AppState,
-    config: &OrchestratorConfig,
-    pods_api: &Api<Pod>,
-    template: Option<&PodTemplateSpec>,
-    current_hash: &str,
+    ctx: &ReconcileCtx<'_>,
     mut map_discovery: Option<&mut MapDiscoveryState>,
 ) -> Result<(), kube::Error> {
+    let ReconcileCtx {
+        state,
+        config,
+        pods_api,
+        servers_api,
+        template,
+        ..
+    } = *ctx;
+    let current_hash = ctx.current_hash;
     let lp = ListParams::default().labels(SHEEPWARS_SELECTOR);
     let list = pods_api.list(&lp).await?;
+    let pod_names: HashSet<String> = if servers_api.is_some() {
+        list.items
+            .iter()
+            .filter_map(|pod| pod.metadata.name.clone())
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    let mut objects = match servers_api {
+        Some(api) => list_servers(api).await,
+        None => HashMap::new(),
+    };
 
     let mut live_ids = HashSet::new();
     let mut events = Vec::new();
@@ -415,9 +598,7 @@ async fn reconcile_once(
         } else {
             tracing::info!(%server_id, ?reason, "Suppression du Pod SheepWars");
         }
-        if let Err(err) = pods_api.delete(&server_id, &DeleteParams::default()).await {
-            tracing::warn!(%server_id, %err, "Échec suppression Pod SheepWars");
-        }
+        delete_server(ctx, &server_id, &mut objects).await;
     }
 
     for _ in 0..actions.servers_to_create {
@@ -441,16 +622,21 @@ async fn reconcile_once(
         let pod_name = format!("sheepwars-{}", &short[..6]);
         let pod = build_sheepwars_pod(&pod_name, config, template, selected_map.as_deref());
         tracing::info!(%pod_name, map = ?selected_map, "Création d'un nouveau Pod SheepWars");
-        match pods_api.create(&PostParams::default(), &pod).await {
-            Ok(_) => {
-                let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
-                engine.register_creating_server(Instant::now(), pod_name.clone(), Some(pod_name));
-            }
-            Err(err) => {
-                tracing::error!(%pod_name, %err, "Échec création Pod SheepWars");
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
+        let created = match servers_api {
+            Some(api) => create_owned_pod(ctx, api, &pod_name, pod, selected_map.as_deref()).await,
+            None => create_bare_pod(pods_api, &pod_name, &pod).await,
+        };
+        if created {
+            let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
+            engine.register_creating_server(Instant::now(), pod_name.clone(), Some(pod_name));
+        } else {
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
+    }
+
+    if let Some(api) = servers_api {
+        delete_orphan_objects(ctx, api, &pod_names, &mut objects).await;
+        sync_statuses(ctx, api, &objects).await;
     }
 
     Ok(())
@@ -490,6 +676,7 @@ mod tests {
             s3_cache_ttl: Duration::from_secs(30),
             fixed_map: None,
             version: None,
+            use_crd: false,
         }
     }
 
@@ -545,6 +732,33 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn crd_mode_pod_carries_the_owner_reference() {
+        let mut server = new_server(
+            "sheepwars-abc123",
+            "ferriscraft",
+            BTreeMap::new(),
+            "h",
+            None,
+        );
+        server.metadata.uid = Some("uid-1".to_owned());
+        let mut pod = build_sheepwars_pod("sheepwars-abc123", &test_config(), None, None);
+        attach_owner(&mut pod, owner_reference(&server));
+        let owners = pod.metadata.owner_references.unwrap();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].kind, "SheepWarsServer");
+        assert_eq!(owners[0].name, "sheepwars-abc123");
+        assert_eq!(owners[0].uid, "uid-1");
+        assert_eq!(owners[0].controller, Some(true));
+    }
+
+    #[test]
+    fn attach_owner_without_reference_leaves_pod_untouched() {
+        let mut pod = build_sheepwars_pod("sheepwars-abc123", &test_config(), None, None);
+        attach_owner(&mut pod, None);
+        assert!(pod.metadata.owner_references.is_none());
     }
 
     fn plugin_template(image: &str) -> PodTemplateSpec {

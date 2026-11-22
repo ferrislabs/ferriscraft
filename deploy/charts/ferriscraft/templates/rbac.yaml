@@ -17,6 +17,14 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch", "create", "delete"]
+  {{- if .Values.orchestrator.sheepwars.crd.enabled }}
+  - apiGroups: ["ferriscraft.io"]
+    resources: ["sheepwarsservers"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["ferriscraft.io"]
+    resources: ["sheepwarsservers/status"]
+    verbs: ["get", "patch"]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

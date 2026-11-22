@@ -67,6 +67,8 @@ spec:
               value: {{ .Values.orchestrator.sheepwars.endingTimeoutSecs | quote }}
             - name: SHEEPWARS_HEARTBEAT_TIMEOUT_SECS
               value: {{ .Values.orchestrator.sheepwars.heartbeatTimeoutSecs | quote }}
+            - name: SHEEPWARS_CRD_ENABLED
+              value: {{ .Values.orchestrator.sheepwars.crd.enabled | quote }}
             - name: RECONCILE_INTERVAL_MS
               value: {{ .Values.orchestrator.sheepwars.reconcileIntervalMs | quote }}
             - name: SHEEPWARS_PORT
