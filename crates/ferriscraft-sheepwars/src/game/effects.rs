@@ -31,7 +31,10 @@ use crate::sheep::WARP_DELAY_TICKS;
 const METEOR_OFFSET_X: f64 = 6.0;
 const METEOR_OFFSET_Z: f64 = 4.0;
 const QUAKE_PARTICLE_POINTS: u32 = 6;
-const FROST_PARTICLE_POINTS: u32 = 6;
+const FROST_OUTER_SHELL_POINTS: u32 = 48;
+const FROST_INNER_SHELL_POINTS: u32 = 20;
+const FROST_INNER_SHELL_RATIO: f64 = 0.55;
+const GOLDEN_ANGLE: f64 = 2.399_963_229_728_653;
 const WARP_MAX_ATTEMPTS: u32 = 4096;
 
 #[derive(Debug)]
@@ -211,18 +214,36 @@ fn frost_step(at: Vec3, enemies: TeamId, age: u32, actions: &mut Vec<Action>) {
         },
         count: 25,
     });
-    for point in 0..FROST_PARTICLE_POINTS {
-        let angle = f64::from(point) / f64::from(FROST_PARTICLE_POINTS) * std::f64::consts::TAU;
-        actions.push(Action::Particle {
-            kind: ParticleKind::Snowflake,
-            at: Vec3 {
-                x: at.x + angle.cos() * FROST_ZONE_RADIUS * 0.6,
-                y: at.y + 0.3,
-                z: at.z + angle.sin() * FROST_ZONE_RADIUS * 0.6,
-            },
-            count: 6,
-        });
+    for (radius, points) in [
+        (FROST_ZONE_RADIUS, FROST_OUTER_SHELL_POINTS),
+        (
+            FROST_ZONE_RADIUS * FROST_INNER_SHELL_RATIO,
+            FROST_INNER_SHELL_POINTS,
+        ),
+    ] {
+        for point in sphere_points(at, radius, points) {
+            actions.push(Action::Particle {
+                kind: ParticleKind::Snowflake,
+                at: point,
+                count: 3,
+            });
+        }
     }
+}
+
+fn sphere_points(center: Vec3, radius: f64, count: u32) -> Vec<Vec3> {
+    (0..count)
+        .map(|index| {
+            let height = 1.0 - 2.0 * (f64::from(index) + 0.5) / f64::from(count);
+            let ring = (1.0 - height * height).sqrt();
+            let angle = GOLDEN_ANGLE * f64::from(index);
+            Vec3 {
+                x: center.x + radius * ring * angle.cos(),
+                y: center.y + radius * height,
+                z: center.z + radius * ring * angle.sin(),
+            }
+        })
+        .collect()
 }
 
 fn within_warp_radius(at: Vec3, origin: Cell, cell: Cell) -> bool {
@@ -583,6 +604,67 @@ mod tests {
             }
         }
         assert!(effects.is_idle());
+    }
+
+    fn distance(a: Vec3, b: Vec3) -> f64 {
+        ((a.x - b.x).powi(2) + (a.y - b.y).powi(2) + (a.z - b.z).powi(2)).sqrt()
+    }
+
+    #[test]
+    fn sphere_points_all_lie_on_the_sphere_and_cover_both_poles() {
+        let points = sphere_points(ORIGIN, 5.0, 48);
+        assert_eq!(points.len(), 48);
+        for point in &points {
+            assert!((distance(*point, ORIGIN) - 5.0).abs() < 1e-9);
+        }
+        assert!(points.iter().any(|p| p.y > ORIGIN.y + 4.5));
+        assert!(points.iter().any(|p| p.y < ORIGIN.y - 4.5));
+    }
+
+    #[test]
+    fn frost_particles_fill_the_whole_zone_as_a_sphere_and_not_only_the_ground() {
+        let mut effects = Effects::new();
+        effects.start(SheepKind::Frozen, ORIGIN, TeamId::Red);
+        let frames = run(&mut effects, FROST_PULSE_TICKS);
+        let points: Vec<Vec3> = frames
+            .last()
+            .unwrap()
+            .iter()
+            .filter_map(|a| match a {
+                Action::Particle {
+                    kind: ParticleKind::Snowflake,
+                    at,
+                    ..
+                } => Some(*at),
+                _ => None,
+            })
+            .collect();
+        assert!(points.len() >= (FROST_OUTER_SHELL_POINTS + FROST_INNER_SHELL_POINTS) as usize);
+        assert!(
+            points
+                .iter()
+                .all(|p| distance(*p, ORIGIN) <= FROST_ZONE_RADIUS + 1e-9)
+        );
+        let outer = points
+            .iter()
+            .filter(|p| (distance(**p, ORIGIN) - FROST_ZONE_RADIUS).abs() < 1e-9)
+            .count();
+        assert_eq!(outer, FROST_OUTER_SHELL_POINTS as usize);
+        assert!(
+            points
+                .iter()
+                .any(|p| p.y > ORIGIN.y + FROST_ZONE_RADIUS * 0.8)
+        );
+        assert!(
+            points
+                .iter()
+                .any(|p| p.y < ORIGIN.y - FROST_ZONE_RADIUS * 0.8)
+        );
+        assert!(
+            points
+                .iter()
+                .any(|p| distance(*p, ORIGIN) < FROST_ZONE_RADIUS * 0.7)
+        );
     }
 
     #[test]
