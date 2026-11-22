@@ -23,6 +23,7 @@ async fn spawn_test_server(token: Option<&str>) -> String {
         idle_ttl: Duration::from_secs(60),
         starting_timeout: Duration::from_secs(60),
         transfer_timeout: Duration::from_secs(15),
+        ending_grace: Duration::from_secs(60),
     };
     let state = AppState::new(FleetEngine::new(policy), token.map(str::to_owned));
     let app = build_router(state);

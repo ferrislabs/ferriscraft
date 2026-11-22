@@ -443,6 +443,7 @@ mod tests {
             idle_ttl: Duration::from_secs(60),
             starting_timeout: Duration::from_secs(120),
             transfer_timeout: Duration::from_secs(15),
+            ending_grace: Duration::from_secs(60),
             reconcile_interval: Duration::from_secs(1),
             k8s_namespace: "ferriscraft".to_owned(),
             pod_template_path: None,

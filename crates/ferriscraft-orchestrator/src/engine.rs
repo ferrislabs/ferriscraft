@@ -27,6 +27,7 @@ pub struct FleetPolicy {
     pub idle_ttl: Duration,
     pub starting_timeout: Duration,
     pub transfer_timeout: Duration,
+    pub ending_grace: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -57,9 +58,23 @@ struct ManagedServer {
     last_heartbeat: Option<Instant>,
     last_non_empty_at: Instant,
     registered_on_proxy: bool,
+    ending_since: Option<Instant>,
 }
 
 impl ManagedServer {
+    fn track_phase(&mut self, now: Instant) {
+        match (self.phase, self.ending_since) {
+            (ServerPhase::Ending, None) => self.ending_since = Some(now),
+            (phase, Some(_)) if phase != ServerPhase::Ending => self.ending_since = None,
+            _ => {}
+        }
+    }
+
+    fn ending_overdue(&self, now: Instant, grace: Duration) -> bool {
+        self.ending_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= grace)
+    }
+
     fn ready_for_proxy(&self) -> bool {
         self.address.is_some()
             && self.tcp_ready
@@ -223,6 +238,7 @@ impl FleetEngine {
                 last_heartbeat: None,
                 last_non_empty_at: now,
                 registered_on_proxy: false,
+                ending_since: None,
             });
     }
 
@@ -252,6 +268,7 @@ impl FleetEngine {
                 last_heartbeat: None,
                 last_non_empty_at: now,
                 registered_on_proxy: false,
+                ending_since: None,
             });
 
         if pod_name.is_some() {
@@ -274,6 +291,7 @@ impl FleetEngine {
             }
         }
 
+        entry.track_phase(now);
         Self::sync_proxy_registration(entry, addr_changed, &mut events);
         events
     }
@@ -339,6 +357,7 @@ impl FleetEngine {
                 last_heartbeat: Some(now),
                 last_non_empty_at: now,
                 registered_on_proxy: false,
+                ending_since: None,
             });
 
         let addr_changed = req.address.is_some() && entry.address != req.address;
@@ -347,6 +366,7 @@ impl FleetEngine {
         }
         let phase_changed = entry.phase != req.phase;
         entry.phase = req.phase;
+        entry.track_phase(now);
         entry.player_count = req.player_count;
         entry.max_players = max_players;
         entry.tcp_ready = true;
@@ -387,6 +407,7 @@ impl FleetEngine {
         let mut events = Vec::new();
         let changed = server.phase != phase;
         server.phase = phase;
+        server.track_phase(now);
         server.has_plugin_heartbeat = true;
         server.last_heartbeat = Some(now);
         Self::sync_proxy_registration(server, changed, &mut events);
@@ -581,7 +602,8 @@ impl FleetEngine {
                 continue;
             }
             let pending = pending_by_server.get(&s.server_id).copied().unwrap_or(0);
-            if s.phase == ServerPhase::Ending && s.player_count == 0 && pending == 0 {
+            let drained = s.phase == ServerPhase::Ending && s.player_count == 0 && pending == 0;
+            if drained || s.ending_overdue(now, self.policy.ending_grace) {
                 to_delete.push(s.server_id.clone());
                 continue;
             }
@@ -841,6 +863,7 @@ mod tests {
             idle_ttl: Duration::from_secs(60),
             starting_timeout: Duration::from_secs(120),
             transfer_timeout: Duration::from_secs(15),
+            ending_grace: Duration::from_secs(60),
         }
     }
 
@@ -1078,5 +1101,81 @@ mod tests {
         );
         let tick2 = engine.tick(t0 + Duration::from_secs(70));
         assert_eq!(tick2.servers_to_delete.len(), 1);
+    }
+
+    fn ending_heartbeat(server_id: &str, players: u32) -> HeartbeatRequest {
+        HeartbeatRequest {
+            server_id: server_id.to_owned(),
+            address: None,
+            phase: ServerPhase::Ending,
+            player_count: players,
+            max_players: 4,
+            player_uuids: Vec::new(),
+        }
+    }
+
+    fn add_server(engine: &mut FleetEngine, now: Instant, id: &str, address: &str) {
+        engine.upsert_infra_server(
+            now,
+            id.to_owned(),
+            Some(id.to_owned()),
+            Some(address.to_owned()),
+            true,
+            false,
+        );
+    }
+
+    #[test]
+    fn an_ending_server_is_deleted_after_the_grace_even_with_players_left_in_its_last_heartbeat() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        add_server(&mut engine, t0, "sheepwars-1", "10.0.0.10:25565");
+        add_server(&mut engine, t0, "sheepwars-2", "10.0.0.11:25565");
+        engine.apply_heartbeat(t0, ending_heartbeat("sheepwars-1", 2));
+
+        let early = engine.tick(t0 + Duration::from_secs(30));
+        assert!(early.servers_to_delete.is_empty());
+
+        let late = engine.tick(t0 + Duration::from_secs(61));
+        assert_eq!(late.servers_to_delete, vec!["sheepwars-1".to_owned()]);
+    }
+
+    #[test]
+    fn repeated_ending_heartbeats_do_not_postpone_the_deletion() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        add_server(&mut engine, t0, "sheepwars-1", "10.0.0.10:25565");
+        add_server(&mut engine, t0, "sheepwars-2", "10.0.0.11:25565");
+        engine.apply_heartbeat(t0, ending_heartbeat("sheepwars-1", 1));
+        engine.apply_heartbeat(
+            t0 + Duration::from_secs(30),
+            ending_heartbeat("sheepwars-1", 1),
+        );
+        engine.apply_heartbeat(
+            t0 + Duration::from_secs(55),
+            ending_heartbeat("sheepwars-1", 1),
+        );
+
+        let tick = engine.tick(t0 + Duration::from_secs(61));
+        assert_eq!(tick.servers_to_delete, vec!["sheepwars-1".to_owned()]);
+    }
+
+    #[test]
+    fn a_server_that_leaves_the_ending_phase_is_not_deleted_by_the_grace() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        add_server(&mut engine, t0, "sheepwars-1", "10.0.0.10:25565");
+        add_server(&mut engine, t0, "sheepwars-2", "10.0.0.11:25565");
+        engine.apply_heartbeat(t0, ending_heartbeat("sheepwars-1", 2));
+        engine.apply_heartbeat(
+            t0 + Duration::from_secs(10),
+            HeartbeatRequest {
+                phase: ServerPhase::Waiting,
+                ..ending_heartbeat("sheepwars-1", 2)
+            },
+        );
+
+        let tick = engine.tick(t0 + Duration::from_secs(90));
+        assert!(!tick.servers_to_delete.contains(&"sheepwars-1".to_owned()));
     }
 }
