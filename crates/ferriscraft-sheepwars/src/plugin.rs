@@ -499,6 +499,10 @@ impl SheepWarsPlugin {
         }
     }
 
+    async fn on_player_drop_item(&self, event: &mut PlayerDropItem) {
+        event.cancel();
+    }
+
     async fn on_block_place(&self, event: &mut BlockPlace) {
         event.cancel();
     }
