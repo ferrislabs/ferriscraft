@@ -18,7 +18,7 @@ impl Default for RoundRules {
             min_players: 2,
             max_players: 16,
             countdown_ticks: 20 * 15,
-            sheep_interval_ticks: 20 * 20,
+            sheep_interval_ticks: 12 * 20,
             respawn: RespawnRule::Lives(3),
         }
     }

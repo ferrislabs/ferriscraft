@@ -1,8 +1,10 @@
+use std::time::Duration;
+
 use futures_util::future::join_all;
 use rspigot_plugin::{
-    BlockPos, BlockType, DyeColor, Effect, EffectType, Entity, EntityType, Error, Explosion,
-    Material, Particle, ParticleBurst, Player, PlayerState, Position, Sound, SoundCue, Vector,
-    World,
+    BlockPos, BlockState, BlockType, DyeColor, Effect, EffectType, Entity, EntityType, Error,
+    Explosion, Material, Particle, ParticleBurst, Player, PlayerState, Position, Sound, SoundCue,
+    Vector, World,
 };
 
 use super::catalog::{self, WoolColor};
@@ -25,6 +27,7 @@ pub async fn apply(
                 | Action::Ignite { .. }
                 | Action::Velocity { .. }
                 | Action::Push { .. }
+                | Action::Damage { .. }
                 | Action::SwapPositions { .. }
         )
     });
@@ -108,14 +111,39 @@ pub async fn apply(
                 lift,
             } => {
                 for (player, state) in matching_players(&live_players, center, radius, team) {
-                    let velocity = outward_velocity(
-                        center,
-                        vec3(state.player.position),
-                        strength,
-                        lift,
-                    );
+                    let velocity =
+                        outward_velocity(center, vec3(state.player.position), strength, lift);
                     player.movement.set_velocity(vector(velocity));
                 }
+            }
+            Action::Damage {
+                team,
+                center,
+                radius,
+                damage,
+            } => {
+                for (player, state) in matching_players(&live_players, center, radius, team) {
+                    let distance = distance_squared(center, vec3(state.player.position)).sqrt();
+                    let points = damage.at_distance(distance, radius);
+                    if points.is_infinite() {
+                        player.health.kill();
+                    } else if points > 0.0 {
+                        player.health.damage(f64::from(points));
+                    }
+                }
+            }
+            Action::ClearSphere { center, radius } => {
+                clear_cells(world, sphere_cells(center, radius)).await;
+            }
+            Action::ClearAbove {
+                center,
+                radius,
+                height,
+            } => {
+                clear_cells(world, column_cells(center, radius, height)).await;
+            }
+            Action::SwapBlocks { a, b } => {
+                swap_blocks(world, a, b).await;
             }
             Action::SwapPositions {
                 team,
@@ -161,7 +189,10 @@ pub async fn apply(
                         z: to.z,
                     };
                     if let Err(error) = player.location.teleport(target).await {
-                        tracing::warn!("échec téléportation abordage pour {} : {error}", player.name);
+                        tracing::warn!(
+                            "échec téléportation abordage pour {} : {error}",
+                            player.name
+                        );
                     }
                     player.movement.set_velocity(vector(Vec3::ZERO));
                 }
@@ -241,7 +272,8 @@ async fn set_block_if_valid(world: &World, at: Cell, block: BlockKind) {
                 y: pos.y - 1,
                 z: pos.z,
             };
-            if let (Ok(here), Ok(under)) = (world.get_block(pos).await, world.get_block(below).await)
+            if let (Ok(here), Ok(under)) =
+                (world.get_block(pos).await, world.get_block(below).await)
                 && is_air(here.kind)
                 && !is_air(under.kind)
             {
@@ -249,6 +281,149 @@ async fn set_block_if_valid(world: &World, at: Cell, block: BlockKind) {
             }
         }
     }
+}
+
+const CLEAR_BATCH: usize = 512;
+const SWAP_VISUAL_DELAY: Duration = Duration::from_millis(500);
+const SWAP_VISUAL_SPEED: f64 = 0.08;
+
+fn sphere_cells(center: Vec3, radius: f64) -> Vec<Cell> {
+    let reach = radius.ceil() as i32;
+    let origin = center.cell();
+    let mut cells = Vec::new();
+    for dx in -reach..=reach {
+        for dy in -reach..=reach {
+            for dz in -reach..=reach {
+                let cell = Cell {
+                    x: origin.x + dx,
+                    y: origin.y + dy,
+                    z: origin.z + dz,
+                };
+                let offset = Vec3 {
+                    x: f64::from(cell.x) + 0.5,
+                    y: f64::from(cell.y) + 0.5,
+                    z: f64::from(cell.z) + 0.5,
+                };
+                if distance_squared(center, offset) <= radius * radius {
+                    cells.push(cell);
+                }
+            }
+        }
+    }
+    cells
+}
+
+fn column_cells(center: Vec3, radius: f64, height: f64) -> Vec<Cell> {
+    let reach = radius.ceil() as i32;
+    let origin = center.cell();
+    let mut cells = Vec::new();
+    for dx in -reach..=reach {
+        for dz in -reach..=reach {
+            let x = f64::from(origin.x + dx) + 0.5 - center.x;
+            let z = f64::from(origin.z + dz) + 0.5 - center.z;
+            if x * x + z * z <= radius * radius {
+                for dy in 0..=height.floor() as i32 {
+                    cells.push(Cell {
+                        x: origin.x + dx,
+                        y: origin.y + dy,
+                        z: origin.z + dz,
+                    });
+                }
+            }
+        }
+    }
+    cells
+}
+
+const fn is_protected(kind: BlockType) -> bool {
+    matches!(kind, BlockType::Bedrock | BlockType::Barrier)
+}
+
+async fn clear_cells(world: &World, cells: Vec<Cell>) {
+    for batch in cells.chunks(CLEAR_BATCH) {
+        let states = join_all(batch.iter().map(|cell| world.get_block(block_pos(*cell)))).await;
+        for (cell, state) in batch.iter().zip(states) {
+            match state {
+                Ok(state) if !is_air(state.kind) && !is_protected(state.kind) => {
+                    world.block(block_pos(*cell)).set(BlockType::Air);
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!("échec lecture bloc {cell:?} : {error}"),
+            }
+        }
+    }
+}
+
+fn block_center(cell: Cell) -> Position {
+    Position {
+        x: f64::from(cell.x) + 0.5,
+        y: f64::from(cell.y),
+        z: f64::from(cell.z) + 0.5,
+    }
+}
+
+async fn swap_blocks(world: &World, a: Cell, b: Cell) {
+    if a == b {
+        return;
+    }
+    let (first, second) = (
+        world.get_block(block_pos(a)).await,
+        world.get_block(block_pos(b)).await,
+    );
+    let (first, second) = match (first, second) {
+        (Ok(first), Ok(second)) => (first, second),
+        (Err(error), _) | (_, Err(error)) => {
+            tracing::warn!("échec lecture blocs distorsion : {error}");
+            return;
+        }
+    };
+    if is_protected(first.kind)
+        || is_protected(second.kind)
+        || (is_air(first.kind) && is_air(second.kind))
+    {
+        return;
+    }
+    world.block(block_pos(a)).set(BlockType::Air);
+    world.block(block_pos(b)).set(BlockType::Air);
+    let mut visuals = Vec::new();
+    for (state, from, to) in [(&first, a, b), (&second, b, a)] {
+        if is_air(state.kind) {
+            continue;
+        }
+        let velocity = Vector {
+            x: f64::from(to.x - from.x) * SWAP_VISUAL_SPEED,
+            y: f64::from(to.y - from.y) * SWAP_VISUAL_SPEED,
+            z: f64::from(to.z - from.z) * SWAP_VISUAL_SPEED,
+        };
+        match world
+            .spawn_falling_block(state.kind, block_center(from), velocity)
+            .await
+        {
+            Ok(entity) => {
+                entity.flags.set_gravity(false);
+                visuals.push(entity);
+            }
+            Err(error) => tracing::warn!("échec bloc visuel distorsion : {error}"),
+        }
+    }
+    let world = world.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(SWAP_VISUAL_DELAY).await;
+        for entity in &visuals {
+            entity.remove();
+        }
+        place_state(&world, a, &second);
+        place_state(&world, b, &first);
+    });
+}
+
+fn place_state(world: &World, at: Cell, state: &BlockState) {
+    let properties: Vec<(&str, &str)> = state
+        .properties
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    world.block(block_pos(at)).set_with(state.kind, &properties);
 }
 
 const fn is_air(kind: BlockType) -> bool {
@@ -260,7 +435,9 @@ const fn is_air(kind: BlockType) -> bool {
 
 pub const fn wool_material(color: WoolColor) -> Material {
     match color {
-        WoolColor::Magenta => Material::MagentaWool,
+        WoolColor::White => Material::WhiteWool,
+        WoolColor::Red => Material::RedWool,
+        WoolColor::Cyan => Material::CyanWool,
         WoolColor::Blue => Material::BlueWool,
         WoolColor::Orange => Material::OrangeWool,
         WoolColor::LightBlue => Material::LightBlueWool,
@@ -276,7 +453,9 @@ pub const fn wool_material(color: WoolColor) -> Material {
 
 pub const fn wool_dye_color(color: WoolColor) -> DyeColor {
     match color {
-        WoolColor::Magenta => DyeColor::Magenta,
+        WoolColor::White => DyeColor::White,
+        WoolColor::Red => DyeColor::Red,
+        WoolColor::Cyan => DyeColor::Cyan,
         WoolColor::Blue => DyeColor::Blue,
         WoolColor::Orange => DyeColor::Orange,
         WoolColor::LightBlue => DyeColor::LightBlue,
@@ -366,5 +545,45 @@ const fn effect_type(kind: EffectKind) -> EffectType {
         EffectKind::Regeneration => EffectType::Regeneration,
         EffectKind::Blindness => EffectType::Blindness,
         EffectKind::Darkness => EffectType::Darkness,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CENTER: Vec3 = Vec3 {
+        x: 0.5,
+        y: 64.0,
+        z: 0.5,
+    };
+
+    #[test]
+    fn sphere_cells_stay_within_the_radius_and_include_the_center() {
+        let cells = sphere_cells(CENTER, 3.0);
+        assert!(cells.contains(&CENTER.cell()));
+        for cell in &cells {
+            let dx = f64::from(cell.x) + 0.5 - CENTER.x;
+            let dy = f64::from(cell.y) + 0.5 - CENTER.y;
+            let dz = f64::from(cell.z) + 0.5 - CENTER.z;
+            assert!(dx * dx + dy * dy + dz * dz <= 9.0 + 1e-9);
+        }
+        assert!(cells.len() > 80);
+    }
+
+    #[test]
+    fn column_cells_start_at_the_impact_and_never_go_below() {
+        let cells = column_cells(CENTER, 8.0, 48.0);
+        assert!(cells.iter().all(|c| c.y >= 64 && c.y <= 64 + 48));
+        assert!(cells.contains(&Cell { x: 0, y: 112, z: 0 }));
+        assert!(!cells.contains(&Cell { x: 9, y: 70, z: 0 }));
+        assert!(cells.len() > 9000);
+    }
+
+    #[test]
+    fn bedrock_and_barrier_are_protected() {
+        assert!(is_protected(BlockType::Bedrock));
+        assert!(is_protected(BlockType::Barrier));
+        assert!(!is_protected(BlockType::Stone));
     }
 }
