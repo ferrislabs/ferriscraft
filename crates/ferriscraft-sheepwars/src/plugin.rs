@@ -450,6 +450,13 @@ impl SheepWarsPlugin {
         }
     }
 
+    async fn on_entity_shoot_bow(&self, event: &mut EntityShootBow) {
+        let Some(game) = self.game() else { return };
+        if let Some(player) = event.player() {
+            game.track_arrow(player.uuid, event.projectile().clone());
+        }
+    }
+
     async fn on_creature_spawn(&self, event: &mut CreatureSpawn) {
         if blocks_creature_spawn(event.spawn_reason()) {
             event.cancel();

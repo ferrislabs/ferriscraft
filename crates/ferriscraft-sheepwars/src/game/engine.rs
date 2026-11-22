@@ -12,6 +12,10 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
+use super::cosmetics::{
+    MAX_ARROW_AGE_TICKS, MAX_TRACKED_ARROWS, MAX_TRAIL_ACTIONS_PER_TICK, arrow_trail, capped,
+    celebrating, celebration_pulses, explosion_burst, sheep_trail, victory_pulse,
+};
 use super::display::lives_line;
 use super::effects::Effects;
 use super::fall_guard::FallGuards;
@@ -35,10 +39,24 @@ use crate::sheep::{
 };
 
 pub const HUD_REFRESH_TICKS: u64 = 5;
+const ARROW_SPAWN_GRACE_TICKS: u32 = 10;
 pub const ACTION_BAR_REFRESH_TICKS: u64 = 20;
 
 pub fn player_id(uuid: Uuid) -> PlayerId {
     PlayerId(uuid.as_u128())
+}
+
+#[derive(Debug)]
+struct TrackedArrow {
+    entity: Entity,
+    team: TeamId,
+    age: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Celebration {
+    team: TeamId,
+    age: u32,
 }
 
 #[derive(Debug)]
@@ -74,6 +92,8 @@ struct State {
     armed: Vec<ArmedSheep>,
     healings: Vec<ActiveHealing>,
     effects: Effects,
+    arrows: Vec<TrackedArrow>,
+    celebration: Option<Celebration>,
     sheep_kinds: HashMap<i32, SheepKind>,
     last_sheep_damager: HashMap<i32, PlayerId>,
     fall_guards: FallGuards,
@@ -112,6 +132,8 @@ impl Game {
                 armed: Vec::new(),
                 healings: Vec::new(),
                 effects: Effects::new(),
+                arrows: Vec::new(),
+                celebration: None,
                 sheep_kinds: HashMap::new(),
                 last_sheep_damager: HashMap::new(),
                 fall_guards: FallGuards::new(),
@@ -452,6 +474,8 @@ impl Game {
         self.advance_armed().await;
         self.advance_healings().await;
         self.advance_effects().await;
+        self.advance_arrows().await;
+        self.advance_celebration().await;
         self.advance_fall_guards().await;
         self.refresh();
         self.check_phase_changed();
@@ -469,6 +493,8 @@ impl Game {
             totem.entity.remove();
         }
         state.effects = Effects::new();
+        state.arrows.clear();
+        state.celebration = None;
         state.sheep_kinds.clear();
         state.last_sheep_damager.clear();
         state.fall_guards.clear();
@@ -524,6 +550,9 @@ impl Game {
                 if let Some(player) = self.player(player) {
                     player.message.send(text);
                 }
+            }
+            Intent::Celebrate { team } => {
+                self.lock().celebration = Some(Celebration { team, age: 0 });
             }
             Intent::Title { text, subtitle } => {
                 for player in self.everyone() {
@@ -650,6 +679,8 @@ impl Game {
             totem.entity.remove();
         }
         state.effects = Effects::new();
+        state.arrows.clear();
+        state.celebration = None;
         state.sheep_kinds.clear();
         state.last_sheep_damager.clear();
         state.fall_guards.clear();
@@ -719,6 +750,7 @@ impl Game {
         let mut children = Vec::new();
         let mut new_armed = Vec::new();
         let mut new_healings = Vec::new();
+        let mut trail = Vec::new();
         let mut removed_ids = Vec::new();
 
         for mut airborne in flights {
@@ -898,8 +930,14 @@ impl Game {
                 airborne.entity.set_velocity(vector(next_velocity));
                 airborne.velocity = next_velocity;
                 airborne.last_pos = pos;
+                trail.extend(sheep_trail(airborne.flight.team, pos));
                 next.push(airborne);
             }
+        }
+
+        let trail = capped(trail, MAX_TRAIL_ACTIONS_PER_TICK);
+        if let Err(error) = apply(&self.arena.world, None, &players_with_teams, &trail).await {
+            tracing::warn!("échec de la traînée de mouton : {error}");
         }
 
         let mut state = self.lock();
@@ -1161,6 +1199,95 @@ impl Game {
         }
     }
 
+    pub fn track_arrow(&self, shooter: Uuid, entity: Entity) {
+        let mut state = self.lock();
+        if state.arrows.len() >= MAX_TRACKED_ARROWS {
+            return;
+        }
+        let id = player_id(shooter);
+        let team = state
+            .session
+            .standing()
+            .into_iter()
+            .find_map(|(member, team)| (member == id).then_some(team));
+        if let Some(team) = team {
+            state.arrows.push(TrackedArrow {
+                entity,
+                team,
+                age: 0,
+            });
+        }
+    }
+
+    async fn advance_arrows(&self) {
+        let arrows = {
+            let mut state = self.lock();
+            if state.arrows.is_empty() {
+                return;
+            }
+            std::mem::take(&mut state.arrows)
+        };
+        let mut kept = Vec::with_capacity(arrows.len());
+        let mut trail = Vec::new();
+        for mut arrow in arrows {
+            arrow.age += 1;
+            if arrow.age > MAX_ARROW_AGE_TICKS {
+                continue;
+            }
+            match arrow.entity.get_state().await {
+                Ok(state) if state.on_ground => {}
+                Ok(state) => {
+                    trail.extend(arrow_trail(arrow.team, vec3(state.entity.position)));
+                    kept.push(arrow);
+                }
+                Err(_) if arrow.age <= ARROW_SPAWN_GRACE_TICKS => kept.push(arrow),
+                Err(_) => {}
+            }
+        }
+        self.lock().arrows.extend(kept);
+        let trail = capped(trail, MAX_TRAIL_ACTIONS_PER_TICK);
+        if let Err(error) = apply(&self.arena.world, None, &[], &trail).await {
+            tracing::warn!("échec de la traînée de flèche : {error}");
+        }
+    }
+
+    async fn advance_celebration(&self) {
+        let (team, winners) = {
+            let mut state = self.lock();
+            let Some(celebration) = state.celebration.as_mut() else {
+                return;
+            };
+            let age = celebration.age;
+            celebration.age += 1;
+            let team = celebration.team;
+            if !celebrating(age) {
+                state.celebration = None;
+                return;
+            }
+            if !celebration_pulses(age) {
+                return;
+            }
+            let winners: Vec<Player> = state
+                .session
+                .standing()
+                .into_iter()
+                .filter(|(_, member_team)| *member_team == team)
+                .filter_map(|(id, _)| state.players.get(&id).cloned())
+                .collect();
+            (team, winners)
+        };
+        let mut actions = Vec::new();
+        for winner in winners {
+            if let Ok(position) = winner.get_position().await {
+                actions.extend(victory_pulse(team, vec3(position)));
+            }
+        }
+        let actions = capped(actions, MAX_TRAIL_ACTIONS_PER_TICK);
+        if let Err(error) = apply(&self.arena.world, None, &[], &actions).await {
+            tracing::warn!("échec du feu d'artifice de victoire : {error}");
+        }
+    }
+
     async fn advance_effects(&self) {
         let (actions, players_with_teams) = {
             let mut state = self.lock();
@@ -1194,7 +1321,9 @@ impl Game {
             thrower,
             ..
         } = flight;
-        let actions = plan(kind, impact_pos, team);
+        let mut actions = plan(kind, impact_pos, team);
+        let burst = explosion_burst(&actions, team);
+        actions.extend(burst);
         if starts_effect(kind) {
             self.lock().effects.start(kind, impact_pos, team);
         }
