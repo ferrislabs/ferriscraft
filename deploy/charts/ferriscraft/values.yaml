@@ -57,6 +57,9 @@ orchestrator:
     idleTtlSecs: 180
     startingTimeoutSecs: 120
     transferTimeoutSecs: 15
+    emptyGraceSecs: 30
+    endingTimeoutSecs: 60
+    heartbeatTimeoutSecs: 30
     reconcileIntervalMs: 1000
   resources:
     requests:

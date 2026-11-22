@@ -61,6 +61,12 @@ spec:
               value: {{ .Values.orchestrator.sheepwars.startingTimeoutSecs | quote }}
             - name: TRANSFER_TIMEOUT_SECS
               value: {{ .Values.orchestrator.sheepwars.transferTimeoutSecs | quote }}
+            - name: SHEEPWARS_EMPTY_GRACE_SECS
+              value: {{ .Values.orchestrator.sheepwars.emptyGraceSecs | quote }}
+            - name: SHEEPWARS_ENDING_TIMEOUT_SECS
+              value: {{ .Values.orchestrator.sheepwars.endingTimeoutSecs | quote }}
+            - name: SHEEPWARS_HEARTBEAT_TIMEOUT_SECS
+              value: {{ .Values.orchestrator.sheepwars.heartbeatTimeoutSecs | quote }}
             - name: RECONCILE_INTERVAL_MS
               value: {{ .Values.orchestrator.sheepwars.reconcileIntervalMs | quote }}
             - name: SHEEPWARS_PORT

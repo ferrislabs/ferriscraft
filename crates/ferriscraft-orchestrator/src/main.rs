@@ -25,6 +25,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         idle_ttl: config.idle_ttl,
         starting_timeout: config.starting_timeout,
         transfer_timeout: config.transfer_timeout,
+        empty_grace: config.empty_grace,
+        ending_timeout: config.ending_timeout,
+        heartbeat_timeout: config.heartbeat_timeout,
     };
 
     let engine = FleetEngine::new(policy);

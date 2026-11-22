@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::api::AppState;
 use crate::config::OrchestratorConfig;
+use crate::engine::ServerDeletion;
 
 use crate::s3::{MapCatalog, S3Client, sanitize_k8s_label};
 
@@ -381,8 +382,12 @@ async fn reconcile_once(
     };
     state.emit_proxy_events(events);
 
-    for server_id in actions.servers_to_delete {
-        tracing::info!(%server_id, "Suppression du Pod SheepWars");
+    for ServerDeletion { server_id, reason } in actions.servers_to_delete {
+        if reason.is_abnormal() {
+            tracing::warn!(%server_id, ?reason, "Suppression du Pod SheepWars");
+        } else {
+            tracing::info!(%server_id, ?reason, "Suppression du Pod SheepWars");
+        }
         if let Err(err) = pods_api.delete(&server_id, &DeleteParams::default()).await {
             tracing::warn!(%server_id, %err, "Échec suppression Pod SheepWars");
         }
@@ -443,6 +448,9 @@ mod tests {
             idle_ttl: Duration::from_secs(60),
             starting_timeout: Duration::from_secs(120),
             transfer_timeout: Duration::from_secs(15),
+            empty_grace: Duration::from_secs(30),
+            ending_timeout: Duration::from_secs(60),
+            heartbeat_timeout: Duration::from_secs(30),
             reconcile_interval: Duration::from_secs(1),
             k8s_namespace: "ferriscraft".to_owned(),
             pod_template_path: None,
