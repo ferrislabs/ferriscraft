@@ -104,6 +104,7 @@ Chaque ligne devient un test dans le module indiqué.
 - `@spec-swi-28` Le passager d'un abordage n'est téléporté en vol que s'il est à plus de 6 blocs du mouton. `game::flight`
 - `@spec-swi-29` Le chercheur garde son IA active après l'impact, car rspigot ignore la vélocité et la gravité d'un mob sans IA. Les autres moutons armés la désactivent. `game::flight`
 - `@spec-swi-30` À chaque impulsion, la zone de gel émet ses particules de neige sur deux coquilles sphériques de rayon 5 et 2,75 centrées sur l'impact, au-dessus comme au-dessous du centre, et jamais au-delà du rayon 5. `game::effects`
+- `@spec-swi-31` Le mouton d'abordage est lancé moins fort que les autres (1,5 contre 2,2) et le passager est plafonné à 2,0, sous la puissance d'un lancer normal. `sheep::catalog`, `game::flight`
 - `@spec-swi-20` Les explosions n'ont aucun rendement d'objets : `set_yield(0.0)` sur `EntityExplode` et `BlockExplode`. `plugin`
 
 ## Simulation
@@ -206,3 +207,5 @@ Amended: 2026-11-22 Le glacé devient une zone de gel temporisée (`Effects`). L
 Amended: 2026-11-22 Le chercheur ne courait pas : le moteur coupait son IA à l'impact, or `finish_ai_step` n'appelle pas `travel` pour un mob sans IA (`living.rs`), donc sa vélocité était ignorée.
 
 Amended: 2026-11-22 Les particules de la zone de gel forment une sphère (deux coquilles, 68 points par impulsion) au lieu d'un anneau au sol.
+
+Amended: 2026-11-22 Le mouton d'abordage est ralenti : puissance de lancer 1,5 (portée d'environ 39 blocs à -20° au lieu de 70) et vitesse maximale du passager 2,0 au lieu de 3,2.

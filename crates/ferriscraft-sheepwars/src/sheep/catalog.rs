@@ -52,6 +52,7 @@ pub const HEALING_DURATION_TICKS: u32 = 20 * 12;
 pub const HEALING_PULSE_TICKS: u32 = 20;
 pub const HEALING_PULSE_HEALTH: f32 = 2.0;
 pub const HEALING_THROW_POWER: f64 = 1.1;
+pub const BOARDING_THROW_POWER: f64 = 1.5;
 
 pub const QUAKE_RADIUS: f64 = 7.0;
 pub const QUAKE_LIFT: f64 = 1.25;
@@ -197,6 +198,7 @@ pub const fn announces_launch(kind: SheepKind) -> bool {
 pub const fn launch_power(kind: SheepKind) -> f64 {
     match kind {
         SheepKind::Healing => HEALING_THROW_POWER,
+        SheepKind::Boarding => BOARDING_THROW_POWER,
         _ => DEFAULT_THROW_POWER,
     }
 }
@@ -281,9 +283,9 @@ mod tests {
     }
 
     #[test]
-    fn healing_is_thrown_shorter_than_the_others() {
+    fn healing_and_boarding_are_thrown_shorter_than_the_others() {
         for kind in SheepKind::ALL {
-            if kind == SheepKind::Healing {
+            if matches!(kind, SheepKind::Healing | SheepKind::Boarding) {
                 assert!(launch_power(kind) < super::DEFAULT_THROW_POWER);
             } else {
                 assert_eq!(launch_power(kind), super::DEFAULT_THROW_POWER);

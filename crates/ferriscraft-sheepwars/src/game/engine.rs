@@ -22,9 +22,9 @@ use super::effects::Effects;
 use super::fall_guard::FallGuards;
 use super::flight::{
     EYE_HEIGHT, Flight, LANDING_GRACE_TICKS, MAX_CONCURRENT_FLIGHTS, MAX_FLIGHT_TICKS,
-    arms_on_impact, can_launch, chase_detonates, chase_velocity, disables_ai_when_armed,
-    flight_velocity, fuse_label, fuse_ticks, initial_velocity, rider_needs_teleport, starts_effect,
-    torpedo_clear, torpedo_clears, torpedo_triggered,
+    RIDER_MAX_SPEED, arms_on_impact, can_launch, chase_detonates, chase_velocity,
+    disables_ai_when_armed, flight_velocity, fuse_label, fuse_ticks, initial_velocity,
+    rider_needs_teleport, starts_effect, torpedo_clear, torpedo_clears, torpedo_triggered,
 };
 use super::intent::Intent;
 use super::session::{ForceStartError, Session, VoidVerdict, launch_announcement};
@@ -849,7 +849,7 @@ impl Game {
                                     y: airborne.velocity.y + dy * 0.55,
                                     z: airborne.velocity.z + dz * 0.55,
                                 },
-                                3.2,
+                                RIDER_MAX_SPEED,
                             );
                             rider.movement.set_velocity(vector(pull));
                         }

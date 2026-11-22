@@ -10,6 +10,7 @@ use crate::sheep::{
 
 pub const MAX_CONCURRENT_FLIGHTS: usize = 32;
 pub const RIDER_TELEPORT_DISTANCE: f64 = 6.0;
+pub const RIDER_MAX_SPEED: f64 = 2.0;
 pub const MAX_FLIGHT_TICKS: u32 = 20 * 15;
 pub const LANDING_GRACE_TICKS: u32 = 4;
 pub const SHEEP_FUSE_TICKS: u32 = 20 * 3;
@@ -238,6 +239,16 @@ mod tests {
                 assert!(disables_ai_when_armed(kind), "{kind:?}");
             }
         }
+    }
+
+    #[test]
+    fn a_boarding_rider_never_outruns_a_normal_throw() {
+        const {
+            assert!(RIDER_MAX_SPEED < crate::sheep::DEFAULT_THROW_POWER);
+            assert!(RIDER_MAX_SPEED > crate::sheep::BOARDING_THROW_POWER);
+        }
+        let sheep = initial_velocity(SheepKind::Boarding, 0.0, -20.0);
+        assert!(speed(sheep) < crate::sheep::DEFAULT_THROW_POWER);
     }
 
     #[test]
