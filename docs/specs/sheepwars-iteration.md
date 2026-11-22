@@ -95,6 +95,8 @@ Chaque ligne devient un test dans le module indiqué.
 - `@spec-swi-19` Casser un bloc de feu à la main l'éteint. `plugin`
 - `@spec-swi-21` Un `Fragment` n'a pas de mèche (`arms_on_impact` faux) et explose à son premier contact avec le sol, après un délai de grâce plus long que celui des autres moutons. `game::flight`
 - `@spec-swi-22` Un `Fragment` explose avec dégâts non létaux et sans enfants, et sa taille est inférieure à 1. `sheep::impact`
+- `@spec-swi-23` Après un abordage, le joueur ne subit aucun dégât de chute tant qu'il est en l'air, quelle que soit la durée de la chute. `game::fall_guard`
+- `@spec-swi-24` La protection dure 1 s (20 ticks) après son premier contact avec le sol, puis cesse. `game::fall_guard`
 - `@spec-swi-20` Les explosions n'ont aucun rendement d'objets : `set_yield(0.0)` sur `EntityExplode` et `BlockExplode`. `plugin`
 
 ## Simulation
@@ -189,3 +191,5 @@ Puis en jeu dans k3d : lancer chaque mouton.
 Amended: 2026-11-22 Quake, Warp et Intergalactic atterrissent sans mèche de 3 s (`arms_on_impact` faux) : leur délai propre est dans `Effects`.
 
 Amended: 2026-11-22 Les enfants de la fragmentation sont un `SheepKind::Fragment` hors de `SheepKind::ALL` (14 variantes, 13 obtenables) : plus petits, sans mèche.
+
+Amended: 2026-11-22 La protection de chute de l'abordage n'est plus un délai fixe de 2 à 3 s : elle dure tant que le joueur est en l'air, plus 1 s après le sol (`FallGuards`).
