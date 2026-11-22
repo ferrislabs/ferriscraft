@@ -59,6 +59,7 @@ pub struct OrchestratorConfig {
     pub s3_cache_ttl: Duration,
     pub fixed_map: Option<String>,
     pub version: Option<String>,
+    pub use_crd: bool,
 }
 
 fn non_empty_env(name: &str) -> Option<String> {
@@ -195,6 +196,8 @@ impl OrchestratorConfig {
             s3_cache_ttl: Duration::from_secs(parse_u64_env("S3_CACHE_TTL_SECS", 30).max(1)),
             fixed_map: non_empty_env("SHEEPWARS_MAP"),
             version: non_empty_env("FERRISCRAFT_VERSION"),
+            use_crd: non_empty_env("SHEEPWARS_CRD_ENABLED")
+                .is_some_and(|v| v.eq_ignore_ascii_case("true") || v == "1"),
         })
     }
 }
