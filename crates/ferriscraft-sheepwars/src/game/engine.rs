@@ -18,9 +18,9 @@ use super::effects::Effects;
 use super::fall_guard::FallGuards;
 use super::flight::{
     EYE_HEIGHT, Flight, LANDING_GRACE_TICKS, MAX_CONCURRENT_FLIGHTS, MAX_FLIGHT_TICKS,
-    arms_on_impact, can_launch, chase_detonates, chase_velocity, flight_velocity, fuse_label,
-    fuse_ticks, initial_velocity, rider_needs_teleport, starts_effect, torpedo_clear,
-    torpedo_clears, torpedo_triggered,
+    arms_on_impact, can_launch, chase_detonates, chase_velocity, disables_ai_when_armed,
+    flight_velocity, fuse_label, fuse_ticks, initial_velocity, rider_needs_teleport, starts_effect,
+    torpedo_clear, torpedo_clears, torpedo_triggered,
 };
 use super::intent::Intent;
 use super::session::{ForceStartError, Session, VoidVerdict, launch_announcement};
@@ -880,7 +880,9 @@ impl Game {
                         pulses: 0,
                     });
                 } else if arms_on_impact(airborne.flight.kind) {
-                    airborne.entity.ai.set(false);
+                    if disables_ai_when_armed(airborne.flight.kind) {
+                        airborne.entity.ai.set(false);
+                    }
                     airborne.entity.flags.set_gravity(true);
                     airborne.entity.flags.set_invulnerable(false);
                     airborne.entity.flags.set_glowing(true);

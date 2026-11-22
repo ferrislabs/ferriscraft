@@ -43,6 +43,10 @@ pub const fn lands_instantly(kind: SheepKind) -> bool {
     )
 }
 
+pub const fn disables_ai_when_armed(kind: SheepKind) -> bool {
+    !chases_after_impact(kind)
+}
+
 pub const fn is_fragment(kind: SheepKind) -> bool {
     matches!(kind, SheepKind::Fragment)
 }
@@ -224,6 +228,16 @@ mod tests {
         assert!(!arms_on_impact(SheepKind::Intergalactic));
         assert!(arms_on_impact(SheepKind::Seeker));
         assert!(!arms_on_impact(SheepKind::Torpedo));
+    }
+
+    #[test]
+    fn only_the_chaser_keeps_its_ai_so_that_its_velocity_still_moves_it() {
+        assert!(!disables_ai_when_armed(SheepKind::Seeker));
+        for kind in SheepKind::ALL {
+            if kind != SheepKind::Seeker {
+                assert!(disables_ai_when_armed(kind), "{kind:?}");
+            }
+        }
     }
 
     #[test]
