@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use ferriscraft_protocol::QueueJoinStatus;
 use rspigot_plugin::prelude::*;
 use rspigot_plugin::{
-    Action, BarColor, BarStyle, EquipmentSlot, EventResult, Facing, Particle, ParticleBurst,
-    SoundCue, Uuid, Vector,
+    Action, BarColor, BarStyle, EquipmentSlot, EventResult, Explosion, Facing, Particle,
+    ParticleBurst, SoundCue, Uuid, Vector,
 };
 
 use crate::auth::{AuthError, AuthManager, Rank, build_device_prompt, build_device_prompt_for};
@@ -31,7 +31,12 @@ use crate::prefs::PrefsStore;
 const MAX_TASK_TITLE: u32 = 120;
 const MAX_TASK_DESC: u32 = 2000;
 const HUD_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
-const PORTAL_COOLDOWN: Duration = Duration::from_secs(4);
+const PORTAL_DEBOUNCE: Duration = Duration::from_millis(400);
+const PORTAL_BLAST_POWER: f32 = 6.0;
+const PORTAL_LAUNCH_MIN_SPEED: f64 = 0.9;
+const PORTAL_LAUNCH_MAX_SPEED: f64 = 2.0;
+const PORTAL_LAUNCH_LIFT: f64 = 1.1;
+const PORTAL_LAUNCH_DELAY: Duration = Duration::from_millis(60);
 const RUN_WATCH_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const RUN_WATCH_MAX_POLLS: usize = 900;
 const RUN_FINISH_BAR_LINGER: Duration = Duration::from_secs(3);
@@ -59,7 +64,8 @@ struct SharedState {
     npcs: Arc<NpcDirector>,
     orchestrator: Option<Arc<OrchestratorClient>>,
     sheepwars_queue: RwLock<HashSet<Uuid>>,
-    portal_cooldowns: RwLock<HashMap<Uuid, Instant>>,
+    portal_last_blast: RwLock<HashMap<Uuid, Instant>>,
+    last_steps: RwLock<HashMap<Uuid, Vector>>,
     task_results: RwLock<HashMap<String, TaskResultReport>>,
 }
 
@@ -95,7 +101,8 @@ impl FerrisCraftLobby {
                 npcs,
                 orchestrator,
                 sheepwars_queue: RwLock::new(HashSet::new()),
-                portal_cooldowns: RwLock::new(HashMap::new()),
+                portal_last_blast: RwLock::new(HashMap::new()),
+                last_steps: RwLock::new(HashMap::new()),
                 task_results: RwLock::new(HashMap::new()),
             }),
         }
@@ -362,6 +369,42 @@ impl FerrisCraftLobby {
         );
     }
 
+    fn portal_blast(&self, player: Player, at: Position, entry_step: Option<Vector>, yaw: f32) {
+        let launch = portal_launch_velocity(entry_step, yaw);
+        tokio::spawn(async move {
+            let world = &player.world;
+            world
+                .explosion
+                .create(Explosion::new(at, PORTAL_BLAST_POWER, false));
+            world.particle.spawn(
+                ParticleBurst::new(Particle::ExplosionEmitter, at)
+                    .count(6)
+                    .spread(Vector {
+                        x: 1.8,
+                        y: 1.2,
+                        z: 1.8,
+                    }),
+            );
+            world.particle.spawn(
+                ParticleBurst::new(Particle::Portal, at)
+                    .count(160)
+                    .spread(Vector {
+                        x: 1.5,
+                        y: 1.5,
+                        z: 1.5,
+                    })
+                    .speed(0.9),
+            );
+            player.sound.play(
+                SoundCue::new(Sound::EntityGenericExplode)
+                    .volume(1.4)
+                    .pitch(0.8),
+            );
+            tokio::time::sleep(PORTAL_LAUNCH_DELAY).await;
+            player.movement.set_velocity(launch);
+        });
+    }
+
     fn join_sheepwars(&self, player: Player) {
         let lobby = self.clone();
         tokio::spawn(async move {
@@ -592,9 +635,7 @@ impl FerrisCraftLobby {
         self.state
             .menus
             .refresh_open_options(player.uuid, &updated, claims.as_ref());
-        self.state
-            .menus
-            .refresh_open_gadgets(player.uuid, &updated);
+        self.state.menus.refresh_open_gadgets(player.uuid, &updated);
 
         if updated.flight_enabled {
             player.sound.play(
@@ -619,11 +660,9 @@ impl FerrisCraftLobby {
                 "§b✈ §aVol dans le Lobby activé ! Appuyez deux fois sur Espace pour décoller.",
             );
         } else {
-            player.sound.play(
-                SoundCue::new(Sound::UiButtonClick)
-                    .volume(0.7)
-                    .pitch(0.75),
-            );
+            player
+                .sound
+                .play(SoundCue::new(Sound::UiButtonClick).volume(0.7).pitch(0.75));
             player.action_bar.send("§7✈ Vol dans le Lobby DÉSACTIVÉ");
             player.message.send("§7✈ Vol dans le Lobby désactivé.");
         }
@@ -639,9 +678,7 @@ impl FerrisCraftLobby {
         self.state
             .menus
             .refresh_open_options(player.uuid, &updated, claims.as_ref());
-        self.state
-            .menus
-            .refresh_open_gadgets(player.uuid, &updated);
+        self.state.menus.refresh_open_gadgets(player.uuid, &updated);
 
         player.sound.play(
             SoundCue::new(Sound::EntityExperienceOrbPickup)
@@ -651,9 +688,10 @@ impl FerrisCraftLobby {
         player
             .action_bar
             .send(format!("§e⚡ Vitesse : {}", updated.speed_tier.label()));
-        player
-            .message
-            .send(format!("§e⚡ Vitesse réglée sur : {}", updated.speed_tier.label()));
+        player.message.send(format!(
+            "§e⚡ Vitesse réglée sur : {}",
+            updated.speed_tier.label()
+        ));
     }
 
     fn cycle_trail_for(&self, player: &Player) {
@@ -661,9 +699,7 @@ impl FerrisCraftLobby {
             .state
             .prefs
             .update(player.uuid, |p| p.aura_trail = p.aura_trail.next());
-        self.state
-            .menus
-            .refresh_open_gadgets(player.uuid, &updated);
+        self.state.menus.refresh_open_gadgets(player.uuid, &updated);
         player.sound.play(
             SoundCue::new(Sound::EntityExperienceOrbPickup)
                 .volume(0.75)
@@ -693,9 +729,7 @@ impl FerrisCraftLobby {
             .update(player.uuid, |p| p.equipped_gadget = gadget);
         let claims = self.state.auth.claims_of(player.uuid);
         apply_lobby_hotbar(player, claims.as_ref(), &updated);
-        self.state
-            .menus
-            .refresh_open_gadgets(player.uuid, &updated);
+        self.state.menus.refresh_open_gadgets(player.uuid, &updated);
 
         player.sound.play(
             SoundCue::new(Sound::EntityItemPickup)
@@ -704,10 +738,9 @@ impl FerrisCraftLobby {
         );
         match gadget {
             Some(g) => {
-                player.action_bar.send(format!(
-                    "{} §aéquipé ! §7(Slot 7 · Clic droit)",
-                    g.title()
-                ));
+                player
+                    .action_bar
+                    .send(format!("{} §aéquipé ! §7(Slot 7 · Clic droit)", g.title()));
                 player.message.send(format!(
                     "§b✦ Gadget équipé : {} §7— clic droit en main (slot 7) pour l'utiliser !",
                     g.title()
@@ -731,12 +764,7 @@ impl FerrisCraftLobby {
         });
     }
 
-    fn handle_menu_click(
-        &self,
-        player: Player,
-        clicked_inv: Option<&InventoryRef>,
-        slot: i32,
-    ) {
+    fn handle_menu_click(&self, player: Player, clicked_inv: Option<&InventoryRef>, slot: i32) {
         if self.state.menus.is_games_inventory(clicked_inv) {
             if let Some(action) = decode_games_click(slot) {
                 player
@@ -1247,12 +1275,6 @@ fn json_field(payload: &serde_json::Value, key: &str) -> String {
         .to_owned()
 }
 
-fn dist_sq_xz(a: Position, b: Position) -> f64 {
-    let dx = a.x - b.x;
-    let dz = a.z - b.z;
-    dx * dx + dz * dz
-}
-
 #[listeners]
 impl FerrisCraftLobby {
     async fn on_enable(&self, server: &Server) {
@@ -1431,7 +1453,12 @@ impl FerrisCraftLobby {
         self.state.npcs.leave_captain_chat(player.uuid);
         self.state.chat.clear_player(player.uuid);
         self.state
-            .portal_cooldowns
+            .last_steps
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&player.uuid);
+        self.state
+            .portal_last_blast
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&player.uuid);
@@ -1924,41 +1951,74 @@ impl FerrisCraftLobby {
             return;
         }
 
+        let from = event.from();
+        let step = Vector {
+            x: to.position.x - from.position.x,
+            y: 0.0,
+            z: to.position.z - from.position.z,
+        };
+        self.state
+            .last_steps
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(event.player().uuid, step);
+
         let prefs = self.state.prefs.get(event.player().uuid);
         if prefs.aura_trail != AuraTrail::None {
             self.state
                 .gadgets
                 .emit_trail_if_due(event.player(), prefs.aura_trail);
         }
+    }
 
-        // Stepping into the Giant Purple Portal triggers SheepWars!
-        if let Some(portal) = layout.pois.get("portal") {
-            let portal_plane = portal.project_forward(2.5);
-            if (to.position.y - portal.y).abs() < 4.5 && dist_sq_xz(to.position, portal_plane) < 4.0
-            {
-                let player = event.player().clone();
-                let should_trigger = {
-                    let now = Instant::now();
-                    let mut guard = self
-                        .state
-                        .portal_cooldowns
-                        .write()
-                        .unwrap_or_else(|e| e.into_inner());
-                    match guard.get(&player.uuid) {
-                        Some(last) if now.saturating_duration_since(*last) < PORTAL_COOLDOWN => {
-                            false
-                        }
-                        _ => {
-                            guard.insert(player.uuid, now);
-                            true
-                        }
-                    }
-                };
-                if should_trigger {
-                    self.join_sheepwars(player);
+    async fn on_player_portal(&self, event: &mut PlayerPortal) {
+        if event.cause() == PlayerTeleportCause::EndPortal {
+            event.cancel();
+        }
+    }
+
+    async fn on_entity_portal_enter(&self, event: &EntityPortalEnter) {
+        if event.entity_type() != EntityType::Player || self.state.orchestrator.is_none() {
+            return;
+        }
+        let entity = event.entity();
+        let uuid = entity.uuid;
+        let now = Instant::now();
+        let debounced = {
+            let mut guard = self
+                .state
+                .portal_last_blast
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            match guard.get(&uuid) {
+                Some(last) if now.saturating_duration_since(*last) < PORTAL_DEBOUNCE => true,
+                _ => {
+                    guard.insert(uuid, now);
+                    false
                 }
             }
+        };
+        if debounced {
+            return;
         }
+        let step = self
+            .state
+            .last_steps
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&uuid)
+            .copied();
+        let at = entity.position;
+        let server = entity.server();
+        let lobby = self.clone();
+        tokio::spawn(async move {
+            let Ok(players) = server.get_players().await else {
+                return;
+            };
+            if let Some(player) = players.into_iter().find(|p| p.uuid == uuid) {
+                lobby.portal_blast(player, at, step, 0.0);
+            }
+        });
     }
 
     #[command("menu")]
@@ -2331,5 +2391,30 @@ impl FerrisCraftLobby {
                 ));
             }
         }
+    }
+}
+
+fn portal_launch_velocity(entry_step: Option<Vector>, yaw: f32) -> Vector {
+    let (dx, dz, len) = match entry_step {
+        Some(step) => {
+            let len = step.x.hypot(step.z);
+            (step.x, step.z, len)
+        }
+        None => (0.0, 0.0, 0.0),
+    };
+    let (dir_x, dir_z, speed) = if len > 1e-3 {
+        (
+            -dx / len,
+            -dz / len,
+            (len * 4.0).clamp(PORTAL_LAUNCH_MIN_SPEED, PORTAL_LAUNCH_MAX_SPEED),
+        )
+    } else {
+        let rad = f64::from(yaw.to_radians());
+        (rad.sin(), -rad.cos(), PORTAL_LAUNCH_MIN_SPEED)
+    };
+    Vector {
+        x: dir_x * speed,
+        y: PORTAL_LAUNCH_LIFT,
+        z: dir_z * speed,
     }
 }
