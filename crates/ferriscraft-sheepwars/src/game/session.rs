@@ -3,6 +3,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use super::intent::Intent;
+use super::report::RoundLog;
 use crate::arena::{Layout, Point};
 use crate::domain::{
     Phase, PlayerId, Round, RoundError, RoundEvent, RoundRules, SheepKind, TeamId,
@@ -60,6 +61,11 @@ pub struct Session {
     end_delay_ticks: u32,
     end_behavior: EndBehavior,
     server_ending: bool,
+    log: Option<RoundLog>,
+    forced_start: bool,
+    elapsed_ticks: u32,
+    pending_report: Option<Uuid>,
+    delay_elapsed: bool,
 }
 
 impl Session {
@@ -81,6 +87,11 @@ impl Session {
             end_delay_ticks: end_delay_ticks.max(1),
             end_behavior,
             server_ending: false,
+            log: None,
+            forced_start: false,
+            elapsed_ticks: 0,
+            pending_report: None,
+            delay_elapsed: false,
         }
     }
 
@@ -167,6 +178,10 @@ impl Session {
         let Some(team) = self.round.team_of(player) else {
             return Vec::new();
         };
+        self.note_elapsed();
+        if let Some(log) = self.log.as_mut() {
+            log.left(player);
+        }
         let events: Vec<RoundEvent> = self
             .round
             .leave(player)
@@ -191,6 +206,7 @@ impl Session {
     }
 
     pub fn die(&mut self, player: PlayerId) -> Vec<Intent> {
+        self.note_elapsed();
         let events = self.round.die(player);
         self.absorb(&events)
     }
@@ -200,10 +216,15 @@ impl Session {
             return Vec::new();
         }
         let events = self.round.tick();
+        self.note_elapsed();
         let mut intents = self.absorb(&events);
         if let Some(remaining) = self.reset_in {
             if remaining <= 1 {
-                intents.extend(self.finish_end_delay());
+                self.reset_in = None;
+                self.delay_elapsed = true;
+                if self.pending_report.is_none() {
+                    intents.extend(self.finish_end_delay());
+                }
             } else {
                 self.reset_in = Some(remaining - 1);
             }
@@ -229,12 +250,25 @@ impl Session {
                 return Err(ForceStartError::AlreadyStarted);
             }
         }
+        self.forced_start = true;
         let mut events = Vec::new();
         while matches!(self.round.phase(), Phase::Countdown { .. }) {
             events.extend(self.round.tick());
         }
         intents.extend(self.absorb(&events));
         Ok(intents)
+    }
+
+    pub fn report_settled(&mut self, match_id: Uuid) -> Vec<Intent> {
+        if self.pending_report != Some(match_id) {
+            return Vec::new();
+        }
+        self.pending_report = None;
+        if self.delay_elapsed {
+            self.finish_end_delay()
+        } else {
+            Vec::new()
+        }
     }
 
     pub fn stop(&mut self) -> Vec<Intent> {
@@ -321,6 +355,11 @@ impl Session {
         self.round = Round::new(self.rules);
         self.reset_in = None;
         self.server_ending = false;
+        self.log = None;
+        self.forced_start = false;
+        self.elapsed_ticks = 0;
+        self.pending_report = None;
+        self.delay_elapsed = false;
         vec![Intent::Broadcast(text.to_owned()), Intent::Reset]
     }
 
@@ -338,13 +377,60 @@ impl Session {
         ]
     }
 
+    fn note_elapsed(&mut self) {
+        if let Phase::Playing { elapsed } = self.round.phase() {
+            self.elapsed_ticks = elapsed;
+        }
+    }
+
+    fn roster(&self) -> Vec<(PlayerId, TeamId)> {
+        TeamId::ALL
+            .into_iter()
+            .flat_map(|team| {
+                self.round
+                    .team(team)
+                    .members()
+                    .map(move |player| (player, team))
+            })
+            .collect()
+    }
+
     fn absorb(&mut self, events: &[RoundEvent]) -> Vec<Intent> {
         let mut intents = Vec::new();
         for event in events {
-            if matches!(event, RoundEvent::Won(_) | RoundEvent::Draw) {
-                self.reset_in = Some(self.end_delay_ticks);
+            match *event {
+                RoundEvent::Started => {
+                    self.log = Some(RoundLog::start(
+                        Uuid::new_v4(),
+                        self.forced_start,
+                        self.roster(),
+                    ));
+                }
+                RoundEvent::Eliminated(player) => {
+                    if let Some(log) = self.log.as_mut() {
+                        log.eliminated(player);
+                    }
+                }
+                RoundEvent::Won(_) | RoundEvent::Draw => {
+                    self.reset_in = Some(self.end_delay_ticks);
+                }
+                _ => {}
             }
             intents.extend(self.intents_for(event));
+            let winner = match *event {
+                RoundEvent::Won(team) => Some(Some(team)),
+                RoundEvent::Draw => Some(None),
+                _ => None,
+            };
+            if let Some(winner) = winner
+                && let Some(log) = self.log.take()
+            {
+                let summary = log.finish(winner, self.elapsed_ticks);
+                if self.end_behavior == EndBehavior::EphemeralPod {
+                    self.pending_report = Some(summary.match_id);
+                }
+                intents.push(Intent::SubmitReport(summary));
+            }
         }
         intents
     }
@@ -425,6 +511,8 @@ mod tests {
     use super::*;
     use crate::arena::ArenaSettings;
     use crate::domain::RespawnRule;
+    use crate::game::report::RoundSummary;
+    use ferriscraft_protocol::MatchOutcome;
 
     const A: PlayerId = PlayerId(1);
     const B: PlayerId = PlayerId(2);
@@ -462,6 +550,193 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn report_id(intents: &[Intent]) -> Option<Uuid> {
+        intents.iter().find_map(|intent| match intent {
+            Intent::SubmitReport(summary) => Some(summary.match_id),
+            _ => None,
+        })
+    }
+
+    fn summary_of(intents: &[Intent]) -> Option<&RoundSummary> {
+        intents.iter().find_map(|intent| match intent {
+            Intent::SubmitReport(summary) => Some(summary),
+            _ => None,
+        })
+    }
+
+    fn ephemeral() -> Session {
+        let mut session = Session::new_with(
+            Layout::new(ArenaSettings::default()),
+            rules(),
+            4,
+            EndBehavior::EphemeralPod,
+        );
+        session.join(A);
+        session.join(B);
+        for _ in 0..3 {
+            session.tick();
+        }
+        session
+    }
+
+    #[test]
+    fn a_win_submits_one_report_with_outcomes_and_duration() {
+        let mut session = started();
+        for _ in 0..45 {
+            session.tick();
+        }
+        session.die(A);
+        let intents = session.die(A);
+        let summary = summary_of(&intents).expect("report");
+        assert_eq!(summary.duration_secs, 2);
+        assert!(!summary.forced_start);
+        let outcome = |player| {
+            summary
+                .participants
+                .iter()
+                .find(|p| p.player == player)
+                .map(|p| (p.outcome, p.completed))
+        };
+        assert_eq!(outcome(A), Some((MatchOutcome::Loss, true)));
+        assert_eq!(outcome(B), Some((MatchOutcome::Win, true)));
+        assert_eq!(
+            intents
+                .iter()
+                .filter(|i| matches!(i, Intent::SubmitReport(_)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_player_leaving_mid_round_is_reported_as_not_completed() {
+        let mut session = started();
+        let intents = session.leave(A);
+        let summary = summary_of(&intents).expect("report");
+        let a = summary.participants.iter().find(|p| p.player == A).unwrap();
+        let b = summary.participants.iter().find(|p| p.player == B).unwrap();
+        assert_eq!((a.outcome, a.completed), (MatchOutcome::Loss, false));
+        assert_eq!((b.outcome, b.completed), (MatchOutcome::Win, true));
+    }
+
+    #[test]
+    fn a_player_eliminated_then_leaving_still_completed() {
+        let mut session = Session::new(
+            Layout::new(ArenaSettings::default()),
+            RoundRules {
+                max_players: 4,
+                ..rules()
+            },
+        );
+        for player in [A, B, C] {
+            session.join(player);
+        }
+        for _ in 0..3 {
+            session.tick();
+        }
+        session.die(C);
+        session.die(C);
+        session.leave(C);
+        let intents = session.leave(A);
+        let summary = summary_of(&intents).expect("report");
+        let c = summary.participants.iter().find(|p| p.player == C).unwrap();
+        assert!(c.completed);
+    }
+
+    #[test]
+    fn a_forced_start_is_flagged_in_the_report() {
+        let mut session = session();
+        session.join(A);
+        session.force_start().expect("starts");
+        let intents = session.die(A);
+        let summary = summary_of(&intents).expect("report");
+        assert!(summary.forced_start);
+        assert_eq!(summary.participants.len(), 1);
+        assert_eq!(summary.participants[0].outcome, MatchOutcome::Win);
+    }
+
+    #[test]
+    fn a_round_after_a_stop_gets_its_own_report() {
+        let mut session = started();
+        session.stop();
+        session.join(A);
+        session.join(B);
+        for _ in 0..3 {
+            session.tick();
+        }
+        session.die(A);
+        let intents = session.die(A);
+        let summary = summary_of(&intents).expect("report");
+        assert!(!summary.forced_start);
+        assert_eq!(summary.participants.len(), 2);
+    }
+
+    #[test]
+    fn an_ephemeral_pod_waits_for_the_ack_after_the_delay() {
+        let mut session = ephemeral();
+        session.die(A);
+        let match_id = report_id(&session.die(A)).expect("report");
+        for _ in 0..20 {
+            let intents = session.tick();
+            assert!(!intents.contains(&Intent::EndServer));
+            assert!(!session.is_server_ending());
+        }
+        let intents = session.report_settled(match_id);
+        assert!(intents.contains(&Intent::EndServer));
+        assert!(session.is_server_ending());
+    }
+
+    #[test]
+    fn an_ephemeral_pod_waits_for_the_delay_after_an_early_ack() {
+        let mut session = ephemeral();
+        session.die(A);
+        let match_id = report_id(&session.die(A)).expect("report");
+        assert!(session.report_settled(match_id).is_empty());
+        for _ in 0..3 {
+            assert!(session.tick().is_empty());
+        }
+        assert!(session.tick().contains(&Intent::EndServer));
+    }
+
+    #[test]
+    fn an_ack_for_another_match_does_not_release_the_ending() {
+        let mut session = ephemeral();
+        session.die(A);
+        session.die(A);
+        for _ in 0..10 {
+            session.tick();
+        }
+        assert!(session.report_settled(Uuid::new_v4()).is_empty());
+        assert!(!session.is_server_ending());
+    }
+
+    #[test]
+    fn a_reset_round_never_waits_for_the_report() {
+        let mut session = Session::new_with(
+            Layout::new(ArenaSettings::default()),
+            rules(),
+            4,
+            EndBehavior::ResetRound {
+                return_to_lobby: true,
+            },
+        );
+        session.join(A);
+        session.join(B);
+        for _ in 0..3 {
+            session.tick();
+        }
+        session.die(A);
+        assert!(report_id(&session.die(A)).is_some());
+        for _ in 0..3 {
+            session.tick();
+        }
+        let intents = session.tick();
+        assert!(intents.contains(&Intent::Reset));
+        assert!(intents.contains(&Intent::ReturnAllToLobby {
+            reason: "fin de partie".to_owned()
+        }));
     }
 
     #[test]
@@ -662,7 +937,7 @@ mod tests {
         assert_eq!(session.server_phase(), ServerPhase::InGame);
 
         session.die(A);
-        session.die(A);
+        let match_id = report_id(&session.die(A)).expect("report submitted");
         // During celebration delay, keep InGame so Velocity preserves player session until transfer.
         assert_eq!(session.server_phase(), ServerPhase::InGame);
 
@@ -670,6 +945,9 @@ mod tests {
             assert!(session.tick().is_empty());
         }
         let end_intents = session.tick();
+        assert!(end_intents.is_empty());
+        assert_eq!(session.server_phase(), ServerPhase::InGame);
+        let end_intents = session.report_settled(match_id);
         assert!(end_intents.contains(&Intent::ReturnAllToLobby {
             reason: "fin de partie".to_owned()
         }));

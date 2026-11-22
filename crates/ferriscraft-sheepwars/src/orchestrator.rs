@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use ferriscraft_protocol::{
-    HeartbeatRequest, PhaseUpdateRequest, SendToLobbyRequest, ServerPhase,
+    HeartbeatRequest, MatchReport, MatchReportAck, PhaseUpdateRequest, PlayerProfile,
+    SendToLobbyRequest, ServerPhase,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -95,5 +96,37 @@ impl SheepWarsOrchestratorClient {
             return Err(OrchestratorClientError::HttpStatus(resp.status().as_u16()));
         }
         Ok(())
+    }
+
+    pub async fn post_match_report(
+        &self,
+        report: &MatchReport,
+    ) -> Result<MatchReportAck, OrchestratorClientError> {
+        let resp = self
+            .apply_auth(self.http.post(format!("{}/api/v1/matches", self.base_url)))
+            .json(report)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(OrchestratorClientError::HttpStatus(resp.status().as_u16()));
+        }
+        Ok(resp.json().await?)
+    }
+
+    pub async fn fetch_profile(
+        &self,
+        player_uuid: Uuid,
+    ) -> Result<PlayerProfile, OrchestratorClientError> {
+        let resp = self
+            .apply_auth(self.http.get(format!(
+                "{}/api/v1/players/{player_uuid}/profile",
+                self.base_url
+            )))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(OrchestratorClientError::HttpStatus(resp.status().as_u16()));
+        }
+        Ok(resp.json().await?)
     }
 }

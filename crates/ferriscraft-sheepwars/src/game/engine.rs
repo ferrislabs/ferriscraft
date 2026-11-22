@@ -2,20 +2,22 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use ferriscraft_protocol::{HeartbeatRequest, ServerPhase};
+use ferriscraft_protocol::{HeartbeatRequest, MatchReportAck, PlayerProfile, ServerPhase};
 use futures_util::future::join_all;
 use rspigot_plugin::{
     BossBar, ChunkLoad, Enchantment, Entity, EntityType, GameMode, InventorySlot, ItemRemoval,
     ItemStack, Location, Material, Particle, ParticleBurst, Player, Position, Rotation, SlotItem,
     Sound, SoundCue, Title, Uuid, Vector,
 };
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 
+use super::cosmetics::{Loadout, SheepTrail, VictoryEffect};
 use super::cosmetics::{
     MAX_ARROW_AGE_TICKS, MAX_TRACKED_ARROWS, MAX_TRAIL_ACTIONS_PER_TICK, arrow_trail, capped,
-    celebrating, celebration_pulses, explosion_burst, sheep_trail, victory_pulse,
+    celebrating, celebration_pulses, equipped_sheep_trail, equipped_victory_pulse, explosion_burst,
+    sheep_trail, victory_pulse,
 };
 use super::display::lives_line;
 use super::effects::Effects;
@@ -27,6 +29,10 @@ use super::flight::{
     rider_needs_teleport, starts_effect, torpedo_clear, torpedo_clears, torpedo_triggered,
 };
 use super::intent::Intent;
+use super::report::{
+    DeliveryError, RoundSummary, build_report, deliver, not_counted_notice, retry_schedule,
+    reward_display,
+};
 use super::session::{ForceStartError, Session, VoidVerdict, launch_announcement};
 use crate::arena::{Arena, ArenaError, Point};
 use crate::config::SheepWarsConfig;
@@ -63,8 +69,20 @@ struct Celebration {
     age: u32,
 }
 
+enum Background {
+    Report {
+        match_id: Uuid,
+        result: Result<MatchReportAck, DeliveryError>,
+    },
+    Profile {
+        uuid: Uuid,
+        profile: Box<PlayerProfile>,
+    },
+}
+
 #[derive(Debug)]
 struct Airborne {
+    trail: Option<SheepTrail>,
     flight: Flight,
     entity: Entity,
     velocity: Vec3,
@@ -92,6 +110,8 @@ struct ActiveHealing {
 struct State {
     session: Session,
     players: HashMap<PlayerId, Player>,
+    names: HashMap<PlayerId, String>,
+    loadouts: HashMap<PlayerId, Loadout>,
     flights: Vec<Airborne>,
     armed: Vec<ArmedSheep>,
     healings: Vec<ActiveHealing>,
@@ -112,6 +132,8 @@ pub struct Game {
     config: SheepWarsConfig,
     orchestrator: Option<Arc<SheepWarsOrchestratorClient>>,
     heartbeat_notify: Arc<Notify>,
+    background_tx: mpsc::UnboundedSender<Background>,
+    background_rx: Mutex<mpsc::UnboundedReceiver<Background>>,
     state: Mutex<State>,
 }
 
@@ -124,14 +146,19 @@ impl Game {
         config: SheepWarsConfig,
         orchestrator: Option<Arc<SheepWarsOrchestratorClient>>,
     ) -> Self {
+        let (background_tx, background_rx) = mpsc::unbounded_channel();
         Self {
             arena,
             config,
             orchestrator,
             heartbeat_notify: Arc::new(Notify::new()),
+            background_tx,
+            background_rx: Mutex::new(background_rx),
             state: Mutex::new(State {
                 session,
                 players: HashMap::new(),
+                names: HashMap::new(),
+                loadouts: HashMap::new(),
                 flights: Vec::new(),
                 armed: Vec::new(),
                 healings: Vec::new(),
@@ -228,11 +255,129 @@ impl Game {
         let intents = {
             let mut state = self.lock();
             state.bar.add_player(&player);
-            state.players.insert(id, player);
+            state.names.insert(id, player.name.clone());
+            state.names.insert(id, player.name.clone());
+            state.players.insert(id, player.clone());
             state.session.join(id)
         };
+        self.fetch_profile(player.uuid);
         self.run(intents).await;
         self.heartbeat_notify.notify_one();
+    }
+
+    fn fetch_profile(&self, uuid: Uuid) {
+        let Some(orchestrator) = self.orchestrator.clone() else {
+            return;
+        };
+        let background = self.background_tx.clone();
+        tokio::spawn(async move {
+            match orchestrator.fetch_profile(uuid).await {
+                Ok(profile) => {
+                    let _ = background.send(Background::Profile {
+                        uuid,
+                        profile: Box::new(profile),
+                    });
+                }
+                Err(error) => tracing::debug!(%uuid, "profil indisponible : {error}"),
+            }
+        });
+    }
+
+    fn submit_report(&self, summary: &RoundSummary) {
+        let Some(orchestrator) = self.orchestrator.clone() else {
+            return;
+        };
+        let report = {
+            let state = self.lock();
+            build_report(summary, &self.config.server_id, |id| {
+                state.names.get(&id).cloned()
+            })
+        };
+        let background = self.background_tx.clone();
+        tokio::spawn(async move {
+            let result = deliver(&retry_schedule(), || {
+                orchestrator.post_match_report(&report)
+            })
+            .await;
+            match &result {
+                Ok(ack) => tracing::info!(
+                    match_id = %report.match_id,
+                    counted = ack.counted,
+                    duplicate = ack.duplicate,
+                    "rapport de manche accepté"
+                ),
+                Err(DeliveryError::Rejected(error)) => tracing::warn!(
+                    match_id = %report.match_id,
+                    "rapport de manche refusé définitivement : {error}"
+                ),
+                Err(DeliveryError::Exhausted(error)) => tracing::error!(
+                    match_id = %report.match_id,
+                    "rapport de manche non envoyé, budget de renvoi épuisé : {error}"
+                ),
+            }
+            let _ = background.send(Background::Report {
+                match_id: report.match_id,
+                result,
+            });
+        });
+    }
+
+    fn take_background(&self) -> Vec<Background> {
+        let mut inbox = self
+            .background_rx
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut taken = Vec::new();
+        while let Ok(item) = inbox.try_recv() {
+            taken.push(item);
+        }
+        taken
+    }
+
+    async fn drain_background(&self) {
+        for item in self.take_background() {
+            match item {
+                Background::Profile { uuid, profile } => {
+                    self.lock()
+                        .loadouts
+                        .insert(player_id(uuid), Loadout::from_profile(&profile));
+                }
+                Background::Report { match_id, result } => {
+                    if let Ok(ack) = &result {
+                        self.announce(ack);
+                    }
+                    let intents = self.lock().session.report_settled(match_id);
+                    self.run(intents).await;
+                }
+            }
+        }
+    }
+
+    fn announce(&self, ack: &MatchReportAck) {
+        if !ack.counted {
+            for player in self.everyone() {
+                player.message.send(not_counted_notice());
+            }
+            return;
+        }
+        for reward in &ack.rewards {
+            let id = player_id(reward.uuid);
+            let player = {
+                let mut state = self.lock();
+                let Some(player) = state.players.get(&id).cloned() else {
+                    continue;
+                };
+                state.loadouts.entry(id).or_default().level = reward.game.level;
+                player
+            };
+            let display = reward_display(reward);
+            for line in &display.lines {
+                player.message.send(line.as_str());
+            }
+            if let Some(title) = &display.title {
+                player.title.send(Title::new(title.as_str()));
+            }
+        }
     }
 
     pub fn restore_platforms(&self) -> Result<usize, ArenaError> {
@@ -271,7 +416,11 @@ impl Game {
             state.session.leave(id)
         };
         self.run(intents).await;
-        self.lock().players.remove(&id);
+        {
+            let mut state = self.lock();
+            state.players.remove(&id);
+            state.loadouts.remove(&id);
+        }
         self.heartbeat_notify.notify_one();
     }
 
@@ -408,7 +557,7 @@ impl Game {
 
     pub async fn throw(&self, player: &Player, kind: SheepKind) -> bool {
         let id = player_id(player.uuid);
-        let team = {
+        let (team, trail) = {
             let state = self.lock();
             let standing = state.session.standing();
             let Some((_, team)) = standing.into_iter().find(|(member, _)| *member == id) else {
@@ -417,7 +566,11 @@ impl Game {
             if !state.session.is_playing() || !can_launch(state.flights.len()) {
                 return false;
             }
-            team
+            let trail = state
+                .loadouts
+                .get(&id)
+                .and_then(|loadout| loadout.sheep_trail);
+            (team, trail)
         };
         let eye = Vec3 {
             x: player.position.x,
@@ -476,6 +629,7 @@ impl Game {
             }
             state.sheep_kinds.insert(sheep.entity_id, kind);
             state.flights.push(Airborne {
+                trail,
                 flight: Flight::new(kind, team, id),
                 entity: sheep,
                 velocity,
@@ -491,6 +645,7 @@ impl Game {
     }
 
     pub async fn tick(&self) {
+        self.drain_background().await;
         let intents = self.lock().session.tick();
         self.run(intents).await;
         self.advance_flights().await;
@@ -671,6 +826,7 @@ impl Game {
                 }
                 self.heartbeat_notify.notify_one();
             }
+            Intent::SubmitReport(summary) => self.submit_report(&summary),
             Intent::Reset => return self.reset(),
         }
         Vec::new()
@@ -713,6 +869,8 @@ impl Game {
                 state.hud.remove_player(team, &player.name);
             }
         }
+        let connected: Vec<PlayerId> = state.players.keys().copied().collect();
+        state.names.retain(|id, _| connected.contains(id));
         let mut ids: Vec<PlayerId> = state.players.keys().copied().collect();
         ids.sort();
         ids.into_iter()
@@ -954,7 +1112,10 @@ impl Game {
                 airborne.entity.set_velocity(vector(next_velocity));
                 airborne.velocity = next_velocity;
                 airborne.last_pos = pos;
-                trail.extend(sheep_trail(airborne.flight.team, pos));
+                trail.extend(match airborne.trail {
+                    Some(equipped) => equipped_sheep_trail(equipped, pos, airborne.flight.age),
+                    None => sheep_trail(airborne.flight.team, pos),
+                });
                 next.push(airborne);
             }
         }
@@ -1291,19 +1452,29 @@ impl Game {
             if !celebration_pulses(age) {
                 return;
             }
-            let winners: Vec<Player> = state
+            let winners: Vec<(Player, Option<VictoryEffect>)> = state
                 .session
                 .standing()
                 .into_iter()
                 .filter(|(_, member_team)| *member_team == team)
-                .filter_map(|(id, _)| state.players.get(&id).cloned())
+                .filter_map(|(id, _)| {
+                    let effect = state.loadouts.get(&id).and_then(|l| l.victory_effect);
+                    state
+                        .players
+                        .get(&id)
+                        .cloned()
+                        .map(|player| (player, effect))
+                })
                 .collect();
             (team, winners)
         };
         let mut actions = Vec::new();
-        for winner in winners {
+        for (winner, effect) in winners {
             if let Ok(position) = winner.get_position().await {
-                actions.extend(victory_pulse(team, vec3(position)));
+                actions.extend(match effect {
+                    Some(effect) => equipped_victory_pulse(effect, vec3(position)),
+                    None => victory_pulse(team, vec3(position)),
+                });
             }
         }
         let actions = capped(actions, MAX_TRAIL_ACTIONS_PER_TICK);
@@ -1345,6 +1516,11 @@ impl Game {
             thrower,
             ..
         } = flight;
+        let trail = self
+            .lock()
+            .loadouts
+            .get(&thrower)
+            .and_then(|loadout| loadout.sheep_trail);
         let mut actions = plan(kind, impact_pos, team);
         let burst = explosion_burst(&actions, team);
         actions.extend(burst);
@@ -1360,6 +1536,7 @@ impl Game {
             Ok(spawned) => spawned
                 .into_iter()
                 .map(|(kind, entity, velocity)| Airborne {
+                    trail,
                     flight: Flight::new(kind, team, thrower),
                     entity,
                     velocity,

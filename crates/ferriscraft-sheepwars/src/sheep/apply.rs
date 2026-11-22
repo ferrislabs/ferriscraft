@@ -536,6 +536,17 @@ const fn team_color(team: TeamId) -> Color {
     }
 }
 
+const fn rainbow_color(step: u8) -> Color {
+    match step % 6 {
+        0 => Color::rgb(255, 60, 60),
+        1 => Color::rgb(255, 150, 40),
+        2 => Color::rgb(255, 235, 60),
+        3 => Color::rgb(70, 220, 90),
+        4 => Color::rgb(70, 130, 255),
+        _ => Color::rgb(170, 90, 230),
+    }
+}
+
 const fn particle(kind: ParticleKind) -> Particle {
     match kind {
         ParticleKind::Explosion => Particle::Explosion,
@@ -552,6 +563,12 @@ const fn particle(kind: ParticleKind) -> Particle {
         ParticleKind::EndRod => Particle::EndRod,
         ParticleKind::Firework => Particle::Firework,
         ParticleKind::Totem => Particle::TotemOfUndying,
+        ParticleKind::Note => Particle::Note,
+        ParticleKind::ElectricSpark => Particle::ElectricSpark,
+        ParticleKind::Rainbow(step) => Particle::Dust {
+            color: rainbow_color(step),
+            scale: 1.2,
+        },
     }
 }
 
