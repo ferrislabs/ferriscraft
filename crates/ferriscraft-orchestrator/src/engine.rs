@@ -195,7 +195,7 @@ pub struct TickActions {
 pub struct FleetEngine {
     policy: FleetPolicy,
     servers: BTreeMap<String, ManagedServer>,
-    deleting: HashSet<String>,
+    deleting: HashMap<String, Instant>,
     queue: BTreeMap<u64, QueuedPlayer>,
     transfers: HashMap<Uuid, ActiveTransfer>,
     player_transfers: HashMap<Uuid, Uuid>,
@@ -209,7 +209,7 @@ impl FleetEngine {
         Self {
             policy,
             servers: BTreeMap::new(),
-            deleting: HashSet::new(),
+            deleting: HashMap::new(),
             queue: BTreeMap::new(),
             transfers: HashMap::new(),
             player_transfers: HashMap::new(),
@@ -529,7 +529,7 @@ impl FleetEngine {
 
     pub fn mark_deleting(&mut self, now: Instant, server_id: &str) -> Option<ProxyEvent> {
         self.requeue_lost_players(server_id);
-        self.deleting.insert(server_id.to_owned());
+        self.deleting.insert(server_id.to_owned(), now);
         let server = self.servers.get_mut(server_id)?;
         server.set_phase(now, ServerPhase::Ending);
         if server.registered_on_proxy {
@@ -540,6 +540,24 @@ impl FleetEngine {
         } else {
             None
         }
+    }
+
+    /// Servers still known after a delete request older than `retry_after`.
+    /// Each returned server gets a fresh request time, so it is retried once per interval.
+    pub fn deletions_to_retry(&mut self, now: Instant, retry_after: Duration) -> Vec<String> {
+        let due: Vec<String> = self
+            .deleting
+            .iter()
+            .filter(|(id, requested_at)| {
+                self.servers.contains_key(*id)
+                    && now.saturating_duration_since(**requested_at) >= retry_after
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &due {
+            self.deleting.insert(id.clone(), now);
+        }
+        due
     }
 
     pub fn apply_heartbeat(&mut self, now: Instant, req: HeartbeatRequest) -> Vec<ProxyEvent> {
@@ -905,7 +923,7 @@ impl FleetEngine {
             .servers
             .get(server_id)
             .ok_or_else(|| EngineError::UnknownServer(server_id.to_owned()))?;
-        if self.deleting.contains(server_id) || !server.ready_for_proxy() {
+        if self.deleting.contains_key(server_id) || !server.ready_for_proxy() {
             return Err(EngineError::NotJoinable(server_id.to_owned()));
         }
         self.remove_entry(player_uuid);
@@ -978,7 +996,27 @@ impl FleetEngine {
     }
 
     pub fn tick(&mut self, now: Instant) -> TickActions {
-        let mut actions = TickActions::default();
+        let mut actions = TickActions {
+            proxy_events: self.dispatch(now),
+            ..TickActions::default()
+        };
+
+        let (to_create, to_delete) = self.plan_fleet_actions(now);
+        actions.servers_to_create = to_create;
+        for deletion in to_delete {
+            if let Some(ev) = self.mark_deleting(now, &deletion.server_id) {
+                actions.proxy_events.push(ev);
+            }
+            actions.servers_to_delete.push(deletion);
+        }
+
+        actions
+    }
+
+    /// Expires transfers and dispatches queued players without planning the fleet.
+    /// Only the reconciler executes deletions, so only it may call [`Self::tick`].
+    pub fn dispatch(&mut self, now: Instant) -> Vec<ProxyEvent> {
+        let mut events = Vec::new();
 
         // 1. Expire timed-out transfers so stuck entries never block players indefinitely.
         let expired: Vec<(Uuid, Uuid)> = self
@@ -1011,28 +1049,14 @@ impl FleetEngine {
             if let Some(lobby) = self.lobbies.remove(&id)
                 && lobby.registered_on_proxy
             {
-                actions
-                    .proxy_events
-                    .push(ProxyEvent::ServerRemove { name: lobby.id });
+                events.push(ProxyEvent::ServerRemove { name: lobby.id });
             }
         }
 
         // 2. Dispatch queued players onto available SheepWars servers.
-        actions
-            .proxy_events
-            .extend(self.dispatch_queued_players(now));
+        events.extend(self.dispatch_queued_players(now));
 
-        // 3. Plan scaling actions (create up to k max, delete Ending/stuck/excess idle servers).
-        let (to_create, to_delete) = self.plan_fleet_actions(now);
-        actions.servers_to_create = to_create;
-        for deletion in to_delete {
-            if let Some(ev) = self.mark_deleting(now, &deletion.server_id) {
-                actions.proxy_events.push(ev);
-            }
-            actions.servers_to_delete.push(deletion);
-        }
-
-        actions
+        events
     }
 
     fn dispatch_queued_players(&mut self, now: Instant) -> Vec<ProxyEvent> {
@@ -1054,7 +1078,7 @@ impl FleetEngine {
                 .servers
                 .values()
                 .filter(|s| {
-                    !self.deleting.contains(&s.server_id)
+                    !self.deleting.contains_key(&s.server_id)
                         && s.ready_for_proxy()
                         && s.phase.accepts_players()
                 })
@@ -1192,14 +1216,14 @@ impl FleetEngine {
 
         let replacement_ready = self.servers.values().any(|s| {
             !s.outdated
-                && !self.deleting.contains(&s.server_id)
+                && !self.deleting.contains_key(&s.server_id)
                 && s.phase == ServerPhase::Waiting
                 && s.ready_for_proxy()
         });
         let mut retiring = HashSet::new();
 
         for s in self.servers.values() {
-            if self.deleting.contains(&s.server_id) {
+            if self.deleting.contains_key(&s.server_id) {
                 continue;
             }
             let pending = pending_by_server.get(&s.server_id).copied().unwrap_or(0);
@@ -1226,7 +1250,7 @@ impl FleetEngine {
             .servers
             .values()
             .filter(|s| {
-                !self.deleting.contains(&s.server_id)
+                !self.deleting.contains_key(&s.server_id)
                     && !delete_set.contains(s.server_id.as_str())
                     && !retiring.contains(s.server_id.as_str())
                     && s.phase.is_active()
@@ -1237,7 +1261,7 @@ impl FleetEngine {
             .servers
             .values()
             .filter(|s| {
-                !self.deleting.contains(&s.server_id)
+                !self.deleting.contains_key(&s.server_id)
                     && !delete_set.contains(s.server_id.as_str())
                     && !s.outdated
                     && s.phase.is_standby_capacity()
@@ -1276,7 +1300,7 @@ impl FleetEngine {
                 .servers
                 .values()
                 .filter(|s| {
-                    !self.deleting.contains(&s.server_id)
+                    !self.deleting.contains_key(&s.server_id)
                         && !delete_set.contains(s.server_id.as_str())
                         && !s.outdated
                         && s.phase == ServerPhase::Waiting
@@ -1317,7 +1341,7 @@ impl FleetEngine {
         let mut servers = Vec::with_capacity(self.servers.len());
 
         for s in self.servers.values() {
-            if self.deleting.contains(&s.server_id) {
+            if self.deleting.contains_key(&s.server_id) {
                 continue;
             }
             match s.phase {
@@ -1370,7 +1394,7 @@ impl FleetEngine {
         let servers = self
             .servers
             .values()
-            .filter(|s| !self.deleting.contains(&s.server_id) && s.ready_for_proxy())
+            .filter(|s| !self.deleting.contains_key(&s.server_id) && s.ready_for_proxy())
             .filter_map(|s| {
                 s.address.as_ref().map(|addr| ProxyServerEntry {
                     name: s.server_id.clone(),
@@ -1500,7 +1524,7 @@ impl FleetEngine {
             .servers
             .values()
             .filter(|s| {
-                !self.deleting.contains(&s.server_id)
+                !self.deleting.contains_key(&s.server_id)
                     && s.ready_for_proxy()
                     && s.phase.accepts_players()
             })
@@ -1508,7 +1532,7 @@ impl FleetEngine {
         let active_servers = self
             .servers
             .values()
-            .filter(|s| !self.deleting.contains(&s.server_id) && s.phase.is_active())
+            .filter(|s| !self.deleting.contains_key(&s.server_id) && s.phase.is_active())
             .count();
 
         JoinQueueResponse {
@@ -1951,6 +1975,62 @@ mod tests {
         heartbeat(&mut engine, t0, "sheepwars-1", ServerPhase::Ending, 0);
         assert_eq!(deleted(&engine.tick(t0)).len(), 1);
         assert!(deleted(&engine.tick(t0 + Duration::from_secs(1))).is_empty());
+    }
+
+    #[test]
+    fn dispatch_between_ticks_leaves_reaping_to_the_reconciler() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        engine.register_creating_server(t0, "sheepwars-stuck".to_owned(), None);
+        let timed_out = t0 + Duration::from_secs(120);
+
+        engine.dispatch(timed_out);
+
+        assert_eq!(
+            deleted(&engine.tick(timed_out)),
+            vec![("sheepwars-stuck", DeletionReason::StartingTimeout)]
+        );
+    }
+
+    #[test]
+    fn deletion_is_retried_while_the_server_is_still_listed() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        infra(&mut engine, t0, "sheepwars-1");
+        heartbeat(&mut engine, t0, "sheepwars-1", ServerPhase::Ending, 0);
+        engine.tick(t0);
+        let retry_after = Duration::from_secs(30);
+
+        assert!(
+            engine
+                .deletions_to_retry(t0 + Duration::from_secs(29), retry_after)
+                .is_empty()
+        );
+        assert_eq!(
+            engine.deletions_to_retry(t0 + Duration::from_secs(30), retry_after),
+            vec!["sheepwars-1".to_owned()]
+        );
+        assert!(
+            engine
+                .deletions_to_retry(t0 + Duration::from_secs(31), retry_after)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn deletion_is_not_retried_once_the_server_is_gone() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        infra(&mut engine, t0, "sheepwars-1");
+        heartbeat(&mut engine, t0, "sheepwars-1", ServerPhase::Ending, 0);
+        engine.tick(t0);
+        engine.retain_infra_servers(&HashSet::new());
+
+        assert!(
+            engine
+                .deletions_to_retry(t0 + Duration::from_secs(60), Duration::from_secs(30))
+                .is_empty()
+        );
     }
 
     fn waiting(engine: &mut FleetEngine, now: Instant, id: &str) {
