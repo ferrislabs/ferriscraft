@@ -18,7 +18,8 @@ use super::fall_guard::FallGuards;
 use super::flight::{
     EYE_HEIGHT, Flight, LANDING_GRACE_TICKS, MAX_CONCURRENT_FLIGHTS, MAX_FLIGHT_TICKS,
     arms_on_impact, can_launch, chase_detonates, chase_velocity, flight_velocity, fuse_label,
-    fuse_ticks, initial_velocity, starts_effect, torpedo_clear, torpedo_triggered,
+    fuse_ticks, initial_velocity, rider_needs_teleport, starts_effect, torpedo_clear,
+    torpedo_clears, torpedo_triggered,
 };
 use super::intent::Intent;
 use super::session::{ForceStartError, Session, VoidVerdict, launch_announcement};
@@ -776,7 +777,7 @@ impl Game {
                             let dy = (pos.y - 0.1) - rider_pos.y;
                             let dz = pos.z - rider_pos.z;
                             let dist_sq = dx * dx + dy * dy + dz * dz;
-                            if dist_sq > 2.5 * 2.5 {
+                            if rider_needs_teleport(dist_sq) {
                                 let _ = rider
                                     .location
                                     .teleport(Position {
@@ -805,13 +806,14 @@ impl Game {
 
             let mut torpedo_hit = false;
             if flies_straight(airborne.flight.kind) {
-                if let Err(error) = apply(
-                    &self.arena.world,
-                    None,
-                    &players_with_teams,
-                    &[torpedo_clear(pos)],
-                )
-                .await
+                if torpedo_clears(airborne.flight.age)
+                    && let Err(error) = apply(
+                        &self.arena.world,
+                        None,
+                        &players_with_teams,
+                        &[torpedo_clear(pos)],
+                    )
+                    .await
                 {
                     tracing::warn!("échec du creusement du torpilleur : {error}");
                 }

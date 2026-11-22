@@ -3,12 +3,13 @@ use rspigot_plugin::Material;
 use crate::domain::{PlayerId, SheepKind, TeamId};
 use crate::sheep::{
     Action, FRAGMENT_LANDING_GRACE_TICKS, SEEKER_DETONATE_DISTANCE, SEEKER_FUSE_TICKS,
-    SEEKER_RUN_SPEED, TORPEDO_CLEAR_RADIUS, TORPEDO_MAX_FLIGHT_TICKS, TORPEDO_SPEED,
-    TORPEDO_TRIGGER_RADIUS, Vec3, chases_after_impact, display_name, flies_straight, launch_power,
-    launch_velocity, sheep_wool, step_ballistic, throw_velocity,
+    SEEKER_RUN_SPEED, TORPEDO_CLEAR_DELAY_TICKS, TORPEDO_CLEAR_RADIUS, TORPEDO_MAX_FLIGHT_TICKS,
+    TORPEDO_SPEED, TORPEDO_TRIGGER_RADIUS, Vec3, chases_after_impact, display_name, flies_straight,
+    launch_power, launch_velocity, sheep_wool, step_ballistic, throw_velocity,
 };
 
 pub const MAX_CONCURRENT_FLIGHTS: usize = 32;
+pub const RIDER_TELEPORT_DISTANCE: f64 = 6.0;
 pub const MAX_FLIGHT_TICKS: u32 = 20 * 15;
 pub const LANDING_GRACE_TICKS: u32 = 4;
 pub const SHEEP_FUSE_TICKS: u32 = 20 * 3;
@@ -31,8 +32,15 @@ pub const fn arms_on_impact(kind: SheepKind) -> bool {
     !(matches!(
         kind,
         SheepKind::Healing | SheepKind::Boarding | SheepKind::Torpedo
-    ) || starts_effect(kind)
+    ) || lands_instantly(kind)
         || is_fragment(kind))
+}
+
+pub const fn lands_instantly(kind: SheepKind) -> bool {
+    matches!(
+        kind,
+        SheepKind::Quake | SheepKind::Warp | SheepKind::Intergalactic
+    )
 }
 
 pub const fn is_fragment(kind: SheepKind) -> bool {
@@ -50,7 +58,7 @@ pub const fn landing_grace_ticks(kind: SheepKind) -> u32 {
 pub const fn starts_effect(kind: SheepKind) -> bool {
     matches!(
         kind,
-        SheepKind::Quake | SheepKind::Warp | SheepKind::Intergalactic
+        SheepKind::Quake | SheepKind::Warp | SheepKind::Intergalactic | SheepKind::Frozen
     )
 }
 
@@ -75,6 +83,14 @@ pub fn torpedo_clear(at: Vec3) -> Action {
         center: at,
         radius: TORPEDO_CLEAR_RADIUS,
     }
+}
+
+pub const fn torpedo_clears(age: u32) -> bool {
+    age >= TORPEDO_CLEAR_DELAY_TICKS
+}
+
+pub fn rider_needs_teleport(distance_squared: f64) -> bool {
+    distance_squared > RIDER_TELEPORT_DISTANCE * RIDER_TELEPORT_DISTANCE
 }
 
 pub fn torpedo_triggered(distance: f64) -> bool {
@@ -202,11 +218,39 @@ mod tests {
         assert!(!arms_on_impact(SheepKind::Healing));
         assert!(!arms_on_impact(SheepKind::Boarding));
         assert!(arms_on_impact(SheepKind::Incendiary));
+        assert!(arms_on_impact(SheepKind::Frozen));
         assert!(!arms_on_impact(SheepKind::Quake));
         assert!(!arms_on_impact(SheepKind::Warp));
         assert!(!arms_on_impact(SheepKind::Intergalactic));
         assert!(arms_on_impact(SheepKind::Seeker));
         assert!(!arms_on_impact(SheepKind::Torpedo));
+    }
+
+    #[test]
+    fn the_torpedo_waits_a_tenth_of_a_second_before_clearing_blocks() {
+        assert_eq!(TORPEDO_CLEAR_DELAY_TICKS, 2);
+        assert!(!torpedo_clears(0));
+        assert!(!torpedo_clears(TORPEDO_CLEAR_DELAY_TICKS - 1));
+        assert!(torpedo_clears(TORPEDO_CLEAR_DELAY_TICKS));
+        assert!(torpedo_clears(TORPEDO_CLEAR_DELAY_TICKS + 10));
+    }
+
+    #[test]
+    fn a_boarding_rider_is_only_teleported_when_they_are_far_from_the_sheep() {
+        assert!(!rider_needs_teleport(0.0));
+        assert!(!rider_needs_teleport(2.6 * 2.6));
+        assert!(!rider_needs_teleport(
+            RIDER_TELEPORT_DISTANCE * RIDER_TELEPORT_DISTANCE
+        ));
+        assert!(rider_needs_teleport(
+            (RIDER_TELEPORT_DISTANCE + 0.1) * (RIDER_TELEPORT_DISTANCE + 0.1)
+        ));
+    }
+
+    #[test]
+    fn the_frozen_sheep_starts_a_frost_zone_but_still_arms() {
+        assert!(starts_effect(SheepKind::Frozen));
+        assert!(arms_on_impact(SheepKind::Frozen));
     }
 
     fn speed(v: Vec3) -> f64 {

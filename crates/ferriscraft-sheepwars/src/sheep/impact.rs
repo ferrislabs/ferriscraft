@@ -227,20 +227,10 @@ pub fn plan(kind: SheepKind, at: Vec3, thrower_team: TeamId) -> Vec<Action> {
             actions.push(sound(SoundKind::Explode, at));
             actions
         }
-        SheepKind::Frozen => {
-            let mut actions = disc(at.cell(), catalog::FROZEN_ICE_RADIUS, -1, BlockKind::Ice);
-            actions.push(Action::Effect {
-                team: enemies,
-                center: at,
-                radius: catalog::FROZEN_RADIUS,
-                effect: EffectKind::Slowness,
-                duration_ticks: catalog::FROZEN_SLOWNESS_TICKS,
-                amplifier: catalog::FROZEN_SLOWNESS_AMPLIFIER,
-            });
-            actions.push(particle(ParticleKind::Snowflake, at, 80));
-            actions.push(sound(SoundKind::Ice, at));
-            actions
-        }
+        SheepKind::Frozen => vec![
+            particle(ParticleKind::Snowflake, at, 80),
+            sound(SoundKind::Ice, at),
+        ],
         SheepKind::Explosive => vec![
             Action::Explode {
                 at,
@@ -427,25 +417,6 @@ fn particle(kind: ParticleKind, at: Vec3, count: i32) -> Action {
 
 fn sound(kind: SoundKind, at: Vec3) -> Action {
     Action::Sound { kind, at }
-}
-
-fn disc(center: Cell, radius: i32, dy: i32, block: BlockKind) -> Vec<Action> {
-    let mut actions = Vec::new();
-    for dx in -radius..=radius {
-        for dz in -radius..=radius {
-            if dx * dx + dz * dz <= radius * radius {
-                actions.push(Action::SetBlock {
-                    at: Cell {
-                        x: center.x + dx,
-                        y: center.y + dy,
-                        z: center.z + dz,
-                    },
-                    block,
-                });
-            }
-        }
-    }
-    actions
 }
 
 #[cfg(test)]
@@ -644,23 +615,14 @@ mod tests {
     }
 
     #[test]
-    fn frozen_slows_the_enemy_team_only() {
+    fn frozen_only_announces_its_landing_and_leaves_the_frost_to_the_zone() {
         let actions = plan(SheepKind::Frozen, AT, TeamId::Red);
-        assert!(actions.iter().any(|a| matches!(
-            a,
-            Action::Effect {
-                team: TeamId::Blue,
-                effect: EffectKind::Slowness,
-                ..
-            }
-        )));
-        assert!(!actions.iter().any(|a| matches!(
-            a,
-            Action::Effect {
-                team: TeamId::Red,
-                ..
-            }
-        )));
+        assert!(actions.iter().any(|a| matches!(a, Action::Sound { .. })));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::Effect { .. } | Action::SetBlock { .. }))
+        );
     }
 
     #[test]
