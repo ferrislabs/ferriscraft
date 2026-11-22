@@ -480,7 +480,13 @@ mod tests {
         assert!(json.contains("\"kind\":\"lobby\""), "{json}");
         let old = r#"{"type":"server_upsert","name":"sw-1","address":"a","phase":"waiting"}"#;
         let parsed: ProxyEvent = serde_json::from_str(old).unwrap();
-        assert!(matches!(parsed, ProxyEvent::ServerUpsert { kind: ServerKind::SheepWars, .. }));
+        assert!(matches!(
+            parsed,
+            ProxyEvent::ServerUpsert {
+                kind: ServerKind::SheepWars,
+                ..
+            }
+        ));
     }
 
     #[test]
