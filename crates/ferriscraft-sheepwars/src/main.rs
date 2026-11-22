@@ -1,5 +1,6 @@
 use ferriscraft_sheepwars::{SheepWarsConfig, SheepWarsPlugin};
 use rspigot_plugin::Error;
+use tokio::signal::unix::{SignalKind, signal};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -22,5 +23,17 @@ async fn main() -> Result<(), Error> {
         orchestrator = ?config.orchestrator_url,
         "Démarrage de ferriscraft-sheepwars"
     );
-    rspigot_plugin::run(SheepWarsPlugin::new(config)).await
+    let plugin = SheepWarsPlugin::new(config);
+    let shutdown = plugin.shutdown_handle();
+    let Ok(mut terminate) = signal(SignalKind::terminate()) else {
+        return rspigot_plugin::run(plugin).await;
+    };
+    tokio::select! {
+        result = rspigot_plugin::run(plugin) => result,
+        _ = terminate.recv() => {
+            tracing::info!("SIGTERM reçu, arrêt propre");
+            shutdown.drain().await;
+            Ok(())
+        }
+    }
 }

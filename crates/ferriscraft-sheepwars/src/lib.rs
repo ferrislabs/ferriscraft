@@ -8,4 +8,4 @@ pub mod plugin;
 pub mod sheep;
 
 pub use config::SheepWarsConfig;
-pub use plugin::SheepWarsPlugin;
+pub use plugin::{SheepWarsPlugin, ShutdownHandle};

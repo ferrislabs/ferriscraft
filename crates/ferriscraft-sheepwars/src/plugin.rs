@@ -9,7 +9,9 @@ use tokio::time::MissedTickBehavior;
 use crate::SheepWarsConfig;
 use crate::arena::{Arena, Layout, Platform};
 use crate::config::load_settings;
-use crate::game::{EndBehavior, Game, HUB_ITEM, Session, VoidVerdict, kind_of};
+use crate::game::{
+    EndBehavior, Game, HUB_ITEM, SHUTDOWN_REPORT_GRACE, Session, VoidVerdict, kind_of,
+};
 use crate::hud::{Hud, bossbar_title};
 use crate::orchestrator::SheepWarsOrchestratorClient;
 
@@ -21,6 +23,25 @@ const EXPLOSION_YIELD: f32 = 0.0;
 struct ArenaGuard {
     world_id: String,
     layout: Layout,
+}
+
+fn short_ref(raw: Option<&str>) -> String {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| "?".to_owned(), |value| value.chars().take(7).collect())
+}
+
+#[derive(Clone)]
+pub struct ShutdownHandle {
+    game: Arc<OnceLock<Arc<Game>>>,
+}
+
+impl ShutdownHandle {
+    pub async fn drain(&self) {
+        if let Some(game) = self.game.get() {
+            game.shutdown(SHUTDOWN_REPORT_GRACE).await;
+        }
+    }
 }
 
 const fn explosion_yield() -> f32 {
@@ -74,7 +95,7 @@ fn may_break(kind: BlockType, pos: BlockPos, layout: &Layout) -> bool {
 pub struct SheepWarsPlugin {
     config: SheepWarsConfig,
     orchestrator: Option<Arc<SheepWarsOrchestratorClient>>,
-    game: OnceLock<Arc<Game>>,
+    game: Arc<OnceLock<Arc<Game>>>,
     guard: OnceLock<ArenaGuard>,
     looper: Mutex<Option<JoinHandle<()>>>,
     heartbeat_task: Mutex<Option<JoinHandle<()>>>,
@@ -97,10 +118,16 @@ impl SheepWarsPlugin {
         Self {
             config,
             orchestrator,
-            game: OnceLock::new(),
+            game: Arc::new(OnceLock::new()),
             guard: OnceLock::new(),
             looper: Mutex::new(None),
             heartbeat_task: Mutex::new(None),
+        }
+    }
+
+    pub fn shutdown_handle(&self) -> ShutdownHandle {
+        ShutdownHandle {
+            game: Arc::clone(&self.game),
         }
     }
 
@@ -267,9 +294,10 @@ impl SheepWarsPlugin {
             "leave" => game.quit(player).await,
             "hub" => game.send_player_hub(player).await,
             "version" => ctx.reply(format!(
-                "§dSheepWars §8» §7serveur §f{} §8• §7plugin §f{}",
+                "§dSheepWars §8» §7serveur §f{} §8• §7plugin §f{} §8• §7rspigot §f{}",
                 self.config.server_id,
-                self.config.version.as_deref().unwrap_or("dev")
+                self.config.version.as_deref().unwrap_or("dev"),
+                short_ref(std::env::var("RSPIGOT_REF").ok().as_deref())
             )),
             "forcestart" | "stop" if !admin => ctx.reply("§cVous ne pouvez pas faire ça."),
             "forcestart" => {
@@ -601,6 +629,14 @@ mod tests {
         assert!(is_fire(BlockType::SoulFire));
         assert!(!is_fire(BlockType::Stone));
         assert!(may_break(BlockType::Fire, pos(200, 70, 200), &layout));
+    }
+
+    #[test]
+    fn the_rspigot_ref_is_cut_to_seven_characters() {
+        assert_eq!(short_ref(Some("0123456789abcdef")), "0123456");
+        assert_eq!(short_ref(Some("abc")), "abc");
+        assert_eq!(short_ref(Some("  ")), "?");
+        assert_eq!(short_ref(None), "?");
     }
 
     #[test]

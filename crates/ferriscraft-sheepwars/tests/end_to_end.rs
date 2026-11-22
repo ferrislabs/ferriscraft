@@ -293,6 +293,8 @@ struct MockOrchestrator {
     report_attempts: Vec<MatchReport>,
     ack_released: bool,
     profile_requests: Vec<Uuid>,
+    spectate_for: Vec<Uuid>,
+    queue_requests: Vec<Uuid>,
 }
 
 type SharedOrchestrator = Arc<Mutex<MockOrchestrator>>;
@@ -443,6 +445,28 @@ fn mock_orchestrator_router(state: SharedOrchestrator) -> Router {
                         "equipped": { "sheep_trail": "sheep_trail_hearts" }
                     }))
                     .into_response()
+                },
+            ),
+        )
+        .route(
+            "/api/v1/queue/player/{uuid}",
+            get(
+                |State(orch): State<SharedOrchestrator>,
+                 AxumPath(uuid): AxumPath<Uuid>,
+                 headers: HeaderMap| async move {
+                    let mut guard = orch.lock().unwrap();
+                    if !authorized(&headers) {
+                        guard.unauthorized_requests += 1;
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    guard.queue_requests.push(uuid);
+                    let mut status = json!({
+                        "state": "not_queued", "total_queued": 0, "min_players": 2
+                    });
+                    if guard.spectate_for.contains(&uuid) {
+                        status["spectate_server"] = json!("sheepwars-e2e");
+                    }
+                    Json(status).into_response()
                 },
             ),
         )
@@ -650,6 +674,104 @@ fn sheepwars_full_lifecycle_orchestrator_countdown_combat_and_ephemeral_end() {
         assert!(guard.profile_requests.contains(&bob.id.0));
     }
     assert!(alice.said("Level 12 SheepWars") || alice.event_debug_has("Level 12 SheepWars"));
+    assert_eq!(orch_state.lock().unwrap().unauthorized_requests, 0);
+    plugin_task.abort();
+}
+
+#[test]
+fn a_player_sent_to_spectate_is_not_enrolled_in_a_team() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info")
+        .with_test_writer()
+        .try_init();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+
+    let host_listener = runtime.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
+    let host_addr = host_listener.local_addr().unwrap();
+    let (inbound_tx, inbox_rx) = crossbeam_channel::unbounded::<Inbound<Link>>();
+    let (_stop_tx, stop_rx) = watch::channel(false);
+    runtime.spawn(rspigot_plugins::serve(
+        host_listener,
+        None,
+        inbound_tx,
+        stop_rx,
+    ));
+
+    let orch_state: SharedOrchestrator = Arc::new(Mutex::new(MockOrchestrator::default()));
+    orch_state
+        .lock()
+        .unwrap()
+        .spectate_for
+        .push(PlayerId::offline("Watcher").0);
+    let orch_listener = runtime.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
+    let orch_addr = orch_listener.local_addr().unwrap();
+    let orch_router = mock_orchestrator_router(Arc::clone(&orch_state));
+    runtime.spawn(async move {
+        let _ = axum::serve(orch_listener, orch_router).await;
+    });
+
+    let config = SheepWarsConfig {
+        server_id: "sheepwars-e2e".to_owned(),
+        orchestrator_url: Some(format!("http://{orch_addr}")),
+        orchestrator_token: Some(EXPECTED_TOKEN.to_owned()),
+        heartbeat_interval: Duration::from_millis(500),
+        ephemeral_pod: true,
+        arena_path: PathBuf::from("/nonexistent-e2e-arena.json"),
+        rules: RoundRules {
+            min_players: 2,
+            max_players: 4,
+            countdown_ticks: 8,
+            sheep_interval_ticks: 6,
+            respawn: RespawnRule::Lives(1),
+        },
+        end_delay_ticks: 6,
+        version: None,
+    };
+    let plugin_task = runtime.spawn(rspigot_plugin::run_with(
+        SheepWarsPlugin::new(config),
+        format!("http://{host_addr}"),
+        None,
+    ));
+
+    let mut core = Core::new(inbox_rx);
+    core.run_until("sheepwars plugin connects and enters Waiting phase", |c| {
+        c.plugin.is_some()
+            && orch_state
+                .lock()
+                .unwrap()
+                .heartbeats
+                .iter()
+                .any(|hb| hb.phase == ServerPhase::Waiting)
+    });
+
+    let mut watcher = join(&mut core.server, "Watcher");
+    let mut bob = join(&mut core.server, "Bob");
+    core.run_until("the watcher is told they are spectating", |c| {
+        confirm_teleports(&mut c.server, &mut watcher);
+        confirm_teleports(&mut c.server, &mut bob);
+        watcher.said("spectateur") && watcher.said("/hub")
+    });
+    let settle = Instant::now() + Duration::from_secs(2);
+    core.run_until("the spectator never fills the queue of the round", |c| {
+        confirm_teleports(&mut c.server, &mut watcher);
+        confirm_teleports(&mut c.server, &mut bob);
+        let guard = orch_state.lock().unwrap();
+        assert!(
+            guard
+                .heartbeats
+                .iter()
+                .all(|hb| hb.phase != ServerPhase::Countdown),
+            "a countdown started although only one player joined a team"
+        );
+        Instant::now() >= settle
+    });
+    assert!(
+        orch_state
+            .lock()
+            .unwrap()
+            .queue_requests
+            .contains(&watcher.id.0)
+    );
     assert_eq!(orch_state.lock().unwrap().unauthorized_requests, 0);
     plugin_task.abort();
 }
