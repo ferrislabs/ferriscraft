@@ -108,15 +108,15 @@ pub async fn apply(
                 lift,
             } => {
                 for (player, state) in matching_players(&live_players, center, radius, team) {
-                    let velocity = outward_velocity(
-                        center,
-                        vec3(state.player.position),
-                        strength,
-                        lift,
-                    );
+                    let velocity =
+                        outward_velocity(center, vec3(state.player.position), strength, lift);
                     player.movement.set_velocity(vector(velocity));
                 }
             }
+            Action::Damage { .. }
+            | Action::ClearSphere { .. }
+            | Action::ClearAbove { .. }
+            | Action::SwapBlocks { .. } => {}
             Action::SwapPositions {
                 team,
                 center,
@@ -161,7 +161,10 @@ pub async fn apply(
                         z: to.z,
                     };
                     if let Err(error) = player.location.teleport(target).await {
-                        tracing::warn!("échec téléportation abordage pour {} : {error}", player.name);
+                        tracing::warn!(
+                            "échec téléportation abordage pour {} : {error}",
+                            player.name
+                        );
                     }
                     player.movement.set_velocity(vector(Vec3::ZERO));
                 }
@@ -241,7 +244,8 @@ async fn set_block_if_valid(world: &World, at: Cell, block: BlockKind) {
                 y: pos.y - 1,
                 z: pos.z,
             };
-            if let (Ok(here), Ok(under)) = (world.get_block(pos).await, world.get_block(below).await)
+            if let (Ok(here), Ok(under)) =
+                (world.get_block(pos).await, world.get_block(below).await)
                 && is_air(here.kind)
                 && !is_air(under.kind)
             {
@@ -260,7 +264,9 @@ const fn is_air(kind: BlockType) -> bool {
 
 pub const fn wool_material(color: WoolColor) -> Material {
     match color {
-        WoolColor::Magenta => Material::MagentaWool,
+        WoolColor::White => Material::WhiteWool,
+        WoolColor::Red => Material::RedWool,
+        WoolColor::Cyan => Material::CyanWool,
         WoolColor::Blue => Material::BlueWool,
         WoolColor::Orange => Material::OrangeWool,
         WoolColor::LightBlue => Material::LightBlueWool,
@@ -276,7 +282,9 @@ pub const fn wool_material(color: WoolColor) -> Material {
 
 pub const fn wool_dye_color(color: WoolColor) -> DyeColor {
     match color {
-        WoolColor::Magenta => DyeColor::Magenta,
+        WoolColor::White => DyeColor::White,
+        WoolColor::Red => DyeColor::Red,
+        WoolColor::Cyan => DyeColor::Cyan,
         WoolColor::Blue => DyeColor::Blue,
         WoolColor::Orange => DyeColor::Orange,
         WoolColor::LightBlue => DyeColor::LightBlue,

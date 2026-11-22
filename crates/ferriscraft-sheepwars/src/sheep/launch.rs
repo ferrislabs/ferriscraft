@@ -52,7 +52,8 @@ pub fn step_ballistic(velocity: Vec3) -> Vec3 {
 }
 
 pub fn clamp_speed(velocity: Vec3, max_speed: f64) -> Vec3 {
-    let speed = (velocity.x * velocity.x + velocity.y * velocity.y + velocity.z * velocity.z).sqrt();
+    let speed =
+        (velocity.x * velocity.x + velocity.y * velocity.y + velocity.z * velocity.z).sqrt();
     if speed <= max_speed || speed <= f64::EPSILON {
         return velocity;
     }

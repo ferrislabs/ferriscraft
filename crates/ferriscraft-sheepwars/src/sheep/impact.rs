@@ -1,7 +1,7 @@
 use std::f64::consts::TAU;
 
 use super::catalog;
-use crate::domain::{SheepKind, TeamId};
+use crate::domain::{Damage, SheepKind, TeamId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Vec3 {
@@ -142,6 +142,25 @@ pub enum Action {
     TeleportThrower {
         to: Vec3,
     },
+    Damage {
+        team: TeamId,
+        center: Vec3,
+        radius: f64,
+        damage: Damage,
+    },
+    ClearSphere {
+        center: Vec3,
+        radius: f64,
+    },
+    ClearAbove {
+        center: Vec3,
+        radius: f64,
+        height: f64,
+    },
+    SwapBlocks {
+        a: Cell,
+        b: Cell,
+    },
 }
 
 pub fn healing_pulse(at: Vec3, team: TeamId, with_chime: bool) -> Vec<Action> {
@@ -216,6 +235,7 @@ pub fn plan(kind: SheepKind, at: Vec3, thrower_team: TeamId) -> Vec<Action> {
             actions.push(sound(SoundKind::Ice, at));
             actions
         }
+        SheepKind::Torpedo | SheepKind::Explosive => Vec::new(),
         SheepKind::Seeker => vec![
             Action::Explode {
                 at,

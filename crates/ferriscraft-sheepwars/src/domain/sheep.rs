@@ -5,6 +5,8 @@ pub enum SheepKind {
     Boarding,
     Healing,
     Seeker,
+    Torpedo,
+    Explosive,
     Splitting,
     Darkness,
     Frozen,
@@ -14,12 +16,14 @@ pub enum SheepKind {
 }
 
 impl SheepKind {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 13] = [
         Self::Lightning,
         Self::Incendiary,
         Self::Boarding,
         Self::Healing,
         Self::Seeker,
+        Self::Torpedo,
+        Self::Explosive,
         Self::Splitting,
         Self::Darkness,
         Self::Frozen,
