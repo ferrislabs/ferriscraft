@@ -7,7 +7,7 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use crate::SheepWarsConfig;
-use crate::arena::Arena;
+use crate::arena::{Arena, Layout, Platform};
 use crate::config::load_settings;
 use crate::game::{EndBehavior, Game, Session, VoidVerdict, kind_of};
 use crate::hud::{Hud, bossbar_title};
@@ -16,12 +16,59 @@ use crate::orchestrator::SheepWarsOrchestratorClient;
 const ADMIN_PERMISSION: &str = "sheepwars.admin";
 const TICK: Duration = Duration::from_millis(50);
 const ACTIONS: [&str; 5] = ["join", "leave", "hub", "forcestart", "stop"];
+const EXPLOSION_YIELD: f32 = 0.0;
+
+struct ArenaGuard {
+    world_id: String,
+    layout: Layout,
+}
+
+const fn explosion_yield() -> f32 {
+    EXPLOSION_YIELD
+}
+
+fn cancels_vanilla_explosion(entity: EntityType, cause: EntityDamageCause) -> bool {
+    entity == EntityType::Player
+        && matches!(
+            cause,
+            EntityDamageCause::BlockExplosion | EntityDamageCause::EntityExplosion
+        )
+}
+
+const fn is_fire(kind: BlockType) -> bool {
+    matches!(kind, BlockType::Fire | BlockType::SoulFire)
+}
+
+const fn is_unbreakable(kind: BlockType) -> bool {
+    matches!(kind, BlockType::Bedrock | BlockType::Barrier)
+}
+
+fn platform_contains(platform: &Platform, pos: BlockPos) -> bool {
+    let min_x = platform.center.x - platform.width / 2;
+    let min_z = platform.center.z - platform.depth / 2;
+    let min_y = platform.center.y - platform.thickness + 1;
+    (min_x..min_x + platform.width).contains(&pos.x)
+        && (min_z..min_z + platform.depth).contains(&pos.z)
+        && (min_y..=platform.center.y).contains(&pos.y)
+}
+
+fn on_platform(layout: &Layout, pos: BlockPos) -> bool {
+    let settings = layout.settings();
+    platform_contains(&settings.red.platform, pos)
+        || platform_contains(&settings.blue.platform, pos)
+        || platform_contains(&settings.lobby_platform, pos)
+}
+
+fn may_break(kind: BlockType, pos: BlockPos, layout: &Layout) -> bool {
+    !is_unbreakable(kind) && !on_platform(layout, pos)
+}
 
 #[derive(Plugin)]
 pub struct SheepWarsPlugin {
     config: SheepWarsConfig,
     orchestrator: Option<Arc<SheepWarsOrchestratorClient>>,
     game: OnceLock<Arc<Game>>,
+    guard: OnceLock<ArenaGuard>,
     looper: Mutex<Option<JoinHandle<()>>>,
     heartbeat_task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -44,6 +91,7 @@ impl SheepWarsPlugin {
             config,
             orchestrator,
             game: OnceLock::new(),
+            guard: OnceLock::new(),
             looper: Mutex::new(None),
             heartbeat_task: Mutex::new(None),
         }
@@ -134,6 +182,10 @@ impl SheepWarsPlugin {
             }
         };
         let reused = arena.reused;
+        let _ = self.guard.set(ArenaGuard {
+            world_id: arena.world.id().to_owned(),
+            layout: arena.layout.clone(),
+        });
         let hud = Hud::new(server.scoreboard_manager.main_scoreboard());
         let game = Arc::new(Game::new(
             arena,
@@ -282,6 +334,10 @@ impl SheepWarsPlugin {
 
     async fn on_entity_damage(&self, event: &mut EntityDamage) {
         let Some(game) = self.game() else { return };
+        if cancels_vanilla_explosion(event.entity_type(), event.cause()) {
+            event.cancel();
+            return;
+        }
         if event.entity_type() == EntityType::Player
             && (game.blocks_damage()
                 || (event.cause() == EntityDamageCause::Fall
@@ -313,9 +369,13 @@ impl SheepWarsPlugin {
 
     async fn on_entity_damage_by_entity(&self, event: &mut EntityDamageByEntity) {
         let Some(game) = self.game() else { return };
-        let attacker = event
-            .player()
-            .or_else(|| event.damage_source().causing.as_ref().and_then(|e| e.player.as_ref()));
+        let attacker = event.player().or_else(|| {
+            event
+                .damage_source()
+                .causing
+                .as_ref()
+                .and_then(|e| e.player.as_ref())
+        });
         let Some(attacker) = attacker else { return };
         if let Some(victim) = event.entity().player.as_ref() {
             if game.blocks_hit(attacker, victim) {
@@ -345,10 +405,142 @@ impl SheepWarsPlugin {
     }
 
     async fn on_block_break(&self, event: &mut BlockBreak) {
-        event.cancel();
+        let (Some(game), Some(guard)) = (self.game(), self.guard.get()) else {
+            event.cancel();
+            return;
+        };
+        let player = event.player();
+        if game.blocks_damage() || player.world.id() != guard.world_id {
+            event.cancel();
+            return;
+        }
+        let pos = event.block().pos;
+        let allowed = match player.world.get_block(pos).await {
+            Ok(state) => may_break(state.kind, pos, &guard.layout),
+            Err(_) => false,
+        };
+        if allowed {
+            event.set_drop_items(false);
+            event.set_exp_to_drop(0);
+        } else {
+            event.cancel();
+        }
+    }
+
+    async fn on_block_damage(&self, event: &mut BlockDamage) {
+        let (Some(game), Some(guard)) = (self.game(), self.guard.get()) else {
+            return;
+        };
+        let player = event.player();
+        if game.blocks_damage() || player.world.id() != guard.world_id {
+            return;
+        }
+        let pos = event.block().pos;
+        if let Ok(state) = player.world.get_block(pos).await
+            && is_fire(state.kind)
+        {
+            player.world.block(pos).set(BlockType::Air);
+        }
+    }
+
+    async fn on_entity_explode(&self, event: &mut EntityExplode) {
+        if self
+            .guard
+            .get()
+            .is_some_and(|guard| guard.world_id == event.location().world)
+        {
+            event.set_yield(explosion_yield());
+        }
+    }
+
+    async fn on_block_explode(&self, event: &mut BlockExplode) {
+        event.set_yield(explosion_yield());
+    }
+
+    async fn on_item_spawn(&self, event: &mut ItemSpawn) {
+        if self
+            .guard
+            .get()
+            .is_some_and(|guard| guard.world_id == event.location().world)
+        {
+            event.cancel();
+        }
     }
 
     async fn on_block_place(&self, event: &mut BlockPlace) {
         event.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arena::ArenaSettings;
+
+    fn layout() -> Layout {
+        Layout::new(ArenaSettings::default())
+    }
+
+    fn pos(x: i32, y: i32, z: i32) -> BlockPos {
+        BlockPos { x, y, z }
+    }
+
+    #[test]
+    fn vanilla_explosions_never_hurt_players() {
+        for cause in [
+            EntityDamageCause::BlockExplosion,
+            EntityDamageCause::EntityExplosion,
+        ] {
+            assert!(cancels_vanilla_explosion(EntityType::Player, cause));
+            assert!(!cancels_vanilla_explosion(EntityType::Sheep, cause));
+        }
+        assert!(!cancels_vanilla_explosion(
+            EntityType::Player,
+            EntityDamageCause::Fall
+        ));
+        assert!(!cancels_vanilla_explosion(
+            EntityType::Player,
+            EntityDamageCause::EntityAttack
+        ));
+    }
+
+    #[test]
+    fn ordinary_blocks_break_but_bedrock_and_barriers_do_not() {
+        let layout = layout();
+        let far = pos(200, 70, 200);
+        assert!(may_break(BlockType::Stone, far, &layout));
+        assert!(may_break(BlockType::Dirt, far, &layout));
+        assert!(!may_break(BlockType::Bedrock, far, &layout));
+        assert!(!may_break(BlockType::Barrier, far, &layout));
+    }
+
+    #[test]
+    fn spawn_and_lobby_platforms_are_unbreakable() {
+        let layout = layout();
+        let settings = layout.settings();
+        for platform in [
+            &settings.red.platform,
+            &settings.blue.platform,
+            &settings.lobby_platform,
+        ] {
+            let center = pos(platform.center.x, platform.center.y, platform.center.z);
+            assert!(!may_break(BlockType::QuartzBlock, center, &layout));
+            let above = pos(center.x, center.y + 1, center.z);
+            assert!(may_break(BlockType::QuartzBlock, above, &layout));
+        }
+    }
+
+    #[test]
+    fn fire_breaks_like_any_ordinary_block() {
+        let layout = layout();
+        assert!(is_fire(BlockType::Fire));
+        assert!(is_fire(BlockType::SoulFire));
+        assert!(!is_fire(BlockType::Stone));
+        assert!(may_break(BlockType::Fire, pos(200, 70, 200), &layout));
+    }
+
+    #[test]
+    fn explosions_yield_no_items() {
+        assert_eq!(explosion_yield(), 0.0);
     }
 }

@@ -1,5 +1,6 @@
 use ferriscraft_protocol::ServerPhase;
 use thiserror::Error;
+use uuid::Uuid;
 
 use super::intent::Intent;
 use crate::arena::{Layout, Point};
@@ -7,14 +8,14 @@ use crate::domain::{
     Phase, PlayerId, Round, RoundError, RoundEvent, RoundRules, SheepKind, TeamId,
 };
 use crate::hud::{message, team_name, team_prefix};
-use crate::sheep::{announces_launch, display_name};
+use crate::sheep::{announces_launch, display_name, weighted_kind};
 
 pub const RESET_DELAY_TICKS: u32 = 20 * 10;
 pub const FORCED_MIN_PLAYERS: usize = 1;
-pub const SHEEP_STRATEGY: fn(u32) -> SheepKind = rotation;
+pub const SHEEP_STRATEGY: fn(u32) -> SheepKind = weighted_kind;
 
-const fn rotation(index: u32) -> SheepKind {
-    SheepKind::ALL[index as usize % SheepKind::ALL.len()]
+fn roll() -> u32 {
+    Uuid::new_v4().as_u128() as u32
 }
 
 pub fn launch_announcement(kind: SheepKind, team: TeamId) -> Option<Intent> {
@@ -394,16 +395,17 @@ impl Session {
     }
 
     fn sheep_for(&self, team: TeamId) -> Vec<Intent> {
-        let Phase::Playing { elapsed } = self.round.phase() else {
+        let Phase::Playing { .. } = self.round.phase() else {
             return Vec::new();
         };
-        let interval = self.round.rules().sheep_interval_ticks.max(1);
-        let kind = SHEEP_STRATEGY((elapsed / interval).saturating_sub(1));
         let members = self.round.team(team);
         members
             .members()
             .filter(|player| members.lives_of(*player).unwrap_or(0) > 0)
-            .map(|player| Intent::Give { player, kind })
+            .map(|player| Intent::Give {
+                player,
+                kind: SHEEP_STRATEGY(roll()),
+            })
             .collect()
     }
 }
@@ -514,19 +516,39 @@ mod tests {
             given.extend(gives(&session.tick()));
         }
         assert_eq!(given.len(), 2);
-        assert!(given.contains(&(A, SHEEP_STRATEGY(0))));
-        assert!(given.contains(&(B, SHEEP_STRATEGY(0))));
+        assert_eq!(given.iter().filter(|(player, _)| *player == A).count(), 1);
+        assert_eq!(given.iter().filter(|(player, _)| *player == B).count(), 1);
     }
 
     #[test]
-    fn sheep_kind_rotates_over_the_catalog() {
-        let mut session = started();
-        let mut kinds = Vec::new();
-        for _ in 0..10 {
-            kinds.extend(gives(&session.tick()).into_iter().map(|(_, kind)| kind));
+    fn each_team_member_rolls_their_own_sheep() {
+        let mut session = Session::new(
+            Layout::new(ArenaSettings::default()),
+            RoundRules {
+                max_players: 8,
+                ..rules()
+            },
+        );
+        for index in 1..=8 {
+            session.join(PlayerId(index));
         }
-        assert_eq!(kinds[0], SheepKind::ALL[0]);
-        assert_eq!(kinds[2], SheepKind::ALL[1]);
+        for _ in 0..3 {
+            session.tick();
+        }
+        let mut kinds = std::collections::BTreeSet::new();
+        for _ in 0..40 {
+            for _ in 0..5 {
+                for (_, kind) in gives(&session.tick()) {
+                    kinds.insert(kind as u8);
+                }
+            }
+        }
+        assert!(kinds.len() > 1);
+    }
+
+    #[test]
+    fn the_default_interval_is_twelve_seconds() {
+        assert_eq!(RoundRules::default().sheep_interval_ticks, 12 * 20);
     }
 
     #[test]
@@ -542,12 +564,6 @@ mod tests {
                 assert_eq!(announcement, None);
             }
         }
-    }
-
-    #[test]
-    fn rotation_wraps_around() {
-        let len = u32::try_from(SheepKind::ALL.len()).expect("small");
-        assert_eq!(SHEEP_STRATEGY(len), SHEEP_STRATEGY(0));
     }
 
     #[test]

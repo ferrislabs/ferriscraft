@@ -24,7 +24,7 @@ pub use catalog::{
     TORPEDO_POWER, TORPEDO_SPEED, TORPEDO_TRIGGER_RADIUS, WARP_BLINDNESS_AMPLIFIER,
     WARP_BLINDNESS_TICKS, WARP_BLOCK_PAIRS, WARP_BLOCK_RADIUS, WARP_DELAY_TICKS, WARP_LIFT,
     WARP_PUSH, WARP_RADIUS, WoolColor, announces_launch, chases_after_impact, display_name,
-    drop_weight, flies_straight, homes_in_flight, launch_power, weighted_kind, wool_color,
+    drop_weight, flies_straight, launch_power, weighted_kind, wool_color,
 };
 pub use impact::{
     Action, BlockKind, Cell, EffectKind, ParticleKind, SoundKind, Vec3, healing_pulse,

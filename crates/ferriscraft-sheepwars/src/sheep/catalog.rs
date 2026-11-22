@@ -142,10 +142,6 @@ pub const fn wool_color(kind: SheepKind) -> WoolColor {
     }
 }
 
-pub const fn homes_in_flight(kind: SheepKind) -> bool {
-    matches!(kind, SheepKind::Seeker)
-}
-
 pub const fn flies_straight(kind: SheepKind) -> bool {
     matches!(kind, SheepKind::Torpedo)
 }
@@ -241,8 +237,10 @@ mod tests {
 
     #[test]
     fn the_explosive_breaks_more_than_the_incendiary() {
-        assert!(EXPLOSIVE_POWER > INCENDIARY_POWER);
-        assert!(EXPLOSIVE_DAMAGE > INCENDIARY_DAMAGE);
+        const {
+            assert!(EXPLOSIVE_POWER > INCENDIARY_POWER);
+            assert!(EXPLOSIVE_DAMAGE > INCENDIARY_DAMAGE);
+        }
     }
 
     #[test]
@@ -256,15 +254,6 @@ mod tests {
         ] {
             assert!(points <= crate::domain::MAX_NON_LETHAL);
         }
-    }
-
-    #[test]
-    fn only_the_seeker_homes() {
-        let homing: Vec<_> = SheepKind::ALL
-            .into_iter()
-            .filter(|kind| homes_in_flight(*kind))
-            .collect();
-        assert_eq!(homing, vec![SheepKind::Seeker]);
     }
 
     #[test]

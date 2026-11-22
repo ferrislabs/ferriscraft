@@ -1,13 +1,19 @@
 use rspigot_plugin::Material;
 
 use crate::domain::{PlayerId, SheepKind, TeamId};
-use crate::sheep::{display_name, sheep_wool};
+use crate::sheep::{
+    Action, SEEKER_DETONATE_DISTANCE, SEEKER_FUSE_TICKS, SEEKER_RUN_SPEED, TORPEDO_CLEAR_RADIUS,
+    TORPEDO_MAX_FLIGHT_TICKS, TORPEDO_SPEED, TORPEDO_TRIGGER_RADIUS, Vec3, chases_after_impact,
+    display_name, flies_straight, launch_power, launch_velocity, sheep_wool, step_ballistic,
+    throw_velocity,
+};
 
 pub const MAX_CONCURRENT_FLIGHTS: usize = 32;
 pub const MAX_FLIGHT_TICKS: u32 = 20 * 15;
 pub const LANDING_GRACE_TICKS: u32 = 4;
 pub const SHEEP_FUSE_TICKS: u32 = 20 * 3;
 pub const EYE_HEIGHT: f64 = 1.62;
+pub const CHASE_DOWN_SPEED: f64 = -0.08;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Flight {
@@ -22,7 +28,73 @@ pub const fn waits_for_ground(kind: SheepKind) -> bool {
 }
 
 pub const fn arms_on_impact(kind: SheepKind) -> bool {
-    !matches!(kind, SheepKind::Healing | SheepKind::Boarding)
+    !(matches!(
+        kind,
+        SheepKind::Healing | SheepKind::Boarding | SheepKind::Torpedo
+    ) || starts_effect(kind))
+}
+
+pub const fn starts_effect(kind: SheepKind) -> bool {
+    matches!(
+        kind,
+        SheepKind::Quake | SheepKind::Warp | SheepKind::Intergalactic
+    )
+}
+
+pub fn initial_velocity(kind: SheepKind, yaw: f64, pitch: f64) -> Vec3 {
+    if flies_straight(kind) {
+        launch_velocity(yaw, pitch, TORPEDO_SPEED)
+    } else {
+        throw_velocity(yaw, pitch, launch_power(kind))
+    }
+}
+
+pub fn flight_velocity(kind: SheepKind, velocity: Vec3, ticks: u32) -> Vec3 {
+    if flies_straight(kind) {
+        velocity
+    } else {
+        (0..ticks).fold(velocity, |v, _| step_ballistic(v))
+    }
+}
+
+pub fn torpedo_clear(at: Vec3) -> Action {
+    Action::ClearSphere {
+        center: at,
+        radius: TORPEDO_CLEAR_RADIUS,
+    }
+}
+
+pub fn torpedo_triggered(distance: f64) -> bool {
+    distance <= TORPEDO_TRIGGER_RADIUS
+}
+
+pub fn chase_velocity(from: Vec3, target: Vec3) -> Vec3 {
+    let (dx, dz) = (target.x - from.x, target.z - from.z);
+    let length = dx.hypot(dz);
+    if length <= f64::EPSILON {
+        return Vec3 {
+            x: 0.0,
+            y: CHASE_DOWN_SPEED,
+            z: 0.0,
+        };
+    }
+    Vec3 {
+        x: dx / length * SEEKER_RUN_SPEED,
+        y: CHASE_DOWN_SPEED,
+        z: dz / length * SEEKER_RUN_SPEED,
+    }
+}
+
+pub fn chase_detonates(distance: f64) -> bool {
+    distance <= SEEKER_DETONATE_DISTANCE
+}
+
+pub const fn fuse_ticks(kind: SheepKind) -> u32 {
+    if chases_after_impact(kind) {
+        SEEKER_FUSE_TICKS
+    } else {
+        SHEEP_FUSE_TICKS
+    }
 }
 
 pub fn fuse_label(kind: SheepKind, remaining_ticks: u32) -> String {
@@ -42,6 +114,9 @@ impl Flight {
     }
 
     pub const fn should_land(&self, on_ground: bool, wall_hit: bool) -> bool {
+        if flies_straight(self.kind) {
+            return self.age >= TORPEDO_MAX_FLIGHT_TICKS;
+        }
         let hit = on_ground || (wall_hit && !waits_for_ground(self.kind));
         (hit && self.age >= LANDING_GRACE_TICKS) || self.age >= MAX_FLIGHT_TICKS
     }
@@ -114,9 +189,83 @@ mod tests {
         assert!(!arms_on_impact(SheepKind::Healing));
         assert!(!arms_on_impact(SheepKind::Boarding));
         assert!(arms_on_impact(SheepKind::Incendiary));
-        assert!(arms_on_impact(SheepKind::Quake));
-        assert!(arms_on_impact(SheepKind::Warp));
+        assert!(!arms_on_impact(SheepKind::Quake));
+        assert!(!arms_on_impact(SheepKind::Warp));
+        assert!(!arms_on_impact(SheepKind::Intergalactic));
         assert!(arms_on_impact(SheepKind::Seeker));
+        assert!(!arms_on_impact(SheepKind::Torpedo));
+    }
+
+    fn speed(v: Vec3) -> f64 {
+        (v.x * v.x + v.y * v.y + v.z * v.z).sqrt()
+    }
+
+    #[test]
+    fn spec_swi_5_torpedo_flies_straight_at_constant_speed_without_gravity() {
+        let launch = initial_velocity(SheepKind::Torpedo, 30.0, 10.0);
+        assert!((speed(launch) - TORPEDO_SPEED).abs() < 1e-9);
+        let later = flight_velocity(SheepKind::Torpedo, launch, 50);
+        assert_eq!(later, launch);
+        let level = initial_velocity(SheepKind::Torpedo, 0.0, 0.0);
+        assert_eq!(flight_velocity(SheepKind::Torpedo, level, 20).y, 0.0);
+        let arc = flight_velocity(SheepKind::Lightning, level, 20);
+        assert!(arc.y < 0.0);
+    }
+
+    #[test]
+    fn torpedo_ignores_ground_and_walls_until_its_lifetime_ends() {
+        assert!(!flight(SheepKind::Torpedo, LANDING_GRACE_TICKS).should_land(true, true));
+        assert!(!flight(SheepKind::Torpedo, TORPEDO_MAX_FLIGHT_TICKS - 1).should_land(true, true));
+        assert!(flight(SheepKind::Torpedo, TORPEDO_MAX_FLIGHT_TICKS).should_land(false, false));
+    }
+
+    #[test]
+    fn spec_swi_6_torpedo_triggers_inside_the_radius_only() {
+        assert!(torpedo_triggered(TORPEDO_TRIGGER_RADIUS));
+        assert!(torpedo_triggered(0.5));
+        assert!(!torpedo_triggered(TORPEDO_TRIGGER_RADIUS + 0.01));
+    }
+
+    #[test]
+    fn spec_swi_7_torpedo_clears_a_sphere_of_radius_three_around_itself() {
+        let at = Vec3 {
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+        };
+        assert_eq!(
+            torpedo_clear(at),
+            Action::ClearSphere {
+                center: at,
+                radius: 3.0
+            }
+        );
+    }
+
+    #[test]
+    fn spec_swi_8_seeker_runs_horizontally_toward_the_target_and_fuses_within_forty_ticks() {
+        let from = Vec3::ZERO;
+        let target = Vec3 {
+            x: 3.0,
+            y: 40.0,
+            z: 4.0,
+        };
+        let v = chase_velocity(from, target);
+        assert!((v.x.hypot(v.z) - SEEKER_RUN_SPEED).abs() < 1e-9);
+        assert!((v.x / v.z - 0.75).abs() < 1e-9);
+        assert!(v.y <= 0.0);
+        assert!(fuse_ticks(SheepKind::Seeker) <= 40);
+        assert_eq!(fuse_ticks(SheepKind::Incendiary), SHEEP_FUSE_TICKS);
+        assert!(chase_detonates(SEEKER_DETONATE_DISTANCE));
+        assert!(!chase_detonates(SEEKER_DETONATE_DISTANCE + 0.1));
+    }
+
+    #[test]
+    fn only_timed_sheep_start_an_effect() {
+        assert!(starts_effect(SheepKind::Quake));
+        assert!(starts_effect(SheepKind::Warp));
+        assert!(starts_effect(SheepKind::Intergalactic));
+        assert!(!starts_effect(SheepKind::Explosive));
     }
 
     #[test]

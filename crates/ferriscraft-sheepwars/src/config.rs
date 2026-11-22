@@ -84,7 +84,7 @@ impl SheepWarsConfig {
             .unwrap_or(16)
             .max(min_players);
         let countdown_secs = parse_u32_env("SHEEPWARS_COUNTDOWN_SECS").unwrap_or(15);
-        let sheep_interval_secs = parse_u32_env("SHEEPWARS_SHEEP_INTERVAL_SECS").unwrap_or(20);
+        let sheep_interval_secs = parse_u32_env("SHEEPWARS_SHEEP_INTERVAL_SECS").unwrap_or(12);
         let lives = parse_u32_env("SHEEPWARS_LIVES").unwrap_or(3).max(1);
         let end_delay_secs = parse_u32_env("SHEEPWARS_END_DELAY_SECS").unwrap_or(10);
 

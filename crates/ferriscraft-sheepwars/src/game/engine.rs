@@ -13,9 +13,11 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use super::display::lives_line;
+use super::effects::Effects;
 use super::flight::{
     EYE_HEIGHT, Flight, LANDING_GRACE_TICKS, MAX_CONCURRENT_FLIGHTS, MAX_FLIGHT_TICKS,
-    SHEEP_FUSE_TICKS, arms_on_impact, can_launch, fuse_label,
+    arms_on_impact, can_launch, chase_detonates, chase_velocity, flight_velocity, fuse_label,
+    fuse_ticks, initial_velocity, starts_effect, torpedo_clear, torpedo_triggered,
 };
 use super::intent::Intent;
 use super::session::{ForceStartError, Session, VoidVerdict, launch_announcement};
@@ -25,10 +27,9 @@ use crate::domain::{PlayerId, SheepKind, TeamId};
 use crate::hud::{Hud, bossbar_progress, bossbar_title};
 use crate::orchestrator::SheepWarsOrchestratorClient;
 use crate::sheep::{
-    Action, HEALING_DURATION_TICKS, HEALING_PULSE_TICKS, ParticleKind, SEEKER_DETONATE_DISTANCE,
-    SEEKER_RANGE, SEEKER_SPEED, Vec3, apply, clamp_speed, display_name, healing_pulse,
-    homes_in_flight, launch_power, nearest_enemy, plan, sheep_dye_color, sheep_wool, spawn_point,
-    steer, step_ballistic, throw_velocity,
+    Action, HEALING_DURATION_TICKS, HEALING_PULSE_TICKS, ParticleKind, SEEKER_RANGE,
+    TORPEDO_TRIGGER_RADIUS, Vec3, apply, chases_after_impact, clamp_speed, display_name,
+    flies_straight, healing_pulse, nearest_enemy, plan, sheep_dye_color, sheep_wool, spawn_point,
 };
 
 pub const HUD_REFRESH_TICKS: u64 = 5;
@@ -70,6 +71,7 @@ struct State {
     flights: Vec<Airborne>,
     armed: Vec<ArmedSheep>,
     healings: Vec<ActiveHealing>,
+    effects: Effects,
     sheep_kinds: HashMap<i32, SheepKind>,
     last_sheep_damager: HashMap<i32, PlayerId>,
     fall_protected_until: HashMap<PlayerId, u64>,
@@ -107,6 +109,7 @@ impl Game {
                 flights: Vec::new(),
                 armed: Vec::new(),
                 healings: Vec::new(),
+                effects: Effects::new(),
                 sheep_kinds: HashMap::new(),
                 last_sheep_damager: HashMap::new(),
                 fall_protected_until: HashMap::new(),
@@ -244,9 +247,7 @@ impl Game {
 
     pub async fn send_player_hub(&self, player: &Player) {
         if let Some(orch) = &self.orchestrator {
-            player
-                .message
-                .send("§eRetour au Hub FerrisCraft...");
+            player.message.send("§eRetour au Hub FerrisCraft...");
             if let Err(err) = orch
                 .send_player_to_lobby(player.uuid, Some("retour demandé".to_owned()))
                 .await
@@ -343,12 +344,11 @@ impl Game {
             killer
                 .inventory
                 .add(ItemStack::new(sheep_wool(kind), 1).name(display_name(kind)));
-            killer
-                .message
-                .send(format!("§aVous avez récupéré un {}§a !", display_name(kind)));
-            killer
-                .sound
-                .play(SoundCue::new(Sound::EntityItemPickup));
+            killer.message.send(format!(
+                "§aVous avez récupéré un {}§a !",
+                display_name(kind)
+            ));
+            killer.sound.play(SoundCue::new(Sound::EntityItemPickup));
         }
         true
     }
@@ -413,7 +413,7 @@ impl Game {
         sheep.name.set(display_name(kind));
         sheep.name.set_visible(true);
 
-        let velocity = throw_velocity(yaw, pitch, launch_power(kind));
+        let velocity = initial_velocity(kind, yaw, pitch);
         sheep.set_velocity(vector(velocity));
         player
             .inventory
@@ -452,6 +452,7 @@ impl Game {
         self.advance_flights().await;
         self.advance_armed().await;
         self.advance_healings().await;
+        self.advance_effects().await;
         self.refresh();
         self.check_phase_changed();
     }
@@ -467,6 +468,7 @@ impl Game {
         for totem in state.healings.drain(..) {
             totem.entity.remove();
         }
+        state.effects = Effects::new();
         state.sheep_kinds.clear();
         state.last_sheep_damager.clear();
         state.fall_protected_until.clear();
@@ -647,6 +649,7 @@ impl Game {
         for totem in state.healings.drain(..) {
             totem.entity.remove();
         }
+        state.effects = Effects::new();
         state.sheep_kinds.clear();
         state.last_sheep_damager.clear();
         state.fall_protected_until.clear();
@@ -806,26 +809,33 @@ impl Game {
                 }
             }
 
-            let seeker_target = if homes_in_flight(airborne.flight.kind) {
-                nearest_enemy(
+            let mut torpedo_hit = false;
+            if flies_straight(airborne.flight.kind) {
+                if let Err(error) = apply(
+                    &self.arena.world,
+                    None,
+                    &players_with_teams,
+                    &[torpedo_clear(pos)],
+                )
+                .await
+                {
+                    tracing::warn!("échec du creusement du torpilleur : {error}");
+                }
+                torpedo_hit = nearest_enemy(
                     pos,
-                    SEEKER_RANGE,
+                    TORPEDO_TRIGGER_RADIUS,
                     airborne.flight.team,
                     &players_with_teams,
                 )
                 .await
-            } else {
-                None
-            };
-            let target_hit = seeker_target.is_some_and(|(_, dist)| {
-                dist <= SEEKER_DETONATE_DISTANCE && airborne.flight.age >= LANDING_GRACE_TICKS
-            });
+                .is_some_and(|(_, distance)| torpedo_triggered(distance));
+            }
 
             let expected_horiz = airborne.velocity.x.hypot(airborne.velocity.z);
             let moved_horiz = (pos.x - airborne.last_pos.x).hypot(pos.z - airborne.last_pos.z);
             let wall_hit = expected_horiz > 0.35 && moved_horiz < expected_horiz * 0.2;
 
-            if airborne.flight.should_land(sheep.on_ground, wall_hit) || target_hit {
+            if airborne.flight.should_land(sheep.on_ground, wall_hit) || torpedo_hit {
                 if airborne.flight.kind == SheepKind::Healing
                     && sheep.on_ground
                     && airborne.flight.age < MAX_FLIGHT_TICKS
@@ -849,16 +859,16 @@ impl Game {
                         pulse_in: HEALING_PULSE_TICKS,
                         pulses: 0,
                     });
-                } else if arms_on_impact(airborne.flight.kind) && !target_hit {
+                } else if arms_on_impact(airborne.flight.kind) {
                     airborne.entity.ai.set(false);
                     airborne.entity.flags.set_gravity(true);
                     airborne.entity.flags.set_invulnerable(false);
                     airborne.entity.flags.set_glowing(true);
                     airborne.entity.set_velocity(vector(Vec3::ZERO));
-                    airborne
-                        .entity
-                        .name
-                        .set(fuse_label(airborne.flight.kind, SHEEP_FUSE_TICKS));
+                    airborne.entity.name.set(fuse_label(
+                        airborne.flight.kind,
+                        fuse_ticks(airborne.flight.kind),
+                    ));
                     airborne.entity.name.set_visible(true);
                     self.arena
                         .world
@@ -867,7 +877,7 @@ impl Game {
                     new_armed.push(ArmedSheep {
                         flight: airborne.flight,
                         entity: airborne.entity,
-                        remaining_ticks: SHEEP_FUSE_TICKS,
+                        remaining_ticks: fuse_ticks(airborne.flight.kind),
                     });
                 } else {
                     if airborne.flight.kind == SheepKind::Boarding && airborne.rider_attached {
@@ -888,15 +898,8 @@ impl Game {
                     airborne.entity.remove();
                 }
             } else {
-                let next_velocity = if let Some((target, _)) = seeker_target {
-                    steer(pos, target, SEEKER_SPEED)
-                } else {
-                    let mut v = airborne.velocity;
-                    for _ in 0..ticks_advanced {
-                        v = step_ballistic(v);
-                    }
-                    v
-                };
+                let next_velocity =
+                    flight_velocity(airborne.flight.kind, airborne.velocity, ticks_advanced);
                 airborne.entity.set_velocity(vector(next_velocity));
                 airborne.velocity = next_velocity;
                 airborne.last_pos = pos;
@@ -978,7 +981,26 @@ impl Game {
             }
 
             armed_sheep.remaining_ticks = armed_sheep.remaining_ticks.saturating_sub(1);
-            if armed_sheep.remaining_ticks == 0 {
+            let mut contact = false;
+            if chases_after_impact(armed_sheep.flight.kind) && armed_sheep.remaining_ticks > 0 {
+                match nearest_enemy(
+                    pos,
+                    SEEKER_RANGE,
+                    armed_sheep.flight.team,
+                    &players_with_teams,
+                )
+                .await
+                {
+                    Some((_, distance)) if chase_detonates(distance) => contact = true,
+                    Some((target, _)) => {
+                        armed_sheep
+                            .entity
+                            .set_velocity(vector(chase_velocity(pos, target)));
+                    }
+                    None => {}
+                }
+            }
+            if armed_sheep.remaining_ticks == 0 || contact {
                 if self.claim_sheep(entity_id) {
                     children.extend(
                         self.land_at(
@@ -994,10 +1016,10 @@ impl Game {
                 armed_sheep.entity.remove();
             } else {
                 if armed_sheep.remaining_ticks.is_multiple_of(4) {
-                    armed_sheep
-                        .entity
-                        .name
-                        .set(fuse_label(armed_sheep.flight.kind, armed_sheep.remaining_ticks));
+                    armed_sheep.entity.name.set(fuse_label(
+                        armed_sheep.flight.kind,
+                        armed_sheep.remaining_ticks,
+                    ));
                 }
                 if matches!(armed_sheep.remaining_ticks, 40 | 20 | 10) {
                     self.arena
@@ -1120,6 +1142,25 @@ impl Game {
         state.healings.extend(next_healings);
     }
 
+    async fn advance_effects(&self) {
+        let (actions, players_with_teams) = {
+            let mut state = self.lock();
+            let actions = state.effects.tick();
+            if actions.is_empty() {
+                return;
+            }
+            let teams: HashMap<PlayerId, TeamId> = state.session.standing().into_iter().collect();
+            let players_with_teams: Vec<(Player, TeamId)> = teams
+                .into_iter()
+                .filter_map(|(id, team)| state.players.get(&id).cloned().map(|p| (p, team)))
+                .collect();
+            (actions, players_with_teams)
+        };
+        if let Err(error) = apply(&self.arena.world, None, &players_with_teams, &actions).await {
+            tracing::warn!("échec des effets temporisés : {error}");
+        }
+    }
+
     async fn land_at(
         &self,
         flight: Flight,
@@ -1135,6 +1176,9 @@ impl Game {
             ..
         } = flight;
         let actions = plan(kind, impact_pos, team);
+        if starts_effect(kind) {
+            self.lock().effects.start(kind, impact_pos, team);
+        }
         let thrower_player = if kind == SheepKind::Boarding && !rider_attached {
             None
         } else {

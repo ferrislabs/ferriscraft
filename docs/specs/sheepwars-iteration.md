@@ -182,3 +182,5 @@ cargo test -p ferriscraft-sheepwars
 ```
 
 Puis en jeu dans k3d : lancer chaque mouton.
+
+Amended: 2026-11-22 Quake, Warp et Intergalactic atterrissent sans mèche de 3 s (`arms_on_impact` faux) : leur délai propre est dans `Effects`.
