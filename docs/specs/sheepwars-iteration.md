@@ -103,6 +103,7 @@ Chaque ligne devient un test dans le module indiqué.
 - `@spec-swi-27` La zone de gel couvre un rayon de 5, ralentit les ennemis toutes les 10 ticks pendant 160 ticks, et pose la glace du centre vers l'extérieur sur plus de blocs que l'ancien disque de rayon 3. `game::effects`
 - `@spec-swi-28` Le passager d'un abordage n'est téléporté en vol que s'il est à plus de 6 blocs du mouton. `game::flight`
 - `@spec-swi-29` Le chercheur garde son IA active après l'impact, car rspigot ignore la vélocité et la gravité d'un mob sans IA. Les autres moutons armés la désactivent. `game::flight`
+- `@spec-swi-30` À chaque impulsion, la zone de gel émet ses particules de neige sur deux coquilles sphériques de rayon 5 et 2,75 centrées sur l'impact, au-dessus comme au-dessous du centre, et jamais au-delà du rayon 5. `game::effects`
 - `@spec-swi-20` Les explosions n'ont aucun rendement d'objets : `set_yield(0.0)` sur `EntityExplode` et `BlockExplode`. `plugin`
 
 ## Simulation
@@ -203,3 +204,5 @@ Amended: 2026-11-22 La protection de chute de l'abordage n'est plus un délai fi
 Amended: 2026-11-22 Le glacé devient une zone de gel temporisée (`Effects`). Le ralentissement de 25 % demandé est approché par Slowness II (30 %, le palier vanilla le plus proche). Le passager de l'abordage n'est plus téléporté à chaque tick : chaque téléportation renvoie au client la rotation connue du serveur, d'où la saccade.
 
 Amended: 2026-11-22 Le chercheur ne courait pas : le moteur coupait son IA à l'impact, or `finish_ai_step` n'appelle pas `travel` pour un mob sans IA (`living.rs`), donc sa vélocité était ignorée.
+
+Amended: 2026-11-22 Les particules de la zone de gel forment une sphère (deux coquilles, 68 points par impulsion) au lieu d'un anneau au sol.
