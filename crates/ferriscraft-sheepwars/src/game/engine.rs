@@ -231,6 +231,7 @@ impl Game {
             max_players,
             player_uuids,
             version: self.config.version.clone(),
+            kind: Default::default(),
         }
     }
 

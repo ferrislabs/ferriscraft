@@ -27,6 +27,14 @@ impl ServerPhase {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerKind {
+    Lobby,
+    #[default]
+    SheepWars,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerSummary {
     pub server_id: String,
@@ -44,6 +52,10 @@ pub struct ServerSummary {
     pub version: Option<String>,
     #[serde(default)]
     pub outdated: bool,
+    #[serde(default)]
+    pub kind: ServerKind,
+    #[serde(default)]
+    pub draining: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,6 +63,8 @@ pub struct HeartbeatRequest {
     pub server_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
+    #[serde(default)]
+    pub kind: ServerKind,
     pub phase: ServerPhase,
     pub player_count: u32,
     pub max_players: u32,
@@ -129,6 +143,8 @@ pub struct PlayerQueueStatus {
     pub min_players: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_server: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spectate_server: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,6 +170,17 @@ pub struct FleetStatusSnapshot {
     pub servers: Vec<ServerSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestrator_version: Option<String>,
+    #[serde(default)]
+    pub lobbies: Vec<ServerSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_version: Option<String>,
+}
+
+pub const PROXY_VERSION_HEADER: &str = "x-ferriscraft-version";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrainResponse {
+    pub remaining_players: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +188,8 @@ pub struct ProxyServerEntry {
     pub name: String,
     pub address: String,
     pub phase: ServerPhase,
+    #[serde(default)]
+    pub kind: ServerKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,6 +214,8 @@ pub enum ProxyEvent {
         name: String,
         address: String,
         phase: ServerPhase,
+        #[serde(default)]
+        kind: ServerKind,
     },
     ServerRemove {
         name: String,
@@ -428,6 +459,28 @@ mod tests {
             (summary.version, summary.outdated, summary.age_secs),
             (None, false, 0)
         );
+    }
+
+    #[test]
+    fn spec_plc_6_heartbeat_without_kind_is_sheepwars() {
+        let json = r#"{"server_id":"sw-1","phase":"waiting","player_count":0,"max_players":16}"#;
+        let heartbeat: HeartbeatRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(heartbeat.kind, ServerKind::SheepWars);
+    }
+
+    #[test]
+    fn lobby_kind_and_upsert_round_trip() {
+        let event = ProxyEvent::ServerUpsert {
+            name: "ferriscraft-lobby-abc".into(),
+            address: "10.0.0.3:25565".into(),
+            phase: ServerPhase::Waiting,
+            kind: ServerKind::Lobby,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"kind\":\"lobby\""), "{json}");
+        let old = r#"{"type":"server_upsert","name":"sw-1","address":"a","phase":"waiting"}"#;
+        let parsed: ProxyEvent = serde_json::from_str(old).unwrap();
+        assert!(matches!(parsed, ProxyEvent::ServerUpsert { kind: ServerKind::SheepWars, .. }));
     }
 
     #[test]

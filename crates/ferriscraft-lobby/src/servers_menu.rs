@@ -198,6 +198,8 @@ mod tests {
             age_secs: 0,
             version: None,
             outdated: false,
+            kind: Default::default(),
+            draining: false,
         }
     }
 

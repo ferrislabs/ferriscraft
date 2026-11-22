@@ -144,6 +144,8 @@ impl ManagedServer {
             age_secs: now.saturating_duration_since(self.created_at).as_secs(),
             version: self.version.clone(),
             outdated: self.outdated,
+            kind: Default::default(),
+            draining: false,
         }
     }
 }
@@ -239,6 +241,7 @@ impl FleetEngine {
                 total_queued: self.queue.len(),
                 min_players: self.policy.queue_min_players,
                 target_server: Some(active.command.target_server.clone()),
+                spectate_server: None,
             };
         }
 
@@ -249,6 +252,7 @@ impl FleetEngine {
                 total_queued: self.queue.len(),
                 min_players: self.policy.queue_min_players,
                 target_server: None,
+                spectate_server: None,
             }
         } else {
             PlayerQueueStatus {
@@ -257,6 +261,7 @@ impl FleetEngine {
                 total_queued: self.queue.len(),
                 min_players: self.policy.queue_min_players,
                 target_server: None,
+                spectate_server: None,
             }
         }
     }
@@ -923,6 +928,8 @@ impl FleetEngine {
             queued_players,
             servers,
             orchestrator_version: None,
+            lobbies: Vec::new(),
+            proxy_version: None,
         }
     }
 
@@ -936,6 +943,7 @@ impl FleetEngine {
                     name: s.server_id.clone(),
                     address: addr.clone(),
                     phase: s.phase,
+                    kind: Default::default(),
                 })
             })
             .collect();
@@ -962,6 +970,7 @@ impl FleetEngine {
                     name: server.server_id.clone(),
                     address: addr.clone(),
                     phase: server.phase,
+                    kind: Default::default(),
                 });
             }
         } else if !should_register && server.registered_on_proxy {
@@ -1165,6 +1174,7 @@ mod tests {
                 max_players: 4,
                 player_uuids: Vec::new(),
                 version: None,
+                kind: Default::default(),
             },
         );
 
@@ -1203,6 +1213,7 @@ mod tests {
                 max_players: 4,
                 player_uuids: Vec::new(),
                 version: None,
+                kind: Default::default(),
             },
         );
         engine.upsert_infra_server(
@@ -1223,6 +1234,7 @@ mod tests {
                 max_players: 4,
                 player_uuids: Vec::new(),
                 version: None,
+                kind: Default::default(),
             },
         );
 
@@ -1260,6 +1272,7 @@ mod tests {
                 max_players: 4,
                 player_uuids: Vec::new(),
                 version: None,
+                kind: Default::default(),
             },
         );
         assert!(hb_events.iter().any(|e| matches!(
@@ -1321,6 +1334,7 @@ mod tests {
                 max_players: 4,
                 player_uuids,
                 version: None,
+                kind: Default::default(),
             },
         );
     }
@@ -1611,6 +1625,7 @@ mod tests {
                 max_players: 4,
                 player_uuids: Vec::new(),
                 version: Some("abc1234".to_owned()),
+                kind: Default::default(),
             },
         );
         heartbeat(&mut engine, t0, "sheepwars-1", ServerPhase::Waiting, 0);

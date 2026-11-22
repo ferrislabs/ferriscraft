@@ -1,6 +1,6 @@
 # 0003. Le SDK rspigot est référencé par un tag git
 
-Status: proposed
+Status: superseded by 0010
 Date: 2026-11-20
 
 ## Context

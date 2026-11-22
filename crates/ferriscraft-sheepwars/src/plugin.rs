@@ -140,6 +140,7 @@ impl SheepWarsPlugin {
                 max_players: u32::try_from(self.config.rules.max_players).unwrap_or(u32::MAX),
                 player_uuids: Vec::new(),
                 version: self.config.version.clone(),
+                kind: Default::default(),
             };
             let _ = orch.send_heartbeat(&starting).await;
         }
