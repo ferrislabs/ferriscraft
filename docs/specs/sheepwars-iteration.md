@@ -102,6 +102,7 @@ Chaque ligne devient un test dans le module indiqué.
 - `@spec-swi-26` Le torpilleur ne détruit aucun bloc avant 2 ticks de vol. `game::flight`
 - `@spec-swi-27` La zone de gel couvre un rayon de 5, ralentit les ennemis toutes les 10 ticks pendant 160 ticks, et pose la glace du centre vers l'extérieur sur plus de blocs que l'ancien disque de rayon 3. `game::effects`
 - `@spec-swi-28` Le passager d'un abordage n'est téléporté en vol que s'il est à plus de 6 blocs du mouton. `game::flight`
+- `@spec-swi-29` Le chercheur garde son IA active après l'impact, car rspigot ignore la vélocité et la gravité d'un mob sans IA. Les autres moutons armés la désactivent. `game::flight`
 - `@spec-swi-20` Les explosions n'ont aucun rendement d'objets : `set_yield(0.0)` sur `EntityExplode` et `BlockExplode`. `plugin`
 
 ## Simulation
@@ -200,3 +201,5 @@ Amended: 2026-11-22 Les enfants de la fragmentation sont un `SheepKind::Fragment
 Amended: 2026-11-22 La protection de chute de l'abordage n'est plus un délai fixe de 2 à 3 s : elle dure tant que le joueur est en l'air, plus 1 s après le sol (`FallGuards`).
 
 Amended: 2026-11-22 Le glacé devient une zone de gel temporisée (`Effects`). Le ralentissement de 25 % demandé est approché par Slowness II (30 %, le palier vanilla le plus proche). Le passager de l'abordage n'est plus téléporté à chaque tick : chaque téléportation renvoie au client la rotation connue du serveur, d'où la saccade.
+
+Amended: 2026-11-22 Le chercheur ne courait pas : le moteur coupait son IA à l'impact, or `finish_ai_step` n'appelle pas `travel` pour un mob sans IA (`living.rs`), donc sa vélocité était ignorée.
