@@ -22,14 +22,18 @@ pub const TORPEDO_POWER: f32 = 3.0;
 pub const TORPEDO_DAMAGE: f32 = 16.0;
 pub const TORPEDO_DAMAGE_RADIUS: f64 = 5.0;
 pub const TORPEDO_MAX_FLIGHT_TICKS: u32 = 20 * 6;
+pub const TORPEDO_CLEAR_DELAY_TICKS: u32 = 2;
 
 pub const LIGHTNING_STRIKES: u32 = 3;
 pub const LIGHTNING_SPREAD: f64 = 2.5;
 
-pub const FROZEN_RADIUS: f64 = 6.0;
-pub const FROZEN_SLOWNESS_TICKS: i32 = 160;
-pub const FROZEN_SLOWNESS_AMPLIFIER: u8 = 2;
-pub const FROZEN_ICE_RADIUS: i32 = 3;
+pub const FROST_ZONE_RADIUS: f64 = 5.0;
+pub const FROST_ZONE_DURATION_TICKS: u32 = 160;
+pub const FROST_PULSE_TICKS: u32 = 10;
+pub const FROST_SLOWNESS_TICKS: i32 = 30;
+pub const FROST_SLOWNESS_AMPLIFIER: u8 = 1;
+pub const FROST_ICE_RING_TICKS: u32 = 3;
+pub const FROST_ICE_LAYERS: [i32; 2] = [-1, -2];
 
 pub const SEEKER_POWER: f32 = 3.5;
 pub const SEEKER_BREAKS_BLOCKS: bool = true;
