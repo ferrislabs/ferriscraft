@@ -131,7 +131,7 @@ impl Game {
             loop {
                 let payload = game.heartbeat_payload();
                 if let Err(err) = orchestrator.send_heartbeat(&payload).await {
-                    tracing::debug!(
+                    tracing::warn!(
                         server_id = %payload.server_id,
                         phase = ?payload.phase,
                         "Échec envoi heartbeat orchestrateur : {err}"
