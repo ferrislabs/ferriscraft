@@ -257,6 +257,21 @@ pub fn plan(kind: SheepKind, at: Vec3, thrower_team: TeamId) -> Vec<Action> {
             particle(ParticleKind::LargeSmoke, at, 30),
             sound(SoundKind::Explode, at),
         ],
+        SheepKind::Fragment => vec![
+            Action::Explode {
+                at,
+                power: catalog::FRAGMENT_POWER,
+                breaks_blocks: catalog::FRAGMENT_BREAKS_BLOCKS,
+            },
+            Action::Damage {
+                team: enemies,
+                center: at,
+                radius: catalog::FRAGMENT_DAMAGE_RADIUS,
+                damage: Damage::capped(catalog::FRAGMENT_DAMAGE),
+            },
+            particle(ParticleKind::Explosion, at, 4),
+            sound(SoundKind::Explode, at),
+        ],
         SheepKind::Torpedo => vec![
             Action::Explode {
                 at,
@@ -559,14 +574,14 @@ mod tests {
     }
 
     #[test]
-    fn splitting_children_are_explosive_and_counted() {
+    fn splitting_children_are_fragments_and_counted() {
         let children = plan(SheepKind::Splitting, AT, TeamId::Red)
             .into_iter()
             .filter(|a| {
                 matches!(
                     a,
                     Action::SpawnSheep {
-                        kind: SheepKind::Explosive,
+                        kind: SheepKind::Fragment,
                         ..
                     }
                 )
@@ -574,6 +589,34 @@ mod tests {
             .count();
         assert_eq!(children, catalog::SPLIT_COUNT as usize);
         assert_eq!(catalog::SPLIT_COUNT, 4);
+    }
+
+    #[test]
+    fn a_fragment_explodes_and_hurts_without_one_shotting() {
+        let actions = plan(SheepKind::Fragment, AT, TeamId::Red);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Explode { at, .. } if *at == AT))
+        );
+        let damage = actions.iter().find_map(|a| match a {
+            Action::Damage { damage, .. } => Some(*damage),
+            _ => None,
+        });
+        assert!(damage.is_some_and(|d| !d.is_lethal() && d.at_distance(0.0, 4.0) < 20.0));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::SpawnSheep { .. }))
+        );
+    }
+
+    #[test]
+    fn a_fragment_is_smaller_than_the_explosive() {
+        const {
+            assert!(catalog::FRAGMENT_POWER < catalog::EXPLOSIVE_POWER);
+            assert!(catalog::FRAGMENT_SCALE < 1.0);
+        }
     }
 
     #[test]

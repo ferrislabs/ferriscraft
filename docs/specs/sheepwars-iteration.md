@@ -54,7 +54,8 @@ Moutons (laine) :
 | Explosive | Mouton explosif | rouge | Explosion simple, puissance 7, dégâts forts, casse beaucoup de terrain. |
 | Torpedo | Mouton torpilleur | cyan | Vol droit sans gravité. Détruit les blocs dans une sphère de 3 à chaque tick. Détonne quand un joueur ennemi entre dans les 3 blocs : dégâts forts rayon 5. |
 | Seeker | Mouton chercheur | vert | Lancé en arc. Après impact, court vers l'ennemi le plus proche (vitesse de course), explose au contact ou à 2 s. |
-| Splitting | Mouton à fragmentation | gris | Petite explosion, puis 4 enfants `Explosive` qui explosent à leur tour. |
+| Splitting | Mouton à fragmentation | gris | Petite explosion, puis 4 enfants `Fragment` qui explosent à leur tour. |
+| Fragment | Fragment | gris | Interne, hors tirage et hors inventaire. Moitié de taille, explose dès son premier contact avec le sol, sans mèche. |
 | Incendiary | Mouton enflammé | orange | Dégâts directs réduits. Enflamme le terrain sur un large rayon. |
 | Intergalactic | Mouton intergalactique | bleu | Météore (particules) du ciel vers l'impact. Détruit tous les blocs au-dessus de l'impact dans le cylindre (rayon 8). Tue les ennemis dans la zone. |
 | Boarding | Mouton d'abordage | blanc | Inchangé, couleur blanche. |
@@ -81,7 +82,7 @@ Chaque ligne devient un test dans le module indiqué.
 - `@spec-swi-6` Le torpilleur détonne dès qu'un joueur ennemi est à moins de 3 blocs, jamais pour un allié. `game::flight`
 - `@spec-swi-7` Le torpilleur émet un `ClearSphere` de rayon 3 centré sur lui à chaque tick de vol. `game::flight`
 - `@spec-swi-8` Le chercheur, après impact, se dirige vers l'ennemi le plus proche et explose au plus tard 40 ticks après l'impact. `game::flight`
-- `@spec-swi-9` Les enfants de la fragmentation sont des `Explosive`, au nombre de `SPLIT_COUNT`. `sheep::impact`
+- `@spec-swi-9` Les enfants de la fragmentation sont des `Fragment`, au nombre de `SPLIT_COUNT`. `sheep::impact`
 - `@spec-swi-10` L'explosif a une puissance et un rayon de destruction supérieurs à ceux de l'enflammé. `sheep::catalog`
 - `@spec-swi-11` L'enflammé inflige moins de dégâts que l'explosif et pose plus de feu que l'ancien. `sheep::impact`
 - `@spec-swi-12` Le champ de tremblement émet une secousse à 40, 80, 120, 160 et 200 ticks, puis s'éteint. `game::effects`
@@ -92,6 +93,8 @@ Chaque ligne devient un test dans le module indiqué.
 - `@spec-swi-17` Le don se déclenche toutes les 12 s par défaut et tire un mouton par joueur. `game::session`
 - `@spec-swi-18` Un joueur casse un bloc à la main sans objet. Bedrock et plateformes restent incassables. `plugin`
 - `@spec-swi-19` Casser un bloc de feu à la main l'éteint. `plugin`
+- `@spec-swi-21` Un `Fragment` n'a pas de mèche (`arms_on_impact` faux) et explose à son premier contact avec le sol, après un délai de grâce plus long que celui des autres moutons. `game::flight`
+- `@spec-swi-22` Un `Fragment` explose avec dégâts non létaux et sans enfants, et sa taille est inférieure à 1. `sheep::impact`
 - `@spec-swi-20` Les explosions n'ont aucun rendement d'objets : `set_yield(0.0)` sur `EntityExplode` et `BlockExplode`. `plugin`
 
 ## Simulation
@@ -184,3 +187,5 @@ cargo test -p ferriscraft-sheepwars
 Puis en jeu dans k3d : lancer chaque mouton.
 
 Amended: 2026-11-22 Quake, Warp et Intergalactic atterrissent sans mèche de 3 s (`arms_on_impact` faux) : leur délai propre est dans `Effects`.
+
+Amended: 2026-11-22 Les enfants de la fragmentation sont un `SheepKind::Fragment` hors de `SheepKind::ALL` (14 variantes, 13 obtenables) : plus petits, sans mèche.

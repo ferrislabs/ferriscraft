@@ -2,10 +2,10 @@ use rspigot_plugin::Material;
 
 use crate::domain::{PlayerId, SheepKind, TeamId};
 use crate::sheep::{
-    Action, SEEKER_DETONATE_DISTANCE, SEEKER_FUSE_TICKS, SEEKER_RUN_SPEED, TORPEDO_CLEAR_RADIUS,
-    TORPEDO_MAX_FLIGHT_TICKS, TORPEDO_SPEED, TORPEDO_TRIGGER_RADIUS, Vec3, chases_after_impact,
-    display_name, flies_straight, launch_power, launch_velocity, sheep_wool, step_ballistic,
-    throw_velocity,
+    Action, FRAGMENT_LANDING_GRACE_TICKS, SEEKER_DETONATE_DISTANCE, SEEKER_FUSE_TICKS,
+    SEEKER_RUN_SPEED, TORPEDO_CLEAR_RADIUS, TORPEDO_MAX_FLIGHT_TICKS, TORPEDO_SPEED,
+    TORPEDO_TRIGGER_RADIUS, Vec3, chases_after_impact, display_name, flies_straight, launch_power,
+    launch_velocity, sheep_wool, step_ballistic, throw_velocity,
 };
 
 pub const MAX_CONCURRENT_FLIGHTS: usize = 32;
@@ -31,7 +31,20 @@ pub const fn arms_on_impact(kind: SheepKind) -> bool {
     !(matches!(
         kind,
         SheepKind::Healing | SheepKind::Boarding | SheepKind::Torpedo
-    ) || starts_effect(kind))
+    ) || starts_effect(kind)
+        || is_fragment(kind))
+}
+
+pub const fn is_fragment(kind: SheepKind) -> bool {
+    matches!(kind, SheepKind::Fragment)
+}
+
+pub const fn landing_grace_ticks(kind: SheepKind) -> u32 {
+    if is_fragment(kind) {
+        FRAGMENT_LANDING_GRACE_TICKS
+    } else {
+        LANDING_GRACE_TICKS
+    }
 }
 
 pub const fn starts_effect(kind: SheepKind) -> bool {
@@ -118,7 +131,7 @@ impl Flight {
             return self.age >= TORPEDO_MAX_FLIGHT_TICKS;
         }
         let hit = on_ground || (wall_hit && !waits_for_ground(self.kind));
-        (hit && self.age >= LANDING_GRACE_TICKS) || self.age >= MAX_FLIGHT_TICKS
+        (hit && self.age >= landing_grace_ticks(self.kind)) || self.age >= MAX_FLIGHT_TICKS
     }
 }
 
@@ -266,6 +279,23 @@ mod tests {
         assert!(starts_effect(SheepKind::Warp));
         assert!(starts_effect(SheepKind::Intergalactic));
         assert!(!starts_effect(SheepKind::Explosive));
+    }
+
+    #[test]
+    fn a_fragment_lands_on_its_first_ground_contact_without_a_fuse() {
+        assert!(!arms_on_impact(SheepKind::Fragment));
+        let grace = landing_grace_ticks(SheepKind::Fragment);
+        assert!(grace > LANDING_GRACE_TICKS);
+        assert!(!flight(SheepKind::Fragment, grace - 1).should_land(true, false));
+        assert!(flight(SheepKind::Fragment, grace).should_land(true, false));
+        assert!(!flight(SheepKind::Fragment, grace).should_land(false, false));
+    }
+
+    #[test]
+    fn only_the_fragment_has_a_longer_landing_grace() {
+        for kind in SheepKind::ALL {
+            assert_eq!(landing_grace_ticks(kind), LANDING_GRACE_TICKS);
+        }
     }
 
     #[test]
