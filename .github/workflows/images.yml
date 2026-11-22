@@ -102,3 +102,50 @@ jobs:
           EXTRA_TAG: ${{ github.sha }}
           RSPIGOT_DIR: ${{ github.workspace }}/rspigot
           RSPIGOT_REF: ${{ steps.rspigot.outputs.ref }}
+
+  # Deploys to prod: writes the new commit into infra, Argo CD does the rest.
+  # The chart is read from this repository at that same commit, so both
+  # infra files move together. Runs once every image is pushed, only for main.
+  bump-infra:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: images
+    runs-on: ubuntu-latest
+    permissions: {}
+    # Two merges close together must bump one after the other, never race.
+    concurrency:
+      group: bump-infra
+      cancel-in-progress: false
+    steps:
+      - name: Checkout infra
+        uses: actions/checkout@v4
+        with:
+          repository: ferrislabs/infra
+          ref: main
+          token: ${{ secrets.INFRA_BOT_TOKEN }}
+
+      - name: Bump chart and image commit
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          yq -i '.global.imageTag = strenv(SHA)' apps/ferriscraft/images.yaml
+          yq -i '(.spec.sources[] | select(.repoURL == "https://github.com/ferrislabs/ferriscraft") | .targetRevision) = strenv(SHA)' argocd/apps/ferriscraft.yaml
+          grep -q "imageTag: ${SHA}" apps/ferriscraft/images.yaml
+          grep -q "targetRevision: ${SHA}" argocd/apps/ferriscraft.yaml
+
+      - name: Commit and push
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          if git diff --quiet; then
+            echo "infra already at ${SHA::7}, nothing to do"
+            exit 0
+          fi
+          git config user.name "ferriscraft-ci"
+          git config user.email "ferriscraft-ci@users.noreply.github.com"
+          git commit -am "chore(ferriscraft): deploy sha-${SHA::7}"
+          for attempt in 1 2 3; do
+            git push origin HEAD:main && exit 0
+            git pull --rebase origin main
+          done
+          echo "could not push the bump after 3 attempts" >&2
+          exit 1
