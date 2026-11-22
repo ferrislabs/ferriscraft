@@ -27,6 +27,9 @@ use crate::menus::{
     GadgetsMenuAction, GamesMenuAction, MenuManager, OptionsMenuAction, apply_lobby_hotbar,
     decode_gadgets_click, decode_games_click, decode_options_click,
 };
+use crate::npcs::{CaptainTurn, NpcClickTarget, NpcDirector};
+use crate::orchestrator::{OrchestratorClient, OrchestratorClientError, ToggleQueueOutcome};
+use crate::prefs::PrefsStore;
 use crate::profile::{
     ProfileCache, ShopItemState, can_grant_coins, equipped_gadget, equipped_trail, error_message,
     gadget_usable, locked_cosmetic_message, next_usable_trail, requirement_message,
@@ -36,9 +39,6 @@ use crate::progress_menus::{
     ProfileMenuAction, ProgressMenuKind, ShopMenuAction, cosmetic_title, decode_profile_click,
     decode_shop_click,
 };
-use crate::npcs::{CaptainTurn, NpcClickTarget, NpcDirector};
-use crate::orchestrator::{OrchestratorClient, OrchestratorClientError, ToggleQueueOutcome};
-use crate::prefs::PrefsStore;
 use crate::servers_menu::decode_servers_slot;
 
 const MAX_TASK_TITLE: u32 = 120;
@@ -163,9 +163,7 @@ impl FerrisCraftLobby {
             self.state
                 .menus
                 .refresh_open_gadgets(player.uuid, &prefs, profile);
-            self.state
-                .menus
-                .refresh_open_progress(player.uuid, profile);
+            self.state.menus.refresh_open_progress(player.uuid, profile);
         });
 
         let (ping_ms, is_op) = match player.get_state().await {
@@ -293,10 +291,9 @@ impl FerrisCraftLobby {
                             .volume(0.8)
                             .pitch(1.3),
                     );
-                    player.message.send(format!(
-                        "§a✔ Achat réussi : {}",
-                        cosmetic_title(cosmetic)
-                    ));
+                    player
+                        .message
+                        .send(format!("§a✔ Achat réussi : {}", cosmetic_title(cosmetic)));
                     lobby.refresh_single_player_ui(&player).await;
                 }
                 Err(err) => player.message.send(error_message(&err)),
@@ -319,10 +316,9 @@ impl FerrisCraftLobby {
                             .volume(0.75)
                             .pitch(1.2),
                     );
-                    player.action_bar.send(format!(
-                        "{} §aéquipé !",
-                        cosmetic_title(cosmetic)
-                    ));
+                    player
+                        .action_bar
+                        .send(format!("{} §aéquipé !", cosmetic_title(cosmetic)));
                     lobby.refresh_single_player_ui(&player).await;
                 }
                 Err(err) => player.message.send(error_message(&err)),
