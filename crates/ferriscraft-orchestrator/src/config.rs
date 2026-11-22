@@ -143,7 +143,7 @@ impl OrchestratorConfig {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(16)
             .max(1);
-        let queue_min_players = parse_usize_env("QUEUE_MIN_PLAYERS", 2)
+        let queue_min_players = parse_usize_env("QUEUE_MIN_PLAYERS", 1)
             .max(1)
             .min(max_players_per_server as usize);
 

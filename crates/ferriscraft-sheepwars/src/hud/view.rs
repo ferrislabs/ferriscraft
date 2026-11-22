@@ -42,9 +42,17 @@ fn countdown_seconds(remaining: u32) -> u32 {
     remaining.div_ceil(TICKS_PER_SECOND)
 }
 
-fn phase_line(phase: Phase) -> String {
-    match phase {
-        Phase::Waiting => "§7En attente de joueurs".to_owned(),
+fn waiting_count(round: &Round) -> String {
+    format!(
+        "§f{}§7/§f{}",
+        round.player_count(),
+        round.rules().min_players
+    )
+}
+
+fn phase_line(round: &Round) -> String {
+    match round.phase() {
+        Phase::Waiting => format!("§7En attente {}", waiting_count(round)),
         Phase::Countdown { remaining } => {
             format!("§eDébut dans §f{}s", countdown_seconds(remaining))
         }
@@ -57,11 +65,7 @@ fn phase_line(phase: Phase) -> String {
 }
 
 pub fn sidebar_lines(round: &Round, viewer: Option<PlayerId>) -> Vec<String> {
-    let mut lines = vec![
-        "§r".to_owned(),
-        phase_line(round.phase()),
-        "§r§r".to_owned(),
-    ];
+    let mut lines = vec!["§r".to_owned(), phase_line(round), "§r§r".to_owned()];
     for id in TeamId::ALL {
         lines.push(format!(
             "{}{} §f: {}",
@@ -83,7 +87,7 @@ pub fn sidebar_lines(round: &Round, viewer: Option<PlayerId>) -> Vec<String> {
 
 pub fn bossbar_title(round: &Round) -> String {
     match round.phase() {
-        Phase::Waiting => "§dSheepWars §7- en attente de joueurs".to_owned(),
+        Phase::Waiting => format!("§dSheepWars §7- en attente {}", waiting_count(round)),
         Phase::Countdown { remaining } => {
             format!(
                 "§dSheepWars §7- début dans §f{}s",
@@ -299,5 +303,18 @@ mod tests {
         assert_eq!(bossbar_progress(&round), 0.0);
         round.tick();
         assert_eq!(bossbar_progress(&round), 0.0);
+    }
+
+    #[test]
+    fn waiting_lobby_shows_player_count_and_minimum() {
+        let lines = sidebar_lines(&waiting(), Some(player(1)));
+        assert!(
+            lines.iter().any(|line| line == "§7En attente §f1§7/§f2"),
+            "{lines:?}"
+        );
+        assert_eq!(
+            bossbar_title(&waiting()),
+            "§dSheepWars §7- en attente §f1§7/§f2"
+        );
     }
 }

@@ -1444,4 +1444,64 @@ mod tests {
         )));
         assert!(deleted(&actions).is_empty());
     }
+
+    fn transfer_targets(actions: &TickActions) -> Vec<(Uuid, &str)> {
+        actions
+            .proxy_events
+            .iter()
+            .filter_map(|event| match event {
+                ProxyEvent::TransferPlayer {
+                    player_uuid,
+                    target_server,
+                    ..
+                } => Some((*player_uuid, target_server.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn queue(engine: &mut FleetEngine, now: Instant, n: u128) {
+        engine.join_queue(
+            now,
+            JoinQueueRequest {
+                player_uuid: Uuid::from_u128(n),
+                player_name: format!("p{n}"),
+            },
+        );
+    }
+
+    #[test]
+    fn with_a_minimum_of_one_a_lone_player_goes_straight_to_a_waiting_server() {
+        let mut engine = FleetEngine::new(FleetPolicy {
+            queue_min_players: 1,
+            ..test_policy()
+        });
+        let t0 = Instant::now();
+        waiting(&mut engine, t0, "sheepwars-1");
+        queue(&mut engine, t0, 10);
+        assert_eq!(
+            transfer_targets(&engine.tick(t0)),
+            [(Uuid::from_u128(10), "sheepwars-1")]
+        );
+    }
+
+    #[test]
+    fn later_players_join_the_server_that_already_has_someone_waiting() {
+        let mut engine = FleetEngine::new(FleetPolicy {
+            queue_min_players: 1,
+            ..test_policy()
+        });
+        let t0 = Instant::now();
+        waiting(&mut engine, t0, "sheepwars-1");
+        waiting(&mut engine, t0, "sheepwars-2");
+        heartbeat(&mut engine, t0, "sheepwars-2", ServerPhase::Waiting, 1);
+        queue(&mut engine, t0, 10);
+        queue(&mut engine, t0, 11);
+        let actions = engine.tick(t0);
+        let targets: Vec<&str> = transfer_targets(&actions)
+            .into_iter()
+            .map(|(_, server)| server)
+            .collect();
+        assert_eq!(targets, ["sheepwars-2", "sheepwars-2"]);
+    }
 }

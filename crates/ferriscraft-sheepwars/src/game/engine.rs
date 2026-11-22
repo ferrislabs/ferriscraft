@@ -36,6 +36,8 @@ use crate::sheep::{
 pub const HUD_REFRESH_TICKS: u64 = 5;
 pub const ACTION_BAR_REFRESH_TICKS: u64 = 20;
 const HEARTBEAT_FAILURE_LOG_EVERY: Duration = Duration::from_secs(30);
+pub const HUB_ITEM: Material = Material::RedBed;
+const HUB_ITEM_SLOT: InventorySlot = InventorySlot::Hotbar(8);
 
 pub fn player_id(uuid: Uuid) -> PlayerId {
     PlayerId(uuid.as_u128())
@@ -557,6 +559,7 @@ impl Game {
                     self.lock().hud.add_player(team, &player.name);
                     player.game_mode.set(GameMode::Survival);
                     player.inventory.clear();
+                    give_hub_item(&player);
                     player.health.set(20.0);
                     player.food.set_level(20);
                     player.food.set_saturation(5.0);
@@ -1222,6 +1225,13 @@ impl Game {
             }
         }
     }
+}
+
+fn give_hub_item(player: &Player) {
+    player.inventory.set(SlotItem::new(
+        HUB_ITEM_SLOT,
+        Some(ItemStack::new(HUB_ITEM, 1).name("§cRetour au Hub §7(clic droit)")),
+    ));
 }
 
 fn give_starter_kit(player: &Player) {

@@ -9,7 +9,7 @@ use tokio::time::MissedTickBehavior;
 use crate::SheepWarsConfig;
 use crate::arena::{Arena, Layout, Platform};
 use crate::config::load_settings;
-use crate::game::{EndBehavior, Game, Session, VoidVerdict, kind_of};
+use crate::game::{EndBehavior, Game, HUB_ITEM, Session, VoidVerdict, kind_of};
 use crate::hud::{Hud, bossbar_title};
 use crate::orchestrator::SheepWarsOrchestratorClient;
 
@@ -293,6 +293,12 @@ impl SheepWarsPlugin {
             Action::RightClickAir | Action::RightClickBlock
         );
         if !right_click || event.hand() != Some(EquipmentSlot::Hand) {
+            return;
+        }
+        if event.material() == HUB_ITEM {
+            event.cancel();
+            let player = event.player().clone();
+            tokio::spawn(async move { game.send_player_hub(&player).await });
             return;
         }
         let Some(kind) = kind_of(event.material()) else {

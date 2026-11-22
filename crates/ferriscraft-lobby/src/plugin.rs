@@ -435,18 +435,18 @@ impl FerrisCraftLobby {
                                     .pitch(1.3),
                             );
                             player.action_bar.send(format!(
-                                "§d§lSheepWars §8• §aFile #{}/{} §7(min §f{}§7 • §b{}/{} srv§7)",
+                                "§d§lSheepWars §8• §aFile #{}/{}{} §7(§b{}/{} srv§7)",
                                 resp.position,
                                 resp.total_queued.max(1),
-                                resp.min_players,
+                                queue_min_hint(resp.min_players),
                                 resp.ready_servers,
                                 resp.max_servers
                             ));
                             player.message.send(format!(
-                                "§d§lSheepWars §8» §aFile d'attente rejointe (§f#{}§a, §f{}§a/§f{} min§a — §b{}§a prêt(s) / §f{} max§a). Recliquez pour quitter.",
+                                "§d§lSheepWars §8» §aFile d'attente rejointe (§f#{}§a/§f{}§a{} — §b{}§a prêt(s) / §f{} max§a). Recliquez pour quitter.",
                                 resp.position,
                                 resp.total_queued,
-                                resp.min_players,
+                                queue_min_hint(resp.min_players),
                                 resp.ready_servers,
                                 resp.max_servers
                             ));
@@ -1266,6 +1266,14 @@ impl FerrisCraftLobby {
     }
 }
 
+fn queue_min_hint(min_players: usize) -> String {
+    if min_players > 1 {
+        format!(" §7(min §f{min_players}§7)")
+    } else {
+        String::new()
+    }
+}
+
 fn json_field(payload: &serde_json::Value, key: &str) -> String {
     payload
         .get(key)
@@ -1331,8 +1339,10 @@ impl FerrisCraftLobby {
                                     format!("§7{}/{} max", snap.in_game_servers, snap.max_replicas)
                                 };
                                 p.action_bar.send(format!(
-                                    "§d§lSheepWars §8• §aFile #{}/{} §7(min §f{}§7) §8• {state_hint}",
-                                    qp.position, snap.queue_len, snap.min_players
+                                    "§d§lSheepWars §8• §aFile #{}/{}{} §8• {state_hint}",
+                                    qp.position,
+                                    snap.queue_len,
+                                    queue_min_hint(snap.min_players)
                                 ));
                             }
                         }

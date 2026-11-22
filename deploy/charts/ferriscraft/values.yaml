@@ -45,7 +45,7 @@ orchestrator:
   port: 8080
   logLevel: info
   queue:
-    minPlayers: 2
+    minPlayers: 1
   sheepwars:
     # Nombre minimum de serveurs chauds (0 = scale-to-zero)
     minReplicas: 1
