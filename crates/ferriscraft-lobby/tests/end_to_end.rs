@@ -966,7 +966,7 @@ fn lobby_spawns_pedestals_living_npcs_rich_chat_and_per_player_ferriskey_capitai
         alice.abilities_after(cmd_fly_cursor, |ab| !ab.may_fly)
     });
 
-    // 10. /gadgets menu -> cycle Trail (22), equip SheepCannon (12), fire it, then FeatherDash (10)
+    // 10. /gadgets menu -> cycle Trail (22), equip FireworkRocket (11, free offline), fire it, then FeatherDash (10)
     let gad_cursor = alice.log_cursor();
     send_input(
         &mut core.server,
@@ -999,19 +999,19 @@ fn lobby_spawns_pedestals_living_npcs_rich_chat_and_per_player_ferriskey_capitai
         PlayerInput::ContainerClick(ContainerClick {
             container: gad_win,
             state_id: gad_state,
-            slot: 12, // GAD_SLOT_SHEEP
+            slot: 11, // GAD_SLOT_ROCKET
             button: 0,
             input: ClickInput::Pickup,
             changed: Vec::new(),
             carried: HashedSlot::EMPTY,
         }),
     );
-    core.run_until("Alice equips SheepCannon from Gadgets menu", |_| {
-        alice.said("Canon à Moutons")
+    core.run_until("Alice equips FireworkRocket from Gadgets menu", |_| {
+        alice.said("Fusée d'Artifice")
     });
     send_input(&mut core.server, &alice, PlayerInput::ContainerClose(gad_win));
 
-    // Activate SheepCannon from slot 6 -> spawns a Sheep entity & particles
+    // Activate FireworkRocket from slot 6 -> spawns a rocket entity & particles
     let sheep_cursor = alice.log_cursor();
     send_input(&mut core.server, &alice, PlayerInput::HeldSlot(6));
     send_input(
@@ -1023,7 +1023,7 @@ fn lobby_spawns_pedestals_living_npcs_rich_chat_and_per_player_ferriskey_capitai
             rotation: Rotation::default(),
         },
     );
-    core.run_until("SheepCannon spawns sheep and particles", |_| {
+    core.run_until("FireworkRocket spawns an entity and particles", |_| {
         alice.has_sheep_spawn_after(sheep_cursor) && alice.has_particle_after(sheep_cursor)
     });
 

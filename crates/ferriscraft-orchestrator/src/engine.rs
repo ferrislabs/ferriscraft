@@ -66,6 +66,7 @@ struct ManagedServer {
     outdated: bool,
     version: Option<String>,
     registered_on_proxy: bool,
+    seen_players: HashSet<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -286,6 +287,7 @@ impl FleetEngine {
                 outdated: false,
                 version: None,
                 registered_on_proxy: false,
+                seen_players: HashSet::new(),
             });
     }
 
@@ -319,6 +321,7 @@ impl FleetEngine {
                 outdated: false,
                 version: None,
                 registered_on_proxy: false,
+                seen_players: HashSet::new(),
             });
 
         if pod_name.is_some() {
@@ -373,6 +376,14 @@ impl FleetEngine {
         }
     }
 
+    #[must_use]
+    pub fn seen_players(&self, server_id: &str) -> HashSet<Uuid> {
+        self.servers
+            .get(server_id)
+            .map(|server| server.seen_players.clone())
+            .unwrap_or_default()
+    }
+
     pub fn mark_outdated(&mut self, server_id: &str) {
         if let Some(server) = self.servers.get_mut(server_id) {
             server.outdated = true;
@@ -416,6 +427,7 @@ impl FleetEngine {
                 outdated: false,
                 version: None,
                 registered_on_proxy: false,
+                seen_players: HashSet::new(),
             });
 
         let addr_changed = req.address.is_some() && entry.address != req.address;
@@ -441,6 +453,7 @@ impl FleetEngine {
         }
 
         // Clear matching active transfers once the game server reports the player connected.
+        entry.seen_players.extend(req.player_uuids.iter().copied());
         for uuid in &req.player_uuids {
             if let Some(tid) = self.player_transfers.get(uuid).copied()
                 && self
@@ -1318,6 +1331,22 @@ mod tests {
             .iter()
             .map(|d| (d.server_id.as_str(), d.reason))
             .collect()
+    }
+
+    #[test]
+    fn seen_players_accumulate_while_the_server_is_known() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        infra(&mut engine, t0, "sheepwars-1");
+        heartbeat(&mut engine, t0, "sheepwars-1", ServerPhase::InGame, 2);
+        heartbeat(&mut engine, t0, "sheepwars-1", ServerPhase::InGame, 1);
+        let seen = engine.seen_players("sheepwars-1");
+        assert_eq!(seen.len(), 2);
+        assert!(seen.contains(&Uuid::from_u128(1)));
+        assert!(seen.contains(&Uuid::from_u128(2)));
+        assert!(engine.seen_players("unknown").is_empty());
+        engine.remove_server("sheepwars-1");
+        assert!(engine.seen_players("sheepwars-1").is_empty());
     }
 
     #[test]

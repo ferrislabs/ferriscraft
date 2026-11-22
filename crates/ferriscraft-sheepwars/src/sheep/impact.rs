@@ -52,6 +52,9 @@ pub enum ParticleKind {
     EndRod,
     Firework,
     Totem,
+    Note,
+    ElectricSpark,
+    Rainbow(u8),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

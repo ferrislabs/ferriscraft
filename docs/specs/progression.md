@@ -110,14 +110,14 @@ Emplacements d'équipement : `LobbyGadget`, `LobbyTrail`, `SheepTrail`, `Victory
 
 | Port | Propriétaire | Dispatch | Rôle |
 |---|---|---|---|
-| `ProgressionRepository` | orchestrateur | générique statique | enregistrer un rapport et ses crédits (atomique, idempotent), lire un profil, mettre à jour pseudo et grade, acheter, équiper, créditer (admin) |
+| `ProgressionRepository` | `ferriscraft-progression` (domaine) | générique statique, enum `ProgressionStore` dans l'orchestrateur | `load`, `update` (applique une closure du domaine sur un joueur, atomique), `settle_match` (crédite un rapport, atomique et idempotent sur `match_id`), `ledger` |
 
 Les plugins n'ont pas de nouveau port. Ils étendent leur client orchestrateur existant (`crates/ferriscraft-{lobby,sheepwars}/src/orchestrator.rs`).
 
 ### Adapters
 
-- `ProgressionRepository` mémoire : tests et dev local sans Postgres.
-- `ProgressionRepository` Postgres (`sqlx`) : base `progression` du cluster CNPG. Achat et crédit dans une transaction avec `SELECT … FOR UPDATE` sur la ligne du joueur.
+- `MemoryProgressionRepository` (crate domaine) : tests et dev local sans Postgres.
+- `PgProgressionRepository` (crate `ferriscraft-progression-pg`, `sqlx`) : base `progression` du cluster CNPG. Chaque `update` et `settle_match` tourne dans une transaction avec `SELECT … FOR UPDATE` sur les lignes des joueurs. Le binaire `ferriscraft-migrate` applique les migrations.
 
 Schéma (migrations expand puis contract, comme `plc`) :
 
@@ -127,7 +127,7 @@ Schéma (migrations expand puis contract, comme `plc`) :
 | `game_progress` | (`uuid`, `game`) PK, `xp`, `played`, `wins`, `losses`, `draws` |
 | `coin_ledger` | `id`, `uuid`, `delta` (signé), `reason`, `match_id` ou `cosmetic` ou `admin`, `created_at` |
 | `coin_balance` | `uuid` PK, `coins` avec `CHECK (coins >= 0)`, mis à jour dans la même transaction que le journal |
-| `matches` | `match_id` PK, `game`, `server_id`, `reported_at` |
+| `matches` | `match_id` PK, `game`, `server_id`, `reported_at`, `ack` (JSON de l'accusé, renvoyé tel quel sur un rejeu) |
 | `unlocks` | (`uuid`, `cosmetic`) PK, `source`, `unlocked_at` |
 | `equipped` | (`uuid`, `slot`) PK, `cosmetic` |
 
@@ -270,7 +270,7 @@ Non. La seule concurrence (achats et crédits simultanés) est confinée dans de
 
 | # | Nom | Mission | Dépend de | Fichiers |
 |---|---|---|---|---|
-| W0 | Postgres | Cluster CNPG et Job de migration dans le chart, base `progression` | `plc` W6 (même cluster) | `deploy/charts/ferriscraft/**` |
+| W0 | Postgres | Cluster CNPG `ferriscraft-db` (base `progression`) dans l'app `ferriscraft-deps` du dépôt infra, comme FerrisKey. Le chart ajoute le Job de migration (hook `PreSync`) et `PROGRESSION_DATABASE_URL` depuis le Secret `ferriscraft-db-app` | — | `deploy/charts/ferriscraft/**`, dépôt infra `apps/ferriscraft/database.yaml` |
 | W1 | Domaine | Crate `ferriscraft-progression` : newtypes, courbes, règles, catalogue, tests de propriété | — | `crates/ferriscraft-progression/**`, `Cargo.toml` |
 | W2 | Contrats | DTO de progression dans `ferriscraft-protocol` | W1 | `crates/ferriscraft-protocol/src/lib.rs` |
 | W3 | Orchestrateur | `ProgressionRepository` mémoire et Postgres, migrations, routes HTTP | W1, W2, W0 pour Postgres | `crates/ferriscraft-orchestrator/src/{api,progression/*}.rs`, `crates/ferriscraft-orchestrator/migrations/` |

@@ -9,8 +9,11 @@ use rspigot_plugin::{
 use crate::auth::UserClaims;
 use crate::gadgets::LobbyGadget;
 use crate::prefs::PlayerPrefs;
+use crate::profile::{gadget_usable, unlock_label};
+use crate::progress_menus::{ProgressMenuKind, populate_progress_menu};
 use crate::servers_menu::{SERVERS_ROWS, populate_servers_menu, sorted_server_ids};
-use ferriscraft_protocol::FleetStatusSnapshot;
+use ferriscraft_progression::Catalog;
+use ferriscraft_protocol::{FleetStatusSnapshot, PlayerProfile};
 
 pub const HOTBAR_GAMES_SLOT: u8 = 0;
 pub const HOTBAR_SHEEPWARS_SLOT: u8 = 1;
@@ -28,6 +31,8 @@ pub const SLOT_SHEEPWARS: u16 = 13;
 pub const SLOT_PITCHOUT: u16 = 20;
 pub const SLOT_FK: u16 = 21;
 pub const SLOT_PVPSWAP: u16 = 23;
+pub const SLOT_OPEN_PROFILE: u16 = 30;
+pub const SLOT_OPEN_SHOP: u16 = 32;
 pub const SLOT_MOUTRON: u16 = 24;
 pub const SLOT_OPEN_GADGETS: u16 = 37;
 pub const SLOT_TP_SPAWN: u16 = 38;
@@ -60,6 +65,8 @@ pub enum GamesMenuAction {
     JoinSheepWars,
     ComingSoon(&'static str),
     OpenGadgets,
+    OpenProfile,
+    OpenShop,
     TeleportPoi(&'static str),
     OpenOptions,
 }
@@ -93,6 +100,8 @@ pub fn decode_games_click(slot: i32) -> Option<GamesMenuAction> {
         SLOT_PVPSWAP => Some(GamesMenuAction::ComingSoon("PvP Swap")),
         SLOT_MOUTRON => Some(GamesMenuAction::ComingSoon("Moutron")),
         SLOT_OPEN_GADGETS => Some(GamesMenuAction::OpenGadgets),
+        SLOT_OPEN_PROFILE => Some(GamesMenuAction::OpenProfile),
+        SLOT_OPEN_SHOP => Some(GamesMenuAction::OpenShop),
         SLOT_TP_SPAWN => Some(GamesMenuAction::TeleportPoi("spawn")),
         SLOT_TP_PORTAL => Some(GamesMenuAction::TeleportPoi("portal")),
         SLOT_TP_CAPITAINERIE => Some(GamesMenuAction::TeleportPoi("capitainerie")),
@@ -221,7 +230,7 @@ pub fn apply_lobby_hotbar(player: &Player, claims: Option<&UserClaims>, prefs: &
     ));
 }
 
-fn fill_border(inv: &CustomInventory, rows: u8, accent: Material, neutral: Material) {
+pub(crate) fn fill_border(inv: &CustomInventory, rows: u8, accent: Material, neutral: Material) {
     let total = u16::from(rows) * 9;
     let accent_pane = ItemStack::new(accent, 1).name("§8 ");
     let neutral_pane = ItemStack::new(neutral, 1).name("§8 ");
@@ -323,6 +332,28 @@ pub fn populate_games_menu(inv: &CustomInventory, queued_sheepwars: usize) {
         ),
     );
 
+    inv.set(
+        SLOT_OPEN_PROFILE,
+        Some(
+            ItemStack::new(Material::Emerald, 1)
+                .name("§6§l✦ Profil")
+                .lore([
+                    "§7Level réseau, level et statistiques",
+                    "§7de chaque mini-jeu.",
+                ]),
+        ),
+    );
+    inv.set(
+        SLOT_OPEN_SHOP,
+        Some(
+            ItemStack::new(Material::GoldIngot, 1)
+                .name("§a§l✦ Boutique")
+                .lore([
+                    "§7Dépensez vos coins en gadgets, traînées",
+                    "§7et effets de victoire.",
+                ]),
+        ),
+    );
     inv.set(
         SLOT_OPEN_GADGETS,
         Some(
@@ -514,7 +545,11 @@ pub fn populate_options_menu(
     );
 }
 
-pub fn populate_gadgets_menu(inv: &CustomInventory, prefs: &PlayerPrefs) {
+pub fn populate_gadgets_menu(
+    inv: &CustomInventory,
+    prefs: &PlayerPrefs,
+    profile: Option<&PlayerProfile>,
+) {
     fill_border(
         inv,
         GADGETS_ROWS,
@@ -533,24 +568,32 @@ pub fn populate_gadgets_menu(inv: &CustomInventory, prefs: &PlayerPrefs) {
 
     for (slot, gadget) in gadget_slots {
         let equipped = prefs.equipped_gadget == Some(gadget);
+        let usable = gadget_usable(profile, gadget);
         let [line1, line2] = gadget.description();
         let cd_secs = gadget.cooldown().as_secs_f32();
+        let action_line = if equipped {
+            "§a✔ Actuellement dans votre main (slot 7)".to_owned()
+        } else if usable {
+            "§e▶ Cliquez pour équiper".to_owned()
+        } else {
+            let requirement = Catalog::entry(gadget.cosmetic())
+                .map_or_else(|| "Verrouillé".to_owned(), |e| unlock_label(e.unlock));
+            format!("§c✖ {requirement} §8(/boutique)")
+        };
         let mut item = ItemStack::new(gadget.material(), 1)
             .name(if equipped {
                 format!("{} §a§l[ÉQUIPÉ]", gadget.title())
-            } else {
+            } else if usable {
                 gadget.title().to_owned()
+            } else {
+                format!("{} §c§l[VERROUILLÉ]", gadget.title())
             })
             .lore([
                 line1.to_owned(),
                 line2.to_owned(),
                 String::new(),
                 format!("§7Recharge : §f{cd_secs:.1}s"),
-                if equipped {
-                    "§a✔ Actuellement dans votre main (slot 7)".to_owned()
-                } else {
-                    "§e▶ Cliquez pour équiper".to_owned()
-                },
+                action_line,
             ]);
         if equipped {
             item = item.enchant(Enchantment::Unbreaking, 1);
@@ -602,6 +645,7 @@ pub fn populate_gadgets_menu(inv: &CustomInventory, prefs: &PlayerPrefs) {
             "§7lorsque vous explorez le Hub.",
             "",
             "§e▶ Cliquez pour changer de traînée",
+            "§8Les traînées verrouillées sont dans /boutique",
         ]);
     inv.set(GAD_SLOT_TRAIL, Some(trail_item));
 
@@ -638,6 +682,7 @@ pub struct MenuManager {
     options_menus: RwLock<HashMap<Uuid, CustomInventory>>,
     gadgets_menus: RwLock<HashMap<Uuid, CustomInventory>>,
     servers_menus: RwLock<HashMap<Uuid, (CustomInventory, Vec<String>)>>,
+    progress_menus: RwLock<HashMap<Uuid, (CustomInventory, ProgressMenuKind)>>,
 }
 
 impl MenuManager {
@@ -711,12 +756,13 @@ impl MenuManager {
         server: &Server,
         player: &Player,
         prefs: &PlayerPrefs,
+        profile: Option<&PlayerProfile>,
     ) -> Result<(), Error> {
         self.discard_gadgets(player.uuid);
         let inv = server
             .create_inventory(GADGETS_ROWS, "§b§lFerrisCraft §8• §fGadgets")
             .await?;
-        populate_gadgets_menu(&inv, prefs);
+        populate_gadgets_menu(&inv, prefs, profile);
         self.gadgets_menus
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -724,7 +770,12 @@ impl MenuManager {
         player.inventory.open(&inv).await
     }
 
-    pub fn refresh_open_gadgets(&self, player_uuid: Uuid, prefs: &PlayerPrefs) {
+    pub fn refresh_open_gadgets(
+        &self,
+        player_uuid: Uuid,
+        prefs: &PlayerPrefs,
+        profile: Option<&PlayerProfile>,
+    ) {
         let inv = self
             .gadgets_menus
             .read()
@@ -732,7 +783,75 @@ impl MenuManager {
             .get(&player_uuid)
             .cloned();
         if let Some(inv) = inv {
-            populate_gadgets_menu(&inv, prefs);
+            populate_gadgets_menu(&inv, prefs, profile);
+        }
+    }
+
+    pub async fn open_progress(
+        &self,
+        server: &Server,
+        player: &Player,
+        kind: ProgressMenuKind,
+        profile: Option<&PlayerProfile>,
+    ) -> Result<(), Error> {
+        self.discard_progress(player.uuid);
+        let inv = server.create_inventory(kind.rows(), kind.title()).await?;
+        populate_progress_menu(&inv, kind, profile);
+        self.progress_menus
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(player.uuid, (inv.clone(), kind));
+        player.inventory.open(&inv).await
+    }
+
+    pub fn progress_menu_kind(
+        &self,
+        player_uuid: Uuid,
+        inv_ref: Option<&InventoryRef>,
+    ) -> Option<ProgressMenuKind> {
+        let custom = inv_ref.and_then(InventoryRef::custom)?;
+        self.progress_menus
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&player_uuid)
+            .filter(|(known, _)| known == custom)
+            .map(|(_, kind)| *kind)
+    }
+
+    pub fn show_progress_page(
+        &self,
+        player_uuid: Uuid,
+        kind: ProgressMenuKind,
+        profile: Option<&PlayerProfile>,
+    ) {
+        let mut guard = self
+            .progress_menus
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((inv, current)) = guard.get_mut(&player_uuid) {
+            *current = kind;
+            populate_progress_menu(inv, kind, profile);
+        }
+    }
+
+    pub fn refresh_open_progress(&self, player_uuid: Uuid, profile: Option<&PlayerProfile>) {
+        let guard = self
+            .progress_menus
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((inv, kind)) = guard.get(&player_uuid) {
+            populate_progress_menu(inv, *kind, profile);
+        }
+    }
+
+    pub fn discard_progress(&self, player_uuid: Uuid) {
+        if let Some((removed, _)) = self
+            .progress_menus
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&player_uuid)
+        {
+            removed.discard();
         }
     }
 
@@ -860,6 +979,17 @@ impl MenuManager {
         {
             removed.discard();
         }
+        drop(srv_guard);
+
+        let mut prg_guard = self
+            .progress_menus
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if prg_guard.get(&player_uuid).map(|(inv, _)| inv) == Some(custom)
+            && let Some((removed, _)) = prg_guard.remove(&player_uuid)
+        {
+            removed.discard();
+        }
     }
 
     pub fn discard_options(&self, player_uuid: Uuid) {
@@ -906,6 +1036,14 @@ mod tests {
         assert_eq!(
             decode_games_click(i32::from(SLOT_OPEN_OPTIONS)),
             Some(GamesMenuAction::OpenOptions)
+        );
+        assert_eq!(
+            decode_games_click(i32::from(SLOT_OPEN_PROFILE)),
+            Some(GamesMenuAction::OpenProfile)
+        );
+        assert_eq!(
+            decode_games_click(i32::from(SLOT_OPEN_SHOP)),
+            Some(GamesMenuAction::OpenShop)
         );
         assert_eq!(decode_games_click(0), None);
 

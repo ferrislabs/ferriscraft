@@ -1,3 +1,4 @@
+use super::report::RoundSummary;
 use crate::arena::Point;
 use crate::domain::{PlayerId, SheepKind, TeamId};
 
@@ -19,5 +20,6 @@ pub enum Intent {
     ReturnAllToLobby { reason: String },
     SendToLobby { player: PlayerId, reason: String },
     EndServer,
+    SubmitReport(RoundSummary),
     Reset,
 }

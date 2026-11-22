@@ -41,11 +41,13 @@ FROM chef AS orchestrator-src
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ferriscraft-protocol ./crates/ferriscraft-protocol
+COPY crates/ferriscraft-progression ./crates/ferriscraft-progression
+COPY crates/ferriscraft-progression-pg ./crates/ferriscraft-progression-pg
 COPY crates/ferriscraft-orchestrator ./crates/ferriscraft-orchestrator
 
 # Build only orchestrator + protocol without requiring rspigot path deps
 RUN python3 -c 'txt = open("Cargo.toml").read(); open("Cargo.toml", "w").write("\n".join(l for l in txt.splitlines() if "rspigot-" not in l) + "\n")' \
-    && sed -i 's/members = \["crates\/\*"\]/members = ["crates\/ferriscraft-protocol", "crates\/ferriscraft-orchestrator"]/' Cargo.toml
+    && sed -i 's/members = \["crates\/\*"\]/members = ["crates\/ferriscraft-protocol", "crates\/ferriscraft-progression", "crates\/ferriscraft-progression-pg", "crates\/ferriscraft-orchestrator"]/' Cargo.toml
 
 FROM orchestrator-src AS orchestrator-planner
 
@@ -61,10 +63,13 @@ RUN --mount=type=cache,id=ferriscraft-cargo-registry-orchestrator,sharing=locked
 
 COPY --from=orchestrator-src /app/Cargo.toml /app/Cargo.lock ./
 COPY crates/ferriscraft-protocol ./crates/ferriscraft-protocol
+COPY crates/ferriscraft-progression ./crates/ferriscraft-progression
+COPY crates/ferriscraft-progression-pg ./crates/ferriscraft-progression-pg
 COPY crates/ferriscraft-orchestrator ./crates/ferriscraft-orchestrator
 RUN --mount=type=cache,id=ferriscraft-cargo-registry-orchestrator,sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=ferriscraft-cargo-git-orchestrator,sharing=locked,target=/usr/local/cargo/git \
-    cargo build --release -p ferriscraft-orchestrator --bin ferriscraft-orchestrator --bin ferriscraft-map-sync
+    cargo build --release -p ferriscraft-orchestrator --bin ferriscraft-orchestrator --bin ferriscraft-map-sync \
+    && cargo build --release -p ferriscraft-progression-pg --bin ferriscraft-migrate
 
 FROM ${DEBIAN_RUNTIME_IMAGE} AS orchestrator
 
@@ -77,6 +82,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY --from=orchestrator-builder /app/target/release/ferriscraft-orchestrator /usr/local/bin/ferriscraft-orchestrator
 COPY --from=orchestrator-builder /app/target/release/ferriscraft-map-sync /usr/local/bin/ferriscraft-map-sync
+COPY --from=orchestrator-builder /app/target/release/ferriscraft-migrate /usr/local/bin/ferriscraft-migrate
 
 USER ferriscraft
 EXPOSE 8080

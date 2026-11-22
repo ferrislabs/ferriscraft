@@ -677,6 +677,7 @@ mod tests {
             fixed_map: None,
             version: None,
             use_crd: false,
+            progression_database_url: None,
         }
     }
 

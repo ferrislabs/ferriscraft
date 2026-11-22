@@ -6,6 +6,7 @@ use rspigot_plugin::{
 };
 
 use crate::auth::{AuthManager, Rank};
+use crate::profile::{ProfileCache, level_prefix};
 
 const TEAM_DEFS: [(&str, &str, &str, TeamColor); 7] = [
     ("00_admin_fk", "§c§lADMIN §f", " §a✔", TeamColor::Red),
@@ -16,6 +17,37 @@ const TEAM_DEFS: [(&str, &str, &str, TeamColor); 7] = [
     ("40_member", "§a§lFK §f", " §a✔", TeamColor::Green),
     ("90_guest", "§7", "", TeamColor::Gray),
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TabKey {
+    rank: Rank,
+    verified: bool,
+    level: Option<u32>,
+}
+
+fn team_def(team: &str) -> Option<&'static (&'static str, &'static str, &'static str, TeamColor)> {
+    TEAM_DEFS.iter().find(|(id, ..)| *id == team)
+}
+
+fn player_team_id(name: &str, rank: Rank, verified: bool) -> String {
+    format!("{}_{name}", rank.team_name(verified))
+}
+
+fn tab_prefix(rank: Rank, verified: bool, level: Option<u32>) -> String {
+    let base = team_def(rank.team_name(verified)).map_or("", |(_, prefix, _, _)| *prefix);
+    format!("{}{base}", level_prefix(level))
+}
+
+fn install_player_team(board: &Scoreboard, name: &str, key: TabKey) {
+    let id = player_team_id(name, key.rank, key.verified);
+    let team = board.register_team(id.as_str());
+    let (suffix, color) = team_def(key.rank.team_name(key.verified))
+        .map_or(("", None), |(_, _, suffix, color)| (*suffix, Some(*color)));
+    team.set_prefix(tab_prefix(key.rank, key.verified, key.level));
+    team.set_suffix(suffix);
+    team.set_color(color);
+    team.add_entry(name);
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HubMetrics {
@@ -33,6 +65,8 @@ pub struct PlayerHudInput {
     pub ferriskey_username: Option<String>,
     pub ping_ms: i32,
     pub metrics: HubMetrics,
+    pub network_level: Option<u32>,
+    pub coins: Option<u64>,
 }
 
 pub fn build_sidebar_lines(input: &PlayerHudInput) -> Vec<String> {
@@ -53,10 +87,15 @@ pub fn build_sidebar_lines(input: &PlayerHudInput) -> Vec<String> {
     };
     let ping = input.ping_ms.max(0);
 
-    vec![
+    let mut lines = vec![
         "§1".to_owned(),
         format!("§fGrade : {}", input.rank.sidebar_label()),
         fk_line,
+    ];
+    if let Some(coins) = input.coins {
+        lines.push(format!("§6Coins §f{coins}"));
+    }
+    lines.extend([
         "§2".to_owned(),
         format!(
             "§fEn ligne : §a{}§7/§f{}",
@@ -71,7 +110,8 @@ pub fn build_sidebar_lines(input: &PlayerHudInput) -> Vec<String> {
         format!("§fPing : §a{ping}ms §8| {tps_color}{tps:.1} TPS"),
         "§4".to_owned(),
         "§6play.ferriscraft.gg".to_owned(),
-    ]
+    ]);
+    lines
 }
 
 pub fn build_tab_list(input: &PlayerHudInput) -> TabList {
@@ -104,7 +144,7 @@ struct BoardEntry {
 #[derive(Default)]
 pub struct HudManager {
     boards: RwLock<HashMap<Uuid, BoardEntry>>,
-    team_by_player: RwLock<HashMap<String, &'static str>>,
+    team_by_player: RwLock<HashMap<String, TabKey>>,
 }
 
 impl HudManager {
@@ -116,23 +156,16 @@ impl HudManager {
             board.register_objective("fc_hub", &Criteria::dummy(), "§6§lFERRISCRAFT §8• §dHUB");
         board.set_display_slot(DisplaySlot::Sidebar, Some(&objective));
 
-        for (id, prefix, suffix, color) in TEAM_DEFS {
-            let team = board.register_team(id);
-            team.set_prefix(prefix);
-            team.set_suffix(suffix);
-            team.set_color(Some(color));
-        }
-
         // Populate existing players' teams on this fresh board so TabList renders immediately.
-        let existing_teams: Vec<(String, &'static str)> = self
+        let existing_teams: Vec<(String, TabKey)> = self
             .team_by_player
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .map(|(name, team)| (name.clone(), *team))
+            .map(|(name, key)| (name.clone(), *key))
             .collect();
-        for (name, team_id) in existing_teams {
-            board.team(team_id).add_entry(name);
+        for (name, key) in existing_teams {
+            install_player_team(&board, &name, key);
         }
 
         player.scoreboard.set(&board);
@@ -166,37 +199,68 @@ impl HudManager {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .remove(player_name);
-        if let Some(team_id) = old_team {
+        if let Some(key) = old_team {
+            let id = player_team_id(player_name, key.rank, key.verified);
             let boards = self.boards.read().unwrap_or_else(|e| e.into_inner());
             for entry in boards.values() {
-                entry.board.team(team_id).remove_entry(player_name);
+                entry.board.team(id.as_str()).unregister();
             }
         }
     }
 
-    pub fn sync_player_team(&self, player_name: &str, rank: Rank, verified: bool) {
-        let target_team = rank.team_name(verified);
+    pub fn sync_player_team(
+        &self,
+        player_name: &str,
+        rank: Rank,
+        verified: bool,
+        level: Option<u32>,
+    ) {
+        let key = TabKey {
+            rank,
+            verified,
+            level,
+        };
         let previous = self
             .team_by_player
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(player_name.to_owned(), target_team);
+            .insert(player_name.to_owned(), key);
 
-        if previous == Some(target_team) {
+        if previous == Some(key) {
             return;
         }
 
         let boards = self.boards.read().unwrap_or_else(|e| e.into_inner());
-        for entry in boards.values() {
-            if let Some(old) = previous {
-                entry.board.team(old).remove_entry(player_name);
+        match previous {
+            Some(old) if old.rank.team_name(old.verified) == rank.team_name(verified) => {
+                let id = player_team_id(player_name, rank, verified);
+                let prefix = tab_prefix(rank, verified, level);
+                for entry in boards.values() {
+                    entry.board.team(id.as_str()).set_prefix(prefix.as_str());
+                }
             }
-            entry.board.team(target_team).add_entry(player_name);
+            Some(old) => {
+                let old_id = player_team_id(player_name, old.rank, old.verified);
+                for entry in boards.values() {
+                    entry.board.team(old_id.as_str()).unregister();
+                    install_player_team(&entry.board, player_name, key);
+                }
+            }
+            None => {
+                for entry in boards.values() {
+                    install_player_team(&entry.board, player_name, key);
+                }
+            }
         }
     }
 
     pub fn refresh_player(&self, player: &Player, input: &PlayerHudInput) {
-        self.sync_player_team(&player.name, input.rank, input.ferriskey_username.is_some());
+        self.sync_player_team(
+            &player.name,
+            input.rank,
+            input.ferriskey_username.is_some(),
+            input.network_level,
+        );
 
         let lines = build_sidebar_lines(input);
         let tab = build_tab_list(input);
@@ -232,7 +296,13 @@ impl HudManager {
         }
     }
 
-    pub async fn refresh_all(&self, server: &Server, auth: &AuthManager, metrics: HubMetrics) {
+    pub async fn refresh_all(
+        &self,
+        server: &Server,
+        auth: &AuthManager,
+        profiles: &ProfileCache,
+        metrics: HubMetrics,
+    ) {
         let Ok(players) = server.get_players().await else {
             return;
         };
@@ -249,6 +319,8 @@ impl HudManager {
                 ferriskey_username: claims.map(|c| c.username),
                 ping_ms,
                 metrics,
+                network_level: profiles.level(player.uuid),
+                coins: profiles.coins(player.uuid),
             };
             self.refresh_player(&player, &input);
         }
@@ -274,6 +346,8 @@ mod tests {
                 agents_working: 2,
                 agents_total: 4,
             },
+            network_level: Some(12),
+            coins: Some(340),
         };
         let lines = build_sidebar_lines(&input);
         let unique: HashSet<&String> = lines.iter().collect();
@@ -284,9 +358,41 @@ mod tests {
         );
         assert!(lines.iter().any(|l| l.contains("✔ nathael")));
         assert!(lines.iter().any(|l| l.contains("SheepWars : §d3")));
+        assert!(lines.iter().any(|l| l == "§6Coins §f340"));
 
         let tab = build_tab_list(&input);
         assert!(tab.header.contains("FERRISCRAFT"));
         assert!(tab.footer.contains("✔ nathael"));
+    }
+
+    #[test]
+    fn sidebar_shows_no_coins_line_until_a_profile_is_known() {
+        let input = PlayerHudInput {
+            rank: Rank::Guest,
+            ferriskey_username: None,
+            ping_ms: 0,
+            metrics: HubMetrics::default(),
+            network_level: None,
+            coins: None,
+        };
+        assert!(
+            !build_sidebar_lines(&input)
+                .iter()
+                .any(|l| l.contains("Coins"))
+        );
+    }
+
+    #[test]
+    fn tab_prefix_puts_the_network_level_before_the_rank_prefix() {
+        assert_eq!(tab_prefix(Rank::Vip, true, Some(12)), "§7[12✫] §6§lVIP §f");
+        assert_eq!(tab_prefix(Rank::Guest, false, None), "§7");
+    }
+
+    #[test]
+    fn player_team_ids_sort_by_rank_then_name() {
+        let admin = player_team_id("Zed", Rank::Admin, true);
+        let member = player_team_id("Abe", Rank::Member, true);
+        assert!(admin < member);
+        assert_eq!(admin, "00_admin_fk_Zed");
     }
 }

@@ -45,6 +45,13 @@ spec:
               value: {{ printf "http://%s-orchestrator:%d" (include "ferriscraft.fullname" .) (int .Values.orchestrator.port) | quote }}
             - name: LOBBY_SERVER_NAME
               value: "lobby"
+            {{- if .Values.progression.existingDatabaseSecret }}
+            - name: PROGRESSION_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.progression.existingDatabaseSecret }}
+                  key: {{ .Values.progression.databaseUriKey }}
+            {{- end }}
             - name: QUEUE_MIN_PLAYERS
               value: {{ .Values.orchestrator.queue.minPlayers | quote }}
             - name: SHEEPWARS_MAX_PLAYERS

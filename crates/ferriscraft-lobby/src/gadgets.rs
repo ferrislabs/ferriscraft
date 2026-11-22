@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
+use ferriscraft_protocol::CosmeticId;
 use rspigot_plugin::{
     BlockPos, Effect, EffectType, EntityType, Face, Facing, ItemStack, Material, Particle,
     ParticleBurst, Player, Position, Sound, SoundCue, Uuid, Vector,
@@ -38,6 +39,21 @@ impl LobbyGadget {
             Self::WindCharge => Material::WindCharge,
             Self::EnderGrapple => Material::EnderPearl,
         }
+    }
+
+    pub const fn cosmetic(self) -> CosmeticId {
+        match self {
+            Self::FeatherDash => CosmeticId::GadgetFeatherDash,
+            Self::FireworkRocket => CosmeticId::GadgetFireworkRocket,
+            Self::SheepCannon => CosmeticId::GadgetSheepCannon,
+            Self::VortexWand => CosmeticId::GadgetVortexWand,
+            Self::WindCharge => CosmeticId::GadgetWindCharge,
+            Self::EnderGrapple => CosmeticId::GadgetEnderGrapple,
+        }
+    }
+
+    pub fn from_cosmetic(cosmetic: CosmeticId) -> Option<Self> {
+        Self::ALL.into_iter().find(|g| g.cosmetic() == cosmetic)
     }
 
     pub fn from_material(material: &Material) -> Option<Self> {
@@ -122,6 +138,22 @@ impl AuraTrail {
             Self::Magic => Self::Emerald,
             Self::Emerald => Self::None,
         }
+    }
+
+    pub const fn cosmetic(self) -> Option<CosmeticId> {
+        match self {
+            Self::None => None,
+            Self::Flame => Some(CosmeticId::TrailFlame),
+            Self::Heart => Some(CosmeticId::TrailHeart),
+            Self::Magic => Some(CosmeticId::TrailMagic),
+            Self::Emerald => Some(CosmeticId::TrailEmerald),
+        }
+    }
+
+    pub fn from_cosmetic(cosmetic: CosmeticId) -> Option<Self> {
+        [Self::Flame, Self::Heart, Self::Magic, Self::Emerald]
+            .into_iter()
+            .find(|t| t.cosmetic() == Some(cosmetic))
     }
 
     pub const fn label(self) -> &'static str {
@@ -543,6 +575,11 @@ impl GadgetManager {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
+    use ferriscraft_progression::Catalog;
+    use ferriscraft_protocol::CosmeticSlot;
+
     use super::*;
 
     #[test]
@@ -573,6 +610,40 @@ mod tests {
         assert!(mgr.try_consume_cooldown(alice, LobbyGadget::FeatherDash).is_ok());
         assert!(mgr.try_consume_cooldown(alice, LobbyGadget::FeatherDash).is_err());
         assert!(mgr.try_consume_cooldown(alice, LobbyGadget::WindCharge).is_ok());
+    }
+
+    #[test]
+    fn every_gadget_maps_to_a_distinct_gadget_cosmetic_and_back() {
+        let mut seen = HashSet::new();
+        for gadget in LobbyGadget::ALL {
+            let id = gadget.cosmetic();
+            assert!(seen.insert(id));
+            assert_eq!(
+                Catalog::entry(id).map(|e| e.slot),
+                Some(CosmeticSlot::LobbyGadget)
+            );
+            assert_eq!(LobbyGadget::from_cosmetic(id), Some(gadget));
+        }
+        assert_eq!(LobbyGadget::from_cosmetic(CosmeticId::TrailFlame), None);
+    }
+
+    #[test]
+    fn every_trail_maps_to_a_trail_cosmetic_and_back() {
+        assert_eq!(AuraTrail::None.cosmetic(), None);
+        for trail in [
+            AuraTrail::Flame,
+            AuraTrail::Heart,
+            AuraTrail::Magic,
+            AuraTrail::Emerald,
+        ] {
+            let id = trail.cosmetic().expect("trail has a cosmetic");
+            assert_eq!(
+                Catalog::entry(id).map(|e| e.slot),
+                Some(CosmeticSlot::LobbyTrail)
+            );
+            assert_eq!(AuraTrail::from_cosmetic(id), Some(trail));
+        }
+        assert_eq!(AuraTrail::from_cosmetic(CosmeticId::GadgetWindCharge), None);
     }
 
     #[test]

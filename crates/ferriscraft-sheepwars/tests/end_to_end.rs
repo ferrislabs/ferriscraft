@@ -6,11 +6,12 @@ use std::time::{Duration, Instant};
 use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use ferriscraft_protocol::{
-    HeartbeatRequest, PhaseUpdateRequest, SendToLobbyRequest, ServerPhase,
+    GameKind, HeartbeatRequest, LevelProgress, MatchOutcome, MatchReport, MatchReportAck,
+    PhaseUpdateRequest, PlayerReward, SendToLobbyRequest, ServerPhase,
 };
 use ferriscraft_sheepwars::domain::{RespawnRule, RoundRules};
 use ferriscraft_sheepwars::{SheepWarsConfig, SheepWarsPlugin};
@@ -289,6 +290,9 @@ struct MockOrchestrator {
     phase_updates: Vec<(String, ServerPhase)>,
     send_lobby_calls: Vec<(Uuid, Option<String>)>,
     unauthorized_requests: usize,
+    report_attempts: Vec<MatchReport>,
+    ack_released: bool,
+    profile_requests: Vec<Uuid>,
 }
 
 type SharedOrchestrator = Arc<Mutex<MockOrchestrator>>;
@@ -299,6 +303,40 @@ fn authorized(headers: &HeaderMap) -> bool {
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         == Some(EXPECTED_TOKEN)
+}
+
+fn progress(level: u32) -> LevelProgress {
+    LevelProgress {
+        level,
+        xp_into_level: 10,
+        xp_for_next: 100,
+        total_xp: 10,
+    }
+}
+
+fn ack_for(report: &MatchReport) -> MatchReportAck {
+    MatchReportAck {
+        match_id: report.match_id,
+        counted: true,
+        duplicate: false,
+        rewards: report
+            .participants
+            .iter()
+            .map(|participant| PlayerReward {
+                uuid: participant.uuid,
+                xp: if participant.outcome == MatchOutcome::Win {
+                    150
+                } else {
+                    50
+                },
+                coins: 30,
+                game: progress(12),
+                game_level_up: participant.outcome == MatchOutcome::Win,
+                network: progress(3),
+                network_level_up: false,
+            })
+            .collect(),
+    }
 }
 
 fn mock_orchestrator_router(state: SharedOrchestrator) -> Router {
@@ -350,6 +388,61 @@ fn mock_orchestrator_router(state: SharedOrchestrator) -> Router {
                     }
                     guard.send_lobby_calls.push((uuid, body.reason));
                     Json(json!({ "ok": true })).into_response()
+                },
+            ),
+        )
+        .route(
+            "/api/v1/matches",
+            post(
+                |State(orch): State<SharedOrchestrator>,
+                 headers: HeaderMap,
+                 Json(body): Json<MatchReport>| async move {
+                    let mut guard = orch.lock().unwrap();
+                    if !authorized(&headers) {
+                        guard.unauthorized_requests += 1;
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    guard.report_attempts.push(body.clone());
+                    if !guard.ack_released {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(json!({ "error": "progression_unavailable" })),
+                        )
+                            .into_response();
+                    }
+                    Json(ack_for(&body)).into_response()
+                },
+            ),
+        )
+        .route(
+            "/api/v1/players/{uuid}/profile",
+            get(
+                |State(orch): State<SharedOrchestrator>,
+                 AxumPath(uuid): AxumPath<Uuid>,
+                 headers: HeaderMap| async move {
+                    let mut guard = orch.lock().unwrap();
+                    if !authorized(&headers) {
+                        guard.unauthorized_requests += 1;
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    guard.profile_requests.push(uuid);
+                    let level = json!({
+                        "level": 12, "xp_into_level": 0, "xp_for_next": 100, "total_xp": 0
+                    });
+                    Json(json!({
+                        "uuid": uuid,
+                        "name": "Player",
+                        "rank": "member",
+                        "coins": 0,
+                        "network": level,
+                        "games": [{
+                            "game": "sheep_wars", "progress": level,
+                            "played": 0, "wins": 0, "losses": 0, "draws": 0
+                        }],
+                        "unlocked": ["sheep_trail_hearts"],
+                        "equipped": { "sheep_trail": "sheep_trail_hearts" }
+                    }))
+                    .into_response()
                 },
             ),
         )
@@ -478,6 +571,36 @@ fn sheepwars_full_lifecycle_orchestrator_countdown_combat_and_ephemeral_end() {
         alice.said("Victoire de l'équipe Rouge") && alice.event_debug_has("TitleText")
     });
 
+    core.run_until("the round report reaches the orchestrator", |c| {
+        confirm_teleports(&mut c.server, &mut alice);
+        confirm_teleports(&mut c.server, &mut bob);
+        !orch_state.lock().unwrap().report_attempts.is_empty()
+    });
+    let grace = Instant::now() + Duration::from_millis(2500);
+    core.run_until("the end delay elapses while the ack is withheld", |c| {
+        confirm_teleports(&mut c.server, &mut alice);
+        confirm_teleports(&mut c.server, &mut bob);
+        let guard = orch_state.lock().unwrap();
+        assert!(
+            guard.phase_updates.is_empty() && guard.send_lobby_calls.is_empty(),
+            "server went Ending before the report was acknowledged"
+        );
+        assert!(
+            guard
+                .heartbeats
+                .iter()
+                .all(|hb| hb.phase != ServerPhase::Ending)
+        );
+        Instant::now() >= grace
+    });
+    orch_state.lock().unwrap().ack_released = true;
+
+    core.run_until("alice sees her rewards", |c| {
+        confirm_teleports(&mut c.server, &mut alice);
+        confirm_teleports(&mut c.server, &mut bob);
+        alice.said("+150 XP SheepWars") && bob.said("+50 XP SheepWars")
+    });
+
     // Celebration ends -> ReturnAllToLobby + Ending phase update
     core.run_until("end delay triggers send-lobby for both players and Ending phase", |_| {
         let guard = orch_state.lock().unwrap();
@@ -500,6 +623,33 @@ fn sheepwars_full_lifecycle_orchestrator_countdown_combat_and_ephemeral_end() {
         alice_returned && bob_returned && phase_ending && hb_ending
     });
 
+    {
+        let guard = orch_state.lock().unwrap();
+        assert!(guard.report_attempts.len() >= 2, "the 503 was retried");
+        let first = &guard.report_attempts[0];
+        assert!(
+            guard
+                .report_attempts
+                .iter()
+                .all(|attempt| attempt.match_id == first.match_id)
+        );
+        assert_eq!(first.game, GameKind::SheepWars);
+        assert_eq!(first.server_id, "sheepwars-e2e");
+        assert!(!first.forced_start);
+        assert_eq!(first.participants.len(), 2);
+        let outcome_of = |name: &str| {
+            first
+                .participants
+                .iter()
+                .find(|p| p.name == name)
+                .map(|p| (p.outcome, p.completed))
+        };
+        assert_eq!(outcome_of("Alice"), Some((MatchOutcome::Win, true)));
+        assert_eq!(outcome_of("Bob"), Some((MatchOutcome::Loss, true)));
+        assert!(guard.profile_requests.contains(&alice.id.0));
+        assert!(guard.profile_requests.contains(&bob.id.0));
+    }
+    assert!(alice.said("Level 12 SheepWars") || alice.event_debug_has("Level 12 SheepWars"));
     assert_eq!(orch_state.lock().unwrap().unauthorized_requests, 0);
     plugin_task.abort();
 }

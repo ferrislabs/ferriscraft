@@ -6,12 +6,17 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use ferriscraft_progression::{
+    EquipError, MemoryProgressionRepository, ProgressionStoreError, Unlock, UnlockError,
+};
 use ferriscraft_protocol::{
-    FleetStatusSnapshot, HeartbeatRequest, JoinQueueRequest, JoinQueueResponse, LeaveQueueRequest,
-    LeaveQueueResponse, PhaseUpdateRequest, PlayerQueueStatus, ProxyDisconnectRequest, ProxyEvent,
-    ProxyStateSnapshot, SendToLobbyRequest, SpectateRequest, TransferAckRequest,
+    AdminCoinGrant, EquipRequest, FleetStatusSnapshot, HeartbeatRequest, JoinQueueRequest,
+    JoinQueueResponse, LeaveQueueRequest, LeaveQueueResponse, MatchReport, MatchReportAck,
+    PhaseUpdateRequest, PlayerIdentityUpdate, PlayerProfile, PlayerQueueStatus,
+    ProxyDisconnectRequest, ProxyEvent, ProxyStateSnapshot, PurchaseRequest, SendToLobbyRequest,
+    SpectateRequest, TransferAckRequest,
 };
 use futures_util::stream::{self, Stream};
 use serde_json::json;
@@ -19,6 +24,7 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::engine::{EngineError, FleetEngine};
+use crate::progression::{ProgressionError, ProgressionService, ProgressionStore};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -26,6 +32,7 @@ pub struct AppState {
     pub proxy_tx: broadcast::Sender<ProxyEvent>,
     pub api_token: Option<String>,
     pub version: Option<String>,
+    pub progression: ProgressionService<ProgressionStore>,
 }
 
 impl AppState {
@@ -36,7 +43,16 @@ impl AppState {
             proxy_tx,
             api_token,
             version: None,
+            progression: ProgressionService::new(ProgressionStore::Memory(
+                MemoryProgressionRepository::default(),
+            )),
         }
+    }
+
+    #[must_use]
+    pub fn with_progression(mut self, service: ProgressionService<ProgressionStore>) -> Self {
+        self.progression = service;
+        self
     }
 
     #[must_use]
@@ -57,11 +73,82 @@ pub enum ApiError {
     NotFound(String),
     BadRequest(String),
     Conflict(String),
+    Progression(ProgressionError),
+}
+
+fn unlock_json(unlock: Unlock) -> serde_json::Value {
+    match unlock {
+        Unlock::Free => json!({ "free": null }),
+        Unlock::Price(price) => json!({ "price": price.get() }),
+        Unlock::Rank(rank) => json!({ "rank": rank }),
+        Unlock::NetworkLevel(level) => json!({ "network_level": level.get() }),
+    }
+}
+
+fn progression_response(error: ProgressionError) -> Response {
+    let (status, body) = match error {
+        ProgressionError::Store(err) => {
+            tracing::warn!(error = %err, "Stockage de progression indisponible");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({ "error": "progression_unavailable" }),
+            )
+        }
+        ProgressionError::EmptyMatch => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({ "error": "empty_match" }),
+        ),
+        ProgressionError::Unlock(err) => match err {
+            UnlockError::AlreadyUnlocked => {
+                (StatusCode::CONFLICT, json!({ "error": "already_unlocked" }))
+            }
+            UnlockError::InsufficientCoins { missing } => (
+                StatusCode::PAYMENT_REQUIRED,
+                json!({ "error": "insufficient_coins", "missing": missing.get() }),
+            ),
+            UnlockError::RankRequired(rank) => (
+                StatusCode::FORBIDDEN,
+                json!({ "error": "rank_required", "rank": rank }),
+            ),
+            UnlockError::LevelRequired(level) => (
+                StatusCode::FORBIDDEN,
+                json!({ "error": "level_required", "level": level.get() }),
+            ),
+            UnlockError::UnknownCosmetic => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                json!({ "error": "unknown_cosmetic" }),
+            ),
+        },
+        ProgressionError::Equip(err) => match err {
+            EquipError::NotUnlocked { requires } => (
+                StatusCode::FORBIDDEN,
+                json!({ "error": "not_unlocked", "requires": unlock_json(requires) }),
+            ),
+            EquipError::WrongSlot => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                json!({ "error": "wrong_slot" }),
+            ),
+        },
+    };
+    (status, Json(body)).into_response()
+}
+
+impl From<ProgressionError> for ApiError {
+    fn from(value: ProgressionError) -> Self {
+        Self::Progression(value)
+    }
+}
+
+impl From<ProgressionStoreError> for ApiError {
+    fn from(value: ProgressionStoreError) -> Self {
+        Self::Progression(ProgressionError::Store(value))
+    }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, msg) = match self {
+            Self::Progression(err) => return progression_response(err),
             Self::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
                 "jeton orchestrateur invalide".to_owned(),
@@ -119,6 +206,12 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/players/{uuid}/send-lobby",
             post(send_player_to_lobby),
         )
+        .route("/api/v1/matches", post(report_match))
+        .route("/api/v1/players/{uuid}/profile", get(player_profile))
+        .route("/api/v1/players/{uuid}/identity", post(set_identity))
+        .route("/api/v1/players/{uuid}/purchases", post(purchase_cosmetic))
+        .route("/api/v1/players/{uuid}/equipped", put(equip_cosmetic))
+        .route("/api/v1/players/{uuid}/coins", post(grant_coins))
         .route("/api/v1/proxy/state", get(proxy_state))
         .route("/api/v1/proxy/events", get(proxy_events))
         .route(
@@ -368,4 +461,68 @@ async fn proxy_player_disconnected(
         )
     };
     Ok(Json(resp))
+}
+
+async fn report_match(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(report): Json<MatchReport>,
+) -> Result<Json<MatchReportAck>, ApiError> {
+    check_auth(&headers, state.api_token.as_deref())?;
+    let seen = {
+        let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
+        engine.seen_players(&report.server_id)
+    };
+    let ack = state.progression.report_match(&report, &seen).await?;
+    Ok(Json(ack))
+}
+
+async fn player_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(uuid): Path<Uuid>,
+) -> Result<Json<PlayerProfile>, ApiError> {
+    check_auth(&headers, state.api_token.as_deref())?;
+    Ok(Json(state.progression.profile(uuid).await?))
+}
+
+async fn set_identity(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(uuid): Path<Uuid>,
+    Json(req): Json<PlayerIdentityUpdate>,
+) -> Result<StatusCode, ApiError> {
+    check_auth(&headers, state.api_token.as_deref())?;
+    state.progression.set_identity(uuid, &req).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn purchase_cosmetic(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(uuid): Path<Uuid>,
+    Json(req): Json<PurchaseRequest>,
+) -> Result<Json<PlayerProfile>, ApiError> {
+    check_auth(&headers, state.api_token.as_deref())?;
+    Ok(Json(state.progression.purchase(uuid, req.cosmetic).await?))
+}
+
+async fn equip_cosmetic(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(uuid): Path<Uuid>,
+    Json(req): Json<EquipRequest>,
+) -> Result<Json<PlayerProfile>, ApiError> {
+    check_auth(&headers, state.api_token.as_deref())?;
+    Ok(Json(state.progression.equip(uuid, &req).await?))
+}
+
+async fn grant_coins(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(uuid): Path<Uuid>,
+    Json(req): Json<AdminCoinGrant>,
+) -> Result<Json<PlayerProfile>, ApiError> {
+    check_auth(&headers, state.api_token.as_deref())?;
+    Ok(Json(state.progression.grant(uuid, &req).await?))
 }

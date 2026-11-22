@@ -6,6 +6,7 @@ use rspigot_plugin::{Click, Part, Player, RichMessage, Sound, SoundCue, Uuid};
 
 use crate::auth::{Rank, UserClaims};
 use crate::prefs::PrefsStore;
+use crate::profile::level_prefix;
 
 const CHAT_COOLDOWN: Duration = Duration::from_millis(1000);
 
@@ -35,9 +36,16 @@ pub fn highlight_mentions(text: &str, online_names: &[String]) -> (String, HashS
     (rendered_words.join(" "), mentioned)
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ChatBadge {
+    pub rank: Rank,
+    pub level: Option<u32>,
+}
+
 pub fn format_public_chat(
     sender_name: &str,
     rank: Rank,
+    level: Option<u32>,
     claims: Option<&UserClaims>,
     rendered_body: &str,
 ) -> RichMessage {
@@ -46,7 +54,11 @@ pub fn format_public_chat(
         None => "§7Compte FerrisKey non lié".to_owned(),
     };
 
-    let mut msg = RichMessage::new().part(Part::new(format!("{} ", rank.chat_badge())));
+    let mut msg = RichMessage::new().part(Part::new(format!(
+        "{}{} ",
+        level_prefix(level),
+        rank.chat_badge()
+    )));
 
     if let Some(c) = claims {
         msg = msg.part(
@@ -101,7 +113,7 @@ impl ChatSystem {
     pub fn broadcast_chat(
         &self,
         sender: &Player,
-        rank: Rank,
+        badge: ChatBadge,
         claims: Option<&UserClaims>,
         raw_message: &str,
         recipients: &[Player],
@@ -109,9 +121,9 @@ impl ChatSystem {
     ) {
         let names: Vec<String> = recipients.iter().map(|p| p.name.clone()).collect();
         let (rendered, mentioned) = highlight_mentions(raw_message, &names);
-        let rich = format_public_chat(&sender.name, rank, claims, &rendered);
+        let rich = format_public_chat(&sender.name, badge.rank, badge.level, claims, &rendered);
 
-        tracing::info!("[CHAT] {} ({:?}): {}", sender.name, rank, raw_message);
+        tracing::info!("[CHAT] {} ({:?}): {}", sender.name, badge.rank, raw_message);
 
         for target in recipients {
             target.message.send_rich(rich.clone());
@@ -211,6 +223,15 @@ mod tests {
         assert_eq!(mentioned.len(), 2);
         assert!(mentioned.contains("Nathael"));
         assert!(mentioned.contains("Astrid"));
+    }
+
+    #[test]
+    fn chat_badge_is_preceded_by_the_network_level_once_known() {
+        let with_level = format_public_chat("Abe", Rank::Vip, Some(12), None, "salut");
+        let without = format_public_chat("Abe", Rank::Vip, None, None, "salut");
+        let first = |msg: &RichMessage| format!("{msg:?}");
+        assert!(first(&with_level).contains("§7[12✫] §6§l[VIP] "));
+        assert!(!first(&without).contains("✫"));
     }
 
     #[test]
