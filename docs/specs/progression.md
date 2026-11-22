@@ -66,7 +66,7 @@ Nouveau crate pur `ferriscraft-progression`, sans I/O :
 - `reward(outcome, rank) -> Reward { xp: Xp, coins: Coins }` : `xp` dépend de `outcome` seul, `coins` du résultat multiplié par le multiplicateur du grade.
 - `Catalog` : prix et condition de déblocage de chaque `CosmeticId`.
 - `Unlock { Free, Price(Coins), Rank(PlayerRank), NetworkLevel(Level) }`.
-- `can_unlock(profile, cosmetic) -> Result<Unlock, UnlockError>`.
+- `PlayerProgress` : profil d'un joueur. `record_match`, `purchase`, `equip` et `grant` appliquent les règles et renvoient le `CoinMovement` à écrire au journal. `missing_requirement(entry)` donne la condition de déblocage non remplie.
 
 Valeurs par défaut, à ajuster après la bêta :
 
@@ -78,7 +78,7 @@ Valeurs par défaut, à ajuster après la bêta :
 | Égalité | 75 XP, 15 coins |
 | Défaite | 50 XP, 10 coins |
 | Multiplicateur de coins | x1,5 (arrondi vers le bas) pour `Vip`, `Dev`, `Mod`, `Admin` ; x1 sinon |
-| Courbe de jeu | `min(250 × L, 2 500)` XP pour passer de `L` à `L+1` (level 30 ≈ 63 750 XP, ≈ 425 victoires) |
+| Courbe de jeu | `min(250 × L, 2 500)` XP pour passer de `L` à `L+1` (level 30 = 61 250 XP, ≈ 409 victoires) |
 | Courbe réseau | `min(1 000 × L, 10 000)` XP |
 
 Catalogue v1 :
@@ -152,7 +152,7 @@ Schéma (migrations expand puis contract, comme `plc`) :
 |---|---|---|
 | Domaine | `NotCounted` | `ForcedStart`, `TooFewPlayers`, `TooShort` |
 | Domaine | `UnlockError` | `AlreadyUnlocked`, `InsufficientCoins { missing: Coins }`, `RankRequired(PlayerRank)`, `LevelRequired(Level)`, `UnknownCosmetic` |
-| Domaine | `EquipError` | `NotUnlocked`, `WrongSlot` |
+| Domaine | `EquipError` | `NotUnlocked { requires: Unlock }`, `WrongSlot` |
 | Repository | `ProgressionStoreError` | `Unavailable`, `Conflict`, `Corrupted(String)` |
 | HTTP | voir Frozen contracts | |
 
@@ -223,7 +223,7 @@ Si l'orchestrateur est injoignable, le lobby affiche « Boutique indisponible »
   Given A est Vip et B est Member
   When ils équipent le trail Emerald
   Then A l'équipe
-  And B reçoit 403 RankRequired(Vip)
+  And B reçoit 403 NotUnlocked avec le grade Vip requis
 
 @spec-prg-12  Scenario: cosmétique équipé visible en jeu
   Given A a équipé la traînée de mouton Cœurs
@@ -284,7 +284,7 @@ W1 et W2 d'abord. W3, W4 et W5 en parallèle ensuite, contre l'adapter mémoire.
 ```rust
 // crates/ferriscraft-protocol/src/lib.rs
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GameKind {
     SheepWars,
@@ -355,7 +355,7 @@ pub struct MatchReportAck {
     pub rewards: Vec<PlayerReward>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CosmeticSlot {
     LobbyGadget,
@@ -364,7 +364,7 @@ pub enum CosmeticSlot {
     VictoryEffect,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CosmeticId {
     GadgetFeatherDash,
@@ -442,7 +442,7 @@ Routes de l'orchestrateur, toutes derrière le jeton Bearer existant :
 | `GET /api/v1/players/{uuid}/profile` | — | `200 PlayerProfile` (profil vide pour un joueur inconnu) |
 | `POST /api/v1/players/{uuid}/identity` | `PlayerIdentityUpdate` | `204` |
 | `POST /api/v1/players/{uuid}/purchases` | `PurchaseRequest` | `200 PlayerProfile` · `402 InsufficientCoins { missing }` · `403 RankRequired \| LevelRequired` · `409 AlreadyUnlocked` · `422 UnknownCosmetic` |
-| `PUT /api/v1/players/{uuid}/equipped` | `EquipRequest` | `200 PlayerProfile` · `403 NotUnlocked` · `422 WrongSlot` |
+| `PUT /api/v1/players/{uuid}/equipped` | `EquipRequest` | `200 PlayerProfile` · `403 NotUnlocked { requires }` · `422 WrongSlot` |
 | `POST /api/v1/players/{uuid}/coins` | `AdminCoinGrant` | `200 PlayerProfile` |
 
 ## Risks / open questions
