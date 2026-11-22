@@ -3,13 +3,14 @@ use std::time::Duration;
 
 use ferriscraft_progression::{Coins, Level, Unlock};
 use ferriscraft_protocol::{
-    AdminCoinGrant, CosmeticId, CosmeticSlot, EquipRequest, FleetStatusSnapshot, JoinQueueRequest,
-    JoinQueueResponse, LeaveQueueRequest, LeaveQueueResponse, LeaveReason, PlayerIdentityUpdate,
-    PlayerProfile, PlayerQueueState, PlayerQueueStatus, PlayerRank, PurchaseRequest,
-    SpectateRequest,
+    AdminCoinGrant, CosmeticId, CosmeticSlot, EquipRequest, FleetStatusSnapshot, HeartbeatRequest,
+    JoinQueueRequest, JoinQueueResponse, LeaveQueueRequest, LeaveQueueResponse, LeaveReason,
+    PlayerIdentityUpdate, PlayerProfile, PlayerQueueState, PlayerQueueStatus, PlayerRank,
+    PurchaseRequest, SpectateRequest,
 };
 use serde::Deserialize;
 use thiserror::Error;
+use tokio::time::Instant;
 use uuid::Uuid;
 
 #[derive(Debug, Error)]
@@ -109,10 +110,28 @@ pub fn decode_progression_error(status: u16, body: &[u8]) -> ProgressionClientEr
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct RetryPolicy {
+    pub budget: Duration,
+    pub initial: Duration,
+    pub max: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            budget: Duration::from_secs(10),
+            initial: Duration::from_millis(250),
+            max: Duration::from_secs(2),
+        }
+    }
+}
+
 pub struct OrchestratorClient {
     base_url: String,
     token: Option<String>,
     http: reqwest::Client,
+    retry: RetryPolicy,
     last_snapshot: RwLock<Option<FleetStatusSnapshot>>,
 }
 
@@ -126,8 +145,55 @@ impl OrchestratorClient {
             base_url: base_url.trim_end_matches('/').to_owned(),
             token,
             http,
+            retry: RetryPolicy::default(),
             last_snapshot: RwLock::new(None),
         }
+    }
+
+    pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    async fn send_retrying<B>(
+        &self,
+        build: B,
+        deadline: Instant,
+    ) -> Result<reqwest::Response, reqwest::Error>
+    where
+        B: Fn() -> reqwest::RequestBuilder,
+    {
+        let mut delay = self.retry.initial;
+        loop {
+            let outcome = build().send().await;
+            let transient = match &outcome {
+                Ok(resp) => resp.status().is_server_error(),
+                Err(_) => true,
+            };
+            if !transient || Instant::now() + delay > deadline {
+                return outcome;
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(self.retry.max);
+        }
+    }
+
+    pub async fn send_heartbeat(
+        &self,
+        req: &HeartbeatRequest,
+    ) -> Result<(), OrchestratorClientError> {
+        let resp = self
+            .apply_auth(
+                self.http
+                    .post(format!("{}/api/v1/servers/heartbeat", self.base_url)),
+            )
+            .json(req)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(OrchestratorClientError::HttpStatus(resp.status().as_u16()));
+        }
+        Ok(())
     }
 
     fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -156,11 +222,18 @@ impl OrchestratorClient {
         player_uuid: Uuid,
         player_name: &str,
     ) -> Result<ToggleQueueOutcome, OrchestratorClientError> {
-        let status_req = self.apply_auth(self.http.get(format!(
-            "{}/api/v1/queue/player/{player_uuid}",
-            self.base_url
-        )));
-        let status_resp = status_req.send().await?;
+        let deadline = Instant::now() + self.retry.budget;
+        let status_resp = self
+            .send_retrying(
+                || {
+                    self.apply_auth(self.http.get(format!(
+                        "{}/api/v1/queue/player/{player_uuid}",
+                        self.base_url
+                    )))
+                },
+                deadline,
+            )
+            .await?;
         if !status_resp.status().is_success() {
             return Err(OrchestratorClientError::HttpStatus(
                 status_resp.status().as_u16(),
@@ -168,54 +241,55 @@ impl OrchestratorClient {
         }
         let current: PlayerQueueStatus = status_resp.json().await?;
         if current.state == PlayerQueueState::Queued {
-            let leave_req = self
-                .apply_auth(
-                    self.http
-                        .post(format!("{}/api/v1/queue/leave", self.base_url)),
-                )
-                .json(&LeaveQueueRequest {
-                    player_uuid,
-                    reason: LeaveReason::UserToggle,
-                });
-            let resp = leave_req.send().await?;
-            if !resp.status().is_success() {
-                return Err(OrchestratorClientError::HttpStatus(resp.status().as_u16()));
-            }
+            let body = LeaveQueueRequest {
+                player_uuid,
+                reason: LeaveReason::UserToggle,
+            };
+            let resp = self.post_queue("leave", &body, deadline).await?;
             let left: LeaveQueueResponse = resp.json().await?;
             return Ok(ToggleQueueOutcome::Left(left));
         }
 
-        let join_req = self
-            .apply_auth(
-                self.http
-                    .post(format!("{}/api/v1/queue/join", self.base_url)),
-            )
-            .json(&JoinQueueRequest {
-                player_uuid,
-                player_name: player_name.to_owned(),
-            });
-        let resp = join_req.send().await?;
-        if !resp.status().is_success() {
-            return Err(OrchestratorClientError::HttpStatus(resp.status().as_u16()));
-        }
+        let body = JoinQueueRequest {
+            player_uuid,
+            player_name: player_name.to_owned(),
+        };
+        let resp = self.post_queue("join", &body, deadline).await?;
         let joined: JoinQueueResponse = resp.json().await?;
         Ok(ToggleQueueOutcome::Joined(joined))
     }
 
-    pub async fn leave_if_queued(&self, player_uuid: Uuid) -> Result<(), OrchestratorClientError> {
-        let req = self
-            .apply_auth(
-                self.http
-                    .post(format!("{}/api/v1/queue/leave", self.base_url)),
+    async fn post_queue<T: serde::Serialize + Sync>(
+        &self,
+        action: &str,
+        body: &T,
+        deadline: Instant,
+    ) -> Result<reqwest::Response, OrchestratorClientError> {
+        let resp = self
+            .send_retrying(
+                || {
+                    self.apply_auth(
+                        self.http
+                            .post(format!("{}/api/v1/queue/{action}", self.base_url)),
+                    )
+                    .json(body)
+                },
+                deadline,
             )
-            .json(&LeaveQueueRequest {
-                player_uuid,
-                reason: LeaveReason::LobbyQuit,
-            });
-        let resp = req.send().await?;
+            .await?;
         if !resp.status().is_success() {
             return Err(OrchestratorClientError::HttpStatus(resp.status().as_u16()));
         }
+        Ok(resp)
+    }
+
+    pub async fn leave_if_queued(&self, player_uuid: Uuid) -> Result<(), OrchestratorClientError> {
+        let body = LeaveQueueRequest {
+            player_uuid,
+            reason: LeaveReason::LobbyQuit,
+        };
+        let deadline = Instant::now() + self.retry.budget;
+        self.post_queue("leave", &body, deadline).await?;
         Ok(())
     }
 

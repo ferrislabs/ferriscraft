@@ -16,6 +16,10 @@ name = "ferriscraft-lobby"
 path = "src/main.rs"
 
 [[bin]]
+name = "ferriscraft-lobby-migrate"
+path = "src/bin/migrate.rs"
+
+[[bin]]
 name = "normalize-anvil"
 path = "src/bin/normalize_anvil.rs"
 

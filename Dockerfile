@@ -184,12 +184,14 @@ COPY crates ./crates
 RUN --mount=type=cache,id=ferriscraft-cargo-registry-plugins,sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=ferriscraft-cargo-git-plugins,sharing=locked,target=/usr/local/cargo/git \
     --mount=type=cache,id=ferriscraft-cargo-target-lobby,sharing=locked,target=/opt/ferrislabs/ferriscraft/target \
-    cargo build --release --bin ferriscraft-lobby \
-    && cp /opt/ferrislabs/ferriscraft/target/release/ferriscraft-lobby /usr/local/bin/ferriscraft-lobby
+    cargo build --release --bin ferriscraft-lobby --bin ferriscraft-lobby-migrate \
+    && cp /opt/ferrislabs/ferriscraft/target/release/ferriscraft-lobby /usr/local/bin/ferriscraft-lobby \
+    && cp /opt/ferrislabs/ferriscraft/target/release/ferriscraft-lobby-migrate /usr/local/bin/ferriscraft-lobby-migrate
 
 FROM distroless-runtime AS lobby
 
 COPY --from=plugins-builder /usr/local/bin/ferriscraft-lobby /usr/local/bin/ferriscraft-lobby
+COPY --from=plugins-builder /usr/local/bin/ferriscraft-lobby-migrate /usr/local/bin/ferriscraft-lobby-migrate
 COPY --chown=65532:65532 lobby.json /app/lobby.json
 ARG FERRISCRAFT_VERSION=dev
 ARG RSPIGOT_REF=local
