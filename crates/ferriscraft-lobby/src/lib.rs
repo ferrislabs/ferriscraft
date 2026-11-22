@@ -10,6 +10,8 @@ pub mod npcs;
 pub mod orchestrator;
 pub mod plugin;
 pub mod prefs;
+pub mod profile;
+pub mod progress_menus;
 pub mod servers_menu;
 
 pub use plugin::FerrisCraftLobby;

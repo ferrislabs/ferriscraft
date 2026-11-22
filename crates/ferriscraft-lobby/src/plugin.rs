@@ -2,7 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use ferriscraft_protocol::QueueJoinStatus;
+use ferriscraft_progression::Catalog;
+use ferriscraft_protocol::{
+    AdminCoinGrant, CosmeticId, CosmeticSlot, PlayerIdentityUpdate, PlayerProfile, QueueJoinStatus,
+};
 use rspigot_plugin::prelude::*;
 use rspigot_plugin::{
     Action, BarColor, BarStyle, EquipmentSlot, EventResult, Explosion, Facing, Particle,
@@ -16,13 +19,22 @@ use crate::capitainerie::{
     build_run_completion_message, build_run_result_dialog, click_slug, clip_text,
     extract_agent_reply, step_name,
 };
-use crate::chat::ChatSystem;
+use crate::chat::{ChatBadge, ChatSystem};
 use crate::config::{ConfigError, EnvConfig, LayoutStore, WaypointPose};
 use crate::gadgets::{AuraTrail, GadgetManager, LobbyGadget};
 use crate::hud::{HubMetrics, HudManager, PlayerHudInput};
 use crate::menus::{
     GadgetsMenuAction, GamesMenuAction, MenuManager, OptionsMenuAction, apply_lobby_hotbar,
     decode_gadgets_click, decode_games_click, decode_options_click,
+};
+use crate::profile::{
+    ProfileCache, ShopItemState, can_grant_coins, equipped_gadget, equipped_trail, error_message,
+    gadget_usable, locked_cosmetic_message, next_usable_trail, requirement_message,
+    shop_item_state, to_player_rank, trail_usable,
+};
+use crate::progress_menus::{
+    ProfileMenuAction, ProgressMenuKind, ShopMenuAction, cosmetic_title, decode_profile_click,
+    decode_shop_click,
 };
 use crate::npcs::{CaptainTurn, NpcClickTarget, NpcDirector};
 use crate::orchestrator::{OrchestratorClient, OrchestratorClientError, ToggleQueueOutcome};
@@ -58,6 +70,7 @@ struct SharedState {
     layout: Arc<LayoutStore>,
     auth: Arc<AuthManager>,
     prefs: PrefsStore,
+    profiles: ProfileCache,
     menus: MenuManager,
     gadgets: GadgetManager,
     hud: HudManager,
@@ -96,6 +109,7 @@ impl FerrisCraftLobby {
                 layout,
                 auth,
                 prefs: PrefsStore::default(),
+                profiles: ProfileCache::default(),
                 menus: MenuManager::default(),
                 gadgets: GadgetManager::default(),
                 hud: HudManager::default(),
@@ -145,7 +159,14 @@ impl FerrisCraftLobby {
         self.state
             .menus
             .refresh_open_options(player.uuid, &prefs, claims.as_ref());
-        self.state.menus.refresh_open_gadgets(player.uuid, &prefs);
+        self.state.profiles.with(player.uuid, |profile| {
+            self.state
+                .menus
+                .refresh_open_gadgets(player.uuid, &prefs, profile);
+            self.state
+                .menus
+                .refresh_open_progress(player.uuid, profile);
+        });
 
         let (ping_ms, is_op) = match player.get_state().await {
             Ok(st) => (st.ping, st.op),
@@ -161,8 +182,220 @@ impl FerrisCraftLobby {
                 ferriskey_username: claims.map(|c| c.username),
                 ping_ms,
                 metrics,
+                network_level: self.state.profiles.level(player.uuid),
+                coins: self.state.profiles.coins(player.uuid),
             },
         );
+    }
+
+    fn store_profile(&self, uuid: Uuid, profile: PlayerProfile, apply_equipped: bool) {
+        if apply_equipped {
+            let gadget = equipped_gadget(&profile);
+            let trail = equipped_trail(&profile);
+            if gadget.is_some() || trail.is_some() {
+                self.state.prefs.update(uuid, |p| {
+                    if let Some(gadget) = gadget {
+                        p.equipped_gadget = Some(gadget);
+                    }
+                    if let Some(trail) = trail {
+                        p.aura_trail = trail;
+                    }
+                });
+            }
+        }
+        self.state.profiles.store(uuid, profile);
+    }
+
+    async fn sync_progression(&self, player: &Player) {
+        let Some(client) = &self.state.orchestrator else {
+            return;
+        };
+        let claims = self.state.auth.claims_of(player.uuid);
+        let is_op = player.get_state().await.is_ok_and(|s| s.op);
+        let has_admin = player.permissions.has("ferriscraft.admin");
+        let rank = Rank::resolve(claims.as_ref(), is_op, has_admin);
+        let identity = PlayerIdentityUpdate {
+            name: player.name.clone(),
+            rank: to_player_rank(rank),
+        };
+        if let Err(err) = client.post_identity(player.uuid, &identity).await {
+            tracing::warn!(
+                "Identité de progression non envoyée pour {}: {err}",
+                player.name
+            );
+        }
+        match client.fetch_profile(player.uuid).await {
+            Ok(profile) => {
+                self.store_profile(player.uuid, profile, true);
+                self.refresh_single_player_ui(player).await;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Profil de progression indisponible pour {}: {err}",
+                    player.name
+                );
+            }
+        }
+    }
+
+    fn persist_equipped(&self, player: &Player, slot: CosmeticSlot, cosmetic: Option<CosmeticId>) {
+        let Some(client) = self.state.orchestrator.clone() else {
+            return;
+        };
+        let lobby = self.clone();
+        let player = player.clone();
+        tokio::spawn(async move {
+            match client.equip(player.uuid, slot, cosmetic).await {
+                Ok(profile) => {
+                    lobby.store_profile(player.uuid, profile, false);
+                    lobby.refresh_single_player_ui(&player).await;
+                }
+                Err(err) => {
+                    tracing::debug!("Équipement non persisté pour {}: {err}", player.name);
+                }
+            }
+        });
+    }
+
+    fn open_progress_for(&self, player: Player, kind: ProgressMenuKind) {
+        let lobby = self.clone();
+        tokio::spawn(async move {
+            if let Some(client) = &lobby.state.orchestrator
+                && let Ok(profile) = client.fetch_profile(player.uuid).await
+            {
+                lobby.store_profile(player.uuid, profile, false);
+                lobby.refresh_single_player_ui(&player).await;
+            }
+            let profile = lobby.state.profiles.snapshot(player.uuid);
+            if let Err(err) = lobby
+                .state
+                .menus
+                .open_progress(&player.server(), &player, kind, profile.as_ref())
+                .await
+            {
+                tracing::debug!("Menu de progression non ouvert pour {}: {err}", player.name);
+            }
+        });
+    }
+
+    fn buy_cosmetic(&self, player: Player, cosmetic: CosmeticId) {
+        let Some(client) = self.state.orchestrator.clone() else {
+            player.message.send("§cBoutique indisponible.");
+            return;
+        };
+        let lobby = self.clone();
+        tokio::spawn(async move {
+            match client.purchase(player.uuid, cosmetic).await {
+                Ok(profile) => {
+                    lobby.store_profile(player.uuid, profile, false);
+                    player.sound.play(
+                        SoundCue::new(Sound::EntityPlayerLevelup)
+                            .volume(0.8)
+                            .pitch(1.3),
+                    );
+                    player.message.send(format!(
+                        "§a✔ Achat réussi : {}",
+                        cosmetic_title(cosmetic)
+                    ));
+                    lobby.refresh_single_player_ui(&player).await;
+                }
+                Err(err) => player.message.send(error_message(&err)),
+            }
+        });
+    }
+
+    fn equip_from_shop(&self, player: Player, slot: CosmeticSlot, cosmetic: CosmeticId) {
+        let Some(client) = self.state.orchestrator.clone() else {
+            player.message.send("§cBoutique indisponible.");
+            return;
+        };
+        let lobby = self.clone();
+        tokio::spawn(async move {
+            match client.equip(player.uuid, slot, Some(cosmetic)).await {
+                Ok(profile) => {
+                    lobby.store_profile(player.uuid, profile, true);
+                    player.sound.play(
+                        SoundCue::new(Sound::EntityItemPickup)
+                            .volume(0.75)
+                            .pitch(1.2),
+                    );
+                    player.action_bar.send(format!(
+                        "{} §aéquipé !",
+                        cosmetic_title(cosmetic)
+                    ));
+                    lobby.refresh_single_player_ui(&player).await;
+                }
+                Err(err) => player.message.send(error_message(&err)),
+            }
+        });
+    }
+
+    fn shop_item_click(&self, player: Player, cosmetic: CosmeticId) {
+        let Some(entry) = Catalog::entry(cosmetic) else {
+            return;
+        };
+        let state = self
+            .state
+            .profiles
+            .with(player.uuid, |p| p.map(|p| shop_item_state(p, &entry)));
+        match state {
+            None => player.message.send("§cBoutique indisponible."),
+            Some(ShopItemState::Equipped) => player
+                .action_bar
+                .send(format!("{} §7est déjà équipé.", cosmetic_title(cosmetic))),
+            Some(ShopItemState::Unlocked) => self.equip_from_shop(player, entry.slot, cosmetic),
+            Some(ShopItemState::Buyable(_)) => self.buy_cosmetic(player, cosmetic),
+            Some(ShopItemState::Locked(unlock)) => {
+                player.message.send(requirement_message(unlock));
+            }
+        }
+    }
+
+    fn handle_progress_click(&self, player: Player, kind: ProgressMenuKind, slot: i32) {
+        match kind {
+            ProgressMenuKind::Profile => match decode_profile_click(slot) {
+                Some(ProfileMenuAction::OpenShop) => {
+                    player
+                        .sound
+                        .play(SoundCue::new(Sound::UiButtonClick).volume(0.7));
+                    self.open_progress_for(
+                        player,
+                        ProgressMenuKind::Shop(CosmeticSlot::LobbyGadget),
+                    );
+                }
+                Some(ProfileMenuAction::BackToGames) => self.back_to_games(player),
+                None => {}
+            },
+            ProgressMenuKind::Shop(page) => match decode_shop_click(slot, page) {
+                Some(ShopMenuAction::Page(tab)) => {
+                    player
+                        .sound
+                        .play(SoundCue::new(Sound::UiButtonClick).volume(0.7));
+                    self.state.profiles.with(player.uuid, |profile| {
+                        self.state.menus.show_progress_page(
+                            player.uuid,
+                            ProgressMenuKind::Shop(tab),
+                            profile,
+                        );
+                    });
+                }
+                Some(ShopMenuAction::Item(cosmetic)) => {
+                    player
+                        .sound
+                        .play(SoundCue::new(Sound::UiButtonClick).volume(0.7));
+                    self.shop_item_click(player, cosmetic);
+                }
+                Some(ShopMenuAction::BackToGames) => self.back_to_games(player),
+                None => {}
+            },
+        }
+    }
+
+    fn back_to_games(&self, player: Player) {
+        let lobby = self.clone();
+        tokio::spawn(async move {
+            let _ = lobby.state.menus.open_games(&player).await;
+        });
     }
 
     fn start_ferriskey_login(&self, player: Player) {
@@ -200,6 +433,7 @@ impl FerrisCraftLobby {
                                 session.claims.username
                             ));
                             lobby.refresh_single_player_ui(&player).await;
+                            lobby.sync_progression(&player).await;
                         }
                         Err(AuthError::Cancelled) => {}
                         Err(AuthError::Expired) => {
@@ -638,7 +872,11 @@ impl FerrisCraftLobby {
         self.state
             .menus
             .refresh_open_options(player.uuid, &updated, claims.as_ref());
-        self.state.menus.refresh_open_gadgets(player.uuid, &updated);
+        self.state.profiles.with(player.uuid, |profile| {
+            self.state
+                .menus
+                .refresh_open_gadgets(player.uuid, &updated, profile);
+        });
 
         if updated.flight_enabled {
             player.sound.play(
@@ -681,7 +919,11 @@ impl FerrisCraftLobby {
         self.state
             .menus
             .refresh_open_options(player.uuid, &updated, claims.as_ref());
-        self.state.menus.refresh_open_gadgets(player.uuid, &updated);
+        self.state.profiles.with(player.uuid, |profile| {
+            self.state
+                .menus
+                .refresh_open_gadgets(player.uuid, &updated, profile);
+        });
 
         player.sound.play(
             SoundCue::new(Sound::EntityExperienceOrbPickup)
@@ -698,11 +940,27 @@ impl FerrisCraftLobby {
     }
 
     fn cycle_trail_for(&self, player: &Player) {
+        let current = self.state.prefs.get(player.uuid).aura_trail;
+        let next = self
+            .state
+            .profiles
+            .with(player.uuid, |profile| next_usable_trail(current, profile));
+        if next == current {
+            player
+                .message
+                .send("§7Aucune autre traînée débloquée. Voir §e/boutique§7.");
+            return;
+        }
         let updated = self
             .state
             .prefs
-            .update(player.uuid, |p| p.aura_trail = p.aura_trail.next());
-        self.state.menus.refresh_open_gadgets(player.uuid, &updated);
+            .update(player.uuid, |p| p.aura_trail = next);
+        self.state.profiles.with(player.uuid, |profile| {
+            self.state
+                .menus
+                .refresh_open_gadgets(player.uuid, &updated, profile);
+        });
+        self.persist_equipped(player, CosmeticSlot::LobbyTrail, next.cosmetic());
         player.sound.play(
             SoundCue::new(Sound::EntityExperienceOrbPickup)
                 .volume(0.75)
@@ -726,13 +984,33 @@ impl FerrisCraftLobby {
     }
 
     fn equip_gadget_for(&self, player: &Player, gadget: Option<LobbyGadget>) {
+        if let Some(gadget) = gadget
+            && !self
+                .state
+                .profiles
+                .with(player.uuid, |p| gadget_usable(p, gadget))
+        {
+            player
+                .message
+                .send(locked_cosmetic_message(gadget.cosmetic()));
+            return;
+        }
         let updated = self
             .state
             .prefs
             .update(player.uuid, |p| p.equipped_gadget = gadget);
         let claims = self.state.auth.claims_of(player.uuid);
         apply_lobby_hotbar(player, claims.as_ref(), &updated);
-        self.state.menus.refresh_open_gadgets(player.uuid, &updated);
+        self.state.profiles.with(player.uuid, |profile| {
+            self.state
+                .menus
+                .refresh_open_gadgets(player.uuid, &updated, profile);
+        });
+        self.persist_equipped(
+            player,
+            CosmeticSlot::LobbyGadget,
+            gadget.map(LobbyGadget::cosmetic),
+        );
 
         player.sound.play(
             SoundCue::new(Sound::EntityItemPickup)
@@ -759,10 +1037,11 @@ impl FerrisCraftLobby {
         let lobby = self.clone();
         tokio::spawn(async move {
             let cur_prefs = lobby.state.prefs.get(player.uuid);
+            let profile = lobby.state.profiles.snapshot(player.uuid);
             let _ = lobby
                 .state
                 .menus
-                .open_gadgets(&player.server(), &player, &cur_prefs)
+                .open_gadgets(&player.server(), &player, &cur_prefs, profile.as_ref())
                 .await;
         });
     }
@@ -782,6 +1061,15 @@ impl FerrisCraftLobby {
                         ));
                     }
                     GamesMenuAction::OpenGadgets => self.open_gadgets_menu_for(player),
+                    GamesMenuAction::OpenProfile => {
+                        self.open_progress_for(player, ProgressMenuKind::Profile);
+                    }
+                    GamesMenuAction::OpenShop => {
+                        self.open_progress_for(
+                            player,
+                            ProgressMenuKind::Shop(CosmeticSlot::LobbyGadget),
+                        );
+                    }
                     GamesMenuAction::TeleportPoi(poi) => self.teleport_to_poi(player, poi),
                     GamesMenuAction::OpenOptions => {
                         let lobby = self.clone();
@@ -840,6 +1128,7 @@ impl FerrisCraftLobby {
                             let lobby = self.clone();
                             tokio::spawn(async move {
                                 lobby.refresh_single_player_ui(&player).await;
+                                lobby.sync_progression(&player).await;
                             });
                         } else {
                             self.start_ferriskey_login(player);
@@ -853,6 +1142,15 @@ impl FerrisCraftLobby {
                     }
                 }
             }
+            return;
+        }
+
+        if let Some(kind) = self
+            .state
+            .menus
+            .progress_menu_kind(player.uuid, clicked_inv)
+        {
+            self.handle_progress_click(player, kind, slot);
             return;
         }
 
@@ -1405,7 +1703,12 @@ impl FerrisCraftLobby {
                 lobby_hud
                     .state
                     .hud
-                    .refresh_all(&srv_hud, &lobby_hud.state.auth, metrics)
+                    .refresh_all(
+                        &srv_hud,
+                        &lobby_hud.state.auth,
+                        &lobby_hud.state.profiles,
+                        metrics,
+                    )
                     .await;
             }
         });
@@ -1503,6 +1806,7 @@ impl FerrisCraftLobby {
             }
 
             lobby.refresh_single_player_ui(&player).await;
+            lobby.sync_progression(&player).await;
         });
     }
 
@@ -1511,6 +1815,8 @@ impl FerrisCraftLobby {
         self.state.auth.cancel_pending(player.uuid);
         self.state.menus.discard_options(player.uuid);
         self.state.menus.discard_gadgets(player.uuid);
+        self.state.menus.discard_progress(player.uuid);
+        self.state.profiles.remove(player.uuid);
         self.state.gadgets.clear_player(player.uuid);
         self.state.hud.detach_player(player.uuid, &player.name);
         self.state.npcs.leave_captain_chat(player.uuid);
@@ -1615,7 +1921,17 @@ impl FerrisCraftLobby {
                 if let Some(gadget) = LobbyGadget::from_material(&other)
                     && prefs.equipped_gadget == Some(gadget)
                 {
-                    self.state.gadgets.activate(player, gadget);
+                    if self
+                        .state
+                        .profiles
+                        .with(player.uuid, |p| gadget_usable(p, gadget))
+                    {
+                        self.state.gadgets.activate(player, gadget);
+                    } else {
+                        player
+                            .action_bar
+                            .send(locked_cosmetic_message(gadget.cosmetic()));
+                    }
                 }
             }
             _ => {}
@@ -1928,7 +2244,10 @@ impl FerrisCraftLobby {
             };
             lobby.state.chat.broadcast_chat(
                 &player,
-                rank,
+                ChatBadge {
+                    rank,
+                    level: lobby.state.profiles.level(player.uuid),
+                },
                 claims.as_ref(),
                 &text,
                 &recipients,
@@ -2027,7 +2346,12 @@ impl FerrisCraftLobby {
             .insert(event.player().uuid, step);
 
         let prefs = self.state.prefs.get(event.player().uuid);
-        if prefs.aura_trail != AuraTrail::None {
+        if prefs.aura_trail != AuraTrail::None
+            && self
+                .state
+                .profiles
+                .with(event.player().uuid, |p| trail_usable(p, prefs.aura_trail))
+        {
             self.state
                 .gadgets
                 .emit_trail_if_due(event.player(), prefs.aura_trail);
@@ -2153,13 +2477,76 @@ impl FerrisCraftLobby {
             .sound
             .play(SoundCue::new(Sound::UiButtonClick).volume(0.7));
         let prefs = self.state.prefs.get(player.uuid);
+        let profile = self.state.profiles.snapshot(player.uuid);
         if let Err(err) = self
             .state
             .menus
-            .open_gadgets(&player.server(), &player, &prefs)
+            .open_gadgets(&player.server(), &player, &prefs, profile.as_ref())
             .await
         {
             ctx.reply(format!("§cImpossible d'ouvrir les gadgets : {err}"));
+        }
+    }
+
+    #[command("profil")]
+    async fn cmd_profil(&self, ctx: Context) {
+        self.open_progress_for(ctx.sender.clone(), ProgressMenuKind::Profile);
+    }
+
+    #[command("boutique")]
+    async fn cmd_boutique(&self, ctx: Context) {
+        self.open_progress_for(
+            ctx.sender.clone(),
+            ProgressMenuKind::Shop(CosmeticSlot::LobbyGadget),
+        );
+    }
+
+    #[command("coins")]
+    async fn cmd_coins(
+        &self,
+        ctx: Context,
+        action: Option<String>,
+        target: Option<Player>,
+        amount: Option<u64>,
+    ) {
+        let sender = ctx.sender.clone();
+        let claims = self.state.auth.claims_of(sender.uuid);
+        let is_op = sender.get_state().await.is_ok_and(|s| s.op);
+        let has_admin = sender.permissions.has("ferriscraft.admin");
+        if !can_grant_coins(Rank::resolve(claims.as_ref(), is_op, has_admin)) {
+            ctx.reply("§cRéservé aux admins.");
+            return;
+        }
+        let (Some("give"), Some(target), Some(amount)) = (action.as_deref(), target, amount) else {
+            ctx.reply("§cUsage : /coins give <joueur> <montant>");
+            return;
+        };
+        if amount == 0 {
+            ctx.reply("§cLe montant doit être supérieur à 0.");
+            return;
+        }
+        let Some(client) = &self.state.orchestrator else {
+            ctx.reply("§cOrchestrateur non configuré.");
+            return;
+        };
+        let grant = AdminCoinGrant {
+            amount,
+            admin: sender.name.clone(),
+        };
+        match client.grant_coins(target.uuid, &grant).await {
+            Ok(profile) => {
+                self.store_profile(target.uuid, profile, false);
+                ctx.reply(format!(
+                    "§a✔ +{amount} coins crédités à §f{}§a.",
+                    target.name
+                ));
+                target.message.send(format!(
+                    "§6§lFerrisCraft §8» §a+{amount} coins §7(crédit de §f{}§7)",
+                    sender.name
+                ));
+                self.refresh_single_player_ui(&target).await;
+            }
+            Err(err) => ctx.reply(error_message(&err)),
         }
     }
 
@@ -2205,6 +2592,7 @@ impl FerrisCraftLobby {
             }
             ctx.reply("§eVotre compte FerrisKey a été déconnecté.");
             self.refresh_single_player_ui(&player).await;
+            self.sync_progression(&player).await;
         } else {
             ctx.reply("§7Aucun compte FerrisKey n'était actif.");
         }
