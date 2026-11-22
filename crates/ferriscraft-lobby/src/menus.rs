@@ -9,6 +9,8 @@ use rspigot_plugin::{
 use crate::auth::UserClaims;
 use crate::gadgets::LobbyGadget;
 use crate::prefs::PlayerPrefs;
+use crate::servers_menu::{SERVERS_ROWS, populate_servers_menu, sorted_server_ids};
+use ferriscraft_protocol::FleetStatusSnapshot;
 
 pub const HOTBAR_GAMES_SLOT: u8 = 0;
 pub const HOTBAR_SHEEPWARS_SLOT: u8 = 1;
@@ -635,6 +637,7 @@ pub struct MenuManager {
     games_menu: RwLock<Option<CustomInventory>>,
     options_menus: RwLock<HashMap<Uuid, CustomInventory>>,
     gadgets_menus: RwLock<HashMap<Uuid, CustomInventory>>,
+    servers_menus: RwLock<HashMap<Uuid, (CustomInventory, Vec<String>)>>,
 }
 
 impl MenuManager {
@@ -733,6 +736,58 @@ impl MenuManager {
         }
     }
 
+    pub async fn open_servers(
+        &self,
+        server: &Server,
+        player: &Player,
+        lobby_version: Option<&str>,
+        snapshot: &FleetStatusSnapshot,
+    ) -> Result<(), Error> {
+        self.discard_servers(player.uuid);
+        let inv = server
+            .create_inventory(SERVERS_ROWS, "§d§lFerrisCraft §8• §fServeurs")
+            .await?;
+        populate_servers_menu(
+            &inv,
+            lobby_version,
+            snapshot.orchestrator_version.as_deref(),
+            &snapshot.servers,
+        );
+        self.servers_menus
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                player.uuid,
+                (inv.clone(), sorted_server_ids(&snapshot.servers)),
+            );
+        player.inventory.open(&inv).await
+    }
+
+    pub fn servers_menu_server_ids(
+        &self,
+        player_uuid: Uuid,
+        inv_ref: Option<&InventoryRef>,
+    ) -> Option<Vec<String>> {
+        let custom = inv_ref.and_then(InventoryRef::custom)?;
+        self.servers_menus
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&player_uuid)
+            .filter(|(known, _)| known == custom)
+            .map(|(_, ids)| ids.clone())
+    }
+
+    pub fn discard_servers(&self, player_uuid: Uuid) {
+        if let Some((removed, _)) = self
+            .servers_menus
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&player_uuid)
+        {
+            removed.discard();
+        }
+    }
+
     pub fn is_games_inventory(&self, inv_ref: Option<&InventoryRef>) -> bool {
         let Some(custom) = inv_ref.and_then(InventoryRef::custom) else {
             return false;
@@ -791,6 +846,17 @@ impl MenuManager {
             .unwrap_or_else(|e| e.into_inner());
         if gad_guard.get(&player_uuid) == Some(custom)
             && let Some(removed) = gad_guard.remove(&player_uuid)
+        {
+            removed.discard();
+        }
+        drop(gad_guard);
+
+        let mut srv_guard = self
+            .servers_menus
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if srv_guard.get(&player_uuid).map(|(inv, _)| inv) == Some(custom)
+            && let Some((removed, _)) = srv_guard.remove(&player_uuid)
         {
             removed.discard();
         }
