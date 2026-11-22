@@ -25,6 +25,8 @@ use crate::s3::{MapCatalog, S3Client, hex_lower, sanitize_k8s_label};
 pub const TEMPLATE_HASH_LABEL: &str = "ferriscraft.io/template-hash";
 const TEMPLATE_HASH_LEN: usize = 12;
 
+const DELETE_RETRY_AFTER: Duration = Duration::from_secs(30);
+
 const SHEEPWARS_SELECTOR: &str =
     "app.kubernetes.io/component=sheepwars,app.kubernetes.io/managed-by=ferriscraft-orchestrator";
 
@@ -544,6 +546,7 @@ async fn reconcile_once(
     };
 
     let mut live_ids = HashSet::new();
+    let mut terminating_ids = HashSet::new();
     let mut events = Vec::new();
     let now = Instant::now();
 
@@ -560,6 +563,9 @@ async fn reconcile_once(
             .and_then(|l| l.get(TEMPLATE_HASH_LABEL))
             .is_none_or(|hash| hash != current_hash);
         live_ids.insert(server_id.clone());
+        if pod.metadata.deletion_timestamp.is_some() {
+            terminating_ids.insert(server_id.clone());
+        }
 
         let address = pod
             .status
@@ -583,12 +589,13 @@ async fn reconcile_once(
         }
     }
 
-    let actions = {
+    let (actions, retries) = {
         let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
         events.extend(engine.retain_infra_servers(&live_ids));
         let actions = engine.tick(now);
         events.extend(actions.proxy_events.clone());
-        actions
+        let retries = engine.deletions_to_retry(now, DELETE_RETRY_AFTER);
+        (actions, retries)
     };
     state.emit_proxy_events(events);
     state.flush_queue_logged().await;
@@ -599,6 +606,14 @@ async fn reconcile_once(
         } else {
             tracing::info!(%server_id, ?reason, "Suppression du Pod SheepWars");
         }
+        delete_server(ctx, &server_id, &mut objects).await;
+    }
+
+    for server_id in retries {
+        if terminating_ids.contains(&server_id) {
+            continue;
+        }
+        tracing::warn!(%server_id, "Pod SheepWars toujours présent, nouvelle suppression");
         delete_server(ctx, &server_id, &mut objects).await;
     }
 
