@@ -61,6 +61,7 @@ struct ManagedServer {
     last_non_empty_at: Instant,
     phase_since: Instant,
     empty_since: Option<Instant>,
+    outdated: bool,
     registered_on_proxy: bool,
 }
 
@@ -72,6 +73,7 @@ pub enum DeletionReason {
     HeartbeatLost,
     StartingTimeout,
     IdleExcess,
+    Outdated,
 }
 
 impl DeletionReason {
@@ -97,6 +99,10 @@ impl ManagedServer {
         self.phase = phase;
         self.phase_since = now;
         true
+    }
+
+    fn is_idle_empty(&self) -> bool {
+        self.player_count == 0 && matches!(self.phase, ServerPhase::Starting | ServerPhase::Waiting)
     }
 
     fn heartbeat_lost(&self, now: Instant, timeout: Duration) -> bool {
@@ -271,6 +277,7 @@ impl FleetEngine {
                 last_non_empty_at: now,
                 phase_since: now,
                 empty_since: None,
+                outdated: false,
                 registered_on_proxy: false,
             });
     }
@@ -302,6 +309,7 @@ impl FleetEngine {
                 last_non_empty_at: now,
                 phase_since: now,
                 empty_since: None,
+                outdated: false,
                 registered_on_proxy: false,
             });
 
@@ -357,6 +365,12 @@ impl FleetEngine {
         }
     }
 
+    pub fn mark_outdated(&mut self, server_id: &str) {
+        if let Some(server) = self.servers.get_mut(server_id) {
+            server.outdated = true;
+        }
+    }
+
     pub fn mark_deleting(&mut self, now: Instant, server_id: &str) -> Option<ProxyEvent> {
         self.deleting.insert(server_id.to_owned());
         let server = self.servers.get_mut(server_id)?;
@@ -391,6 +405,7 @@ impl FleetEngine {
                 last_non_empty_at: now,
                 phase_since: now,
                 empty_since: None,
+                outdated: false,
                 registered_on_proxy: false,
             });
 
@@ -548,7 +563,7 @@ impl FleetEngine {
 
             // Pick a joinable server: prefer already-populated Waiting/Countdown servers first
             // to fill matches quickly without splitting players across empty servers.
-            let mut candidates: Vec<(bool, u32, u32, String)> = self
+            let mut candidates: Vec<(bool, bool, u32, u32, String)> = self
                 .servers
                 .values()
                 .filter(|s| {
@@ -563,7 +578,13 @@ impl FleetEngine {
                     if free == 0 {
                         None
                     } else {
-                        Some((occupied > 0, occupied, free, s.server_id.clone()))
+                        Some((
+                            !s.outdated,
+                            occupied > 0,
+                            occupied,
+                            free,
+                            s.server_id.clone(),
+                        ))
                     }
                 })
                 .collect();
@@ -575,10 +596,11 @@ impl FleetEngine {
             candidates.sort_by(|a, b| {
                 b.0.cmp(&a.0)
                     .then_with(|| b.1.cmp(&a.1))
-                    .then_with(|| a.3.cmp(&b.3))
+                    .then_with(|| b.2.cmp(&a.2))
+                    .then_with(|| a.4.cmp(&b.4))
             });
 
-            let (has_players, _, free_slots, target_server) = candidates.remove(0);
+            let (_, has_players, _, free_slots, target_server) = candidates.remove(0);
 
             // Only open an empty server once queue meets queue_min_players.
             // If a server already has players waiting inside, backfill immediately!
@@ -661,6 +683,14 @@ impl FleetEngine {
         let mut to_delete = Vec::new();
         let pending_by_server = self.pending_transfer_counts();
 
+        let replacement_ready = self.servers.values().any(|s| {
+            !s.outdated
+                && !self.deleting.contains(&s.server_id)
+                && s.phase == ServerPhase::Waiting
+                && s.ready_for_proxy()
+        });
+        let mut retiring = HashSet::new();
+
         for s in self.servers.values() {
             if self.deleting.contains(&s.server_id) {
                 continue;
@@ -671,6 +701,15 @@ impl FleetEngine {
                     server_id: s.server_id.clone(),
                     reason,
                 });
+            } else if s.outdated && s.is_idle_empty() && pending == 0 {
+                if replacement_ready {
+                    to_delete.push(ServerDeletion {
+                        server_id: s.server_id.clone(),
+                        reason: DeletionReason::Outdated,
+                    });
+                } else {
+                    retiring.insert(s.server_id.as_str());
+                }
             }
         }
 
@@ -682,6 +721,7 @@ impl FleetEngine {
             .filter(|s| {
                 !self.deleting.contains(&s.server_id)
                     && !delete_set.contains(s.server_id.as_str())
+                    && !retiring.contains(s.server_id.as_str())
                     && s.phase.is_active()
             })
             .count();
@@ -692,6 +732,7 @@ impl FleetEngine {
             .filter(|s| {
                 !self.deleting.contains(&s.server_id)
                     && !delete_set.contains(s.server_id.as_str())
+                    && !s.outdated
                     && s.phase.is_standby_capacity()
             })
             .count();
@@ -731,6 +772,7 @@ impl FleetEngine {
                 .filter(|s| {
                     !self.deleting.contains(&s.server_id)
                         && !delete_set.contains(s.server_id.as_str())
+                        && !s.outdated
                         && s.phase == ServerPhase::Waiting
                         && s.player_count == 0
                         && pending_by_server.get(&s.server_id).copied().unwrap_or(0) == 0
@@ -1309,5 +1351,97 @@ mod tests {
         heartbeat(&mut engine, t0, "sheepwars-1", ServerPhase::Ending, 0);
         assert_eq!(deleted(&engine.tick(t0)).len(), 1);
         assert!(deleted(&engine.tick(t0 + Duration::from_secs(1))).is_empty());
+    }
+
+    fn waiting(engine: &mut FleetEngine, now: Instant, id: &str) {
+        infra(engine, now, id);
+        heartbeat(engine, now, id, ServerPhase::Waiting, 0);
+    }
+
+    #[test]
+    fn outdated_idle_server_gets_a_replacement_before_it_is_deleted() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        waiting(&mut engine, t0, "old");
+        engine.mark_outdated("old");
+
+        let first = engine.tick(t0);
+        assert_eq!(first.servers_to_create, 1);
+        assert!(deleted(&first).is_empty());
+
+        waiting(&mut engine, t0, "new");
+        let second = engine.tick(t0 + Duration::from_secs(1));
+        assert_eq!(deleted(&second), [("old", DeletionReason::Outdated)]);
+        assert_eq!(second.servers_to_create, 0);
+    }
+
+    #[test]
+    fn outdated_server_in_game_is_kept_until_its_round_ends() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        infra(&mut engine, t0, "old");
+        heartbeat(&mut engine, t0, "old", ServerPhase::InGame, 2);
+        engine.mark_outdated("old");
+        waiting(&mut engine, t0, "new");
+
+        assert!(deleted(&engine.tick(t0)).is_empty());
+
+        heartbeat(&mut engine, t0, "old", ServerPhase::Ending, 0);
+        assert_eq!(
+            deleted(&engine.tick(t0 + Duration::from_secs(1))),
+            [("old", DeletionReason::RoundEnded)]
+        );
+    }
+
+    #[test]
+    fn queue_prefers_an_up_to_date_server() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        infra(&mut engine, t0, "old");
+        heartbeat(&mut engine, t0, "old", ServerPhase::Waiting, 1);
+        engine.mark_outdated("old");
+        waiting(&mut engine, t0, "new");
+
+        for n in 10..12u128 {
+            engine.join_queue(
+                t0,
+                JoinQueueRequest {
+                    player_uuid: Uuid::from_u128(n),
+                    player_name: format!("p{n}"),
+                },
+            );
+        }
+        let actions = engine.tick(t0);
+        let targets: Vec<&str> = actions
+            .proxy_events
+            .iter()
+            .filter_map(|event| match event {
+                ProxyEvent::TransferPlayer { target_server, .. } => Some(target_server.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(targets, ["new", "new"]);
+    }
+
+    #[test]
+    fn outdated_server_with_a_waiting_player_still_takes_players_when_alone() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        infra(&mut engine, t0, "old");
+        heartbeat(&mut engine, t0, "old", ServerPhase::Waiting, 1);
+        engine.mark_outdated("old");
+        engine.join_queue(
+            t0,
+            JoinQueueRequest {
+                player_uuid: Uuid::from_u128(10),
+                player_name: "p10".to_owned(),
+            },
+        );
+        let actions = engine.tick(t0);
+        assert!(actions.proxy_events.iter().any(|event| matches!(
+            event,
+            ProxyEvent::TransferPlayer { target_server, .. } if target_server == "old"
+        )));
+        assert!(deleted(&actions).is_empty());
     }
 }

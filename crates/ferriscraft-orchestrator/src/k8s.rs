@@ -9,13 +9,17 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::Client;
 use kube::api::{Api, DeleteParams, ListParams, PostParams};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::api::AppState;
 use crate::config::OrchestratorConfig;
 use crate::engine::ServerDeletion;
 
-use crate::s3::{MapCatalog, S3Client, sanitize_k8s_label};
+use crate::s3::{MapCatalog, S3Client, hex_lower, sanitize_k8s_label};
+
+pub const TEMPLATE_HASH_LABEL: &str = "ferriscraft.io/template-hash";
+const TEMPLATE_HASH_LEN: usize = 12;
 
 const SHEEPWARS_SELECTOR: &str =
     "app.kubernetes.io/component=sheepwars,app.kubernetes.io/managed-by=ferriscraft-orchestrator";
@@ -38,6 +42,17 @@ pub fn load_pod_template(config: &OrchestratorConfig) -> Option<PodTemplateSpec>
     }
 }
 
+pub fn template_hash(config: &OrchestratorConfig, template: Option<&PodTemplateSpec>) -> String {
+    let rendered = match template {
+        Some(tpl) => serde_json::to_vec(tpl),
+        None => serde_json::to_vec(&default_pod_spec(config)),
+    }
+    .unwrap_or_default();
+    let mut hash = hex_lower(&Sha256::digest(&rendered));
+    hash.truncate(TEMPLATE_HASH_LEN);
+    hash
+}
+
 pub fn build_sheepwars_pod(
     pod_name: &str,
     config: &OrchestratorConfig,
@@ -58,6 +73,10 @@ pub fn build_sheepwars_pod(
         "ferriscraft-orchestrator".to_owned(),
     );
     labels.insert("ferriscraft.io/server-id".to_owned(), pod_name.to_owned());
+    labels.insert(
+        TEMPLATE_HASH_LABEL.to_owned(),
+        template_hash(config, template),
+    );
     if let Some(map_name) = selected_map {
         let label = sanitize_k8s_label(map_name);
         if !label.is_empty() {
@@ -285,6 +304,7 @@ pub async fn run_k8s_reconcile_loop(state: AppState, config: OrchestratorConfig)
     };
     let pods_api: Api<Pod> = Api::namespaced(client, &config.k8s_namespace);
     let template = load_pod_template(&config);
+    let current_hash = template_hash(&config, template.as_ref());
 
     let mut map_discovery = config
         .s3
@@ -304,6 +324,7 @@ pub async fn run_k8s_reconcile_loop(state: AppState, config: OrchestratorConfig)
         queue_min_players = config.queue_min_players,
         s3_enabled = map_discovery.is_some(),
         fixed_map = ?config.fixed_map,
+        template_hash = %current_hash,
         "Réconciliateur Kubernetes SheepWars démarré"
     );
 
@@ -318,6 +339,7 @@ pub async fn run_k8s_reconcile_loop(state: AppState, config: OrchestratorConfig)
             &config,
             &pods_api,
             template.as_ref(),
+            &current_hash,
             map_discovery.as_mut(),
         )
         .await
@@ -332,6 +354,7 @@ async fn reconcile_once(
     config: &OrchestratorConfig,
     pods_api: &Api<Pod>,
     template: Option<&PodTemplateSpec>,
+    current_hash: &str,
     mut map_discovery: Option<&mut MapDiscoveryState>,
 ) -> Result<(), kube::Error> {
     let lp = ListParams::default().labels(SHEEPWARS_SELECTOR);
@@ -345,13 +368,14 @@ async fn reconcile_once(
         let Some(pod_name) = pod.metadata.name.clone() else {
             continue;
         };
-        let server_id = pod
-            .metadata
-            .labels
-            .as_ref()
+        let labels = pod.metadata.labels.as_ref();
+        let server_id = labels
             .and_then(|l| l.get("ferriscraft.io/server-id"))
             .cloned()
             .unwrap_or_else(|| pod_name.clone());
+        let outdated = labels
+            .and_then(|l| l.get(TEMPLATE_HASH_LABEL))
+            .is_none_or(|hash| hash != current_hash);
         live_ids.insert(server_id.clone());
 
         let address = pod
@@ -365,12 +389,15 @@ async fn reconcile_once(
         let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
         events.extend(engine.upsert_infra_server(
             now,
-            server_id,
+            server_id.clone(),
             Some(pod_name),
             address,
             ready,
             terminating,
         ));
+        if outdated {
+            engine.mark_outdated(&server_id);
+        }
     }
 
     let actions = {
@@ -517,5 +544,45 @@ mod tests {
                 )
             );
         }
+    }
+
+    fn plugin_template(image: &str) -> PodTemplateSpec {
+        PodTemplateSpec {
+            metadata: None,
+            spec: Some(PodSpec {
+                containers: vec![Container {
+                    name: "sheepwars-plugin".to_owned(),
+                    image: Some(image.to_owned()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn pod_is_labelled_with_the_template_hash() {
+        let config = test_config();
+        let template = plugin_template("plugin:v1");
+        let pod = build_sheepwars_pod("sheepwars-abc123", &config, Some(&template), None);
+        let labels = pod.metadata.labels.unwrap();
+        assert_eq!(
+            labels.get(TEMPLATE_HASH_LABEL),
+            Some(&template_hash(&config, Some(&template)))
+        );
+    }
+
+    #[test]
+    fn template_hash_changes_with_the_image_and_is_stable() {
+        let config = test_config();
+        let v1 = template_hash(&config, Some(&plugin_template("plugin:v1")));
+        let v2 = template_hash(&config, Some(&plugin_template("plugin:v2")));
+        assert_eq!(v1.len(), TEMPLATE_HASH_LEN);
+        assert_ne!(v1, v2);
+        assert_eq!(
+            v1,
+            template_hash(&config, Some(&plugin_template("plugin:v1")))
+        );
+        assert_ne!(template_hash(&config, None), v1);
     }
 }
