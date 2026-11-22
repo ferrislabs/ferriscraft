@@ -2,7 +2,16 @@ use crate::domain::Damage;
 use crate::domain::SheepKind;
 use crate::domain::TeamId;
 use crate::sheep::Action;
+use crate::sheep::BlockKind;
 use crate::sheep::Cell;
+use crate::sheep::EffectKind;
+use crate::sheep::FROST_ICE_LAYERS;
+use crate::sheep::FROST_ICE_RING_TICKS;
+use crate::sheep::FROST_PULSE_TICKS;
+use crate::sheep::FROST_SLOWNESS_AMPLIFIER;
+use crate::sheep::FROST_SLOWNESS_TICKS;
+use crate::sheep::FROST_ZONE_DURATION_TICKS;
+use crate::sheep::FROST_ZONE_RADIUS;
 use crate::sheep::INTERGALACTIC_CLEAR_HEIGHT;
 use crate::sheep::INTERGALACTIC_FALL_TICKS;
 use crate::sheep::INTERGALACTIC_POWER;
@@ -22,6 +31,10 @@ use crate::sheep::WARP_DELAY_TICKS;
 const METEOR_OFFSET_X: f64 = 6.0;
 const METEOR_OFFSET_Z: f64 = 4.0;
 const QUAKE_PARTICLE_POINTS: u32 = 6;
+const FROST_OUTER_SHELL_POINTS: u32 = 48;
+const FROST_INNER_SHELL_POINTS: u32 = 20;
+const FROST_INNER_SHELL_RATIO: f64 = 0.55;
+const GOLDEN_ANGLE: f64 = 2.399_963_229_728_653;
 const WARP_MAX_ATTEMPTS: u32 = 4096;
 
 #[derive(Debug)]
@@ -55,6 +68,7 @@ enum Effect {
     Quake { at: Vec3, team: TeamId, age: u32 },
     Warp { at: Vec3, age: u32, rng: Rng },
     Meteor { at: Vec3, team: TeamId, age: u32 },
+    Frost { at: Vec3, team: TeamId, age: u32 },
 }
 
 #[derive(Debug, Default)]
@@ -76,6 +90,7 @@ impl Effects {
                 rng: Rng::seeded(at),
             },
             SheepKind::Intergalactic => Effect::Meteor { at, team, age: 0 },
+            SheepKind::Frozen => Effect::Frost { at, team, age: 0 },
             _ => return,
         };
         self.active.push(effect);
@@ -103,6 +118,11 @@ impl Effects {
                 *age += 1;
                 meteor_step(*at, team.other(), *age, &mut actions);
                 *age < INTERGALACTIC_FALL_TICKS
+            }
+            Effect::Frost { at, team, age } => {
+                *age += 1;
+                frost_step(*at, team.other(), *age, &mut actions);
+                *age < FROST_ZONE_DURATION_TICKS
             }
         });
         actions
@@ -146,6 +166,84 @@ fn quake_pulse(at: Vec3, enemies: TeamId, actions: &mut Vec<Action>) {
         kind: SoundKind::Quake,
         at,
     });
+}
+
+fn ice_ring(center: Cell, ring: u32, actions: &mut Vec<Action>) {
+    let reach = FROST_ZONE_RADIUS.ceil() as i32;
+    for dx in -reach..=reach {
+        for dz in -reach..=reach {
+            let distance = f64::from(dx * dx + dz * dz).sqrt();
+            if distance > FROST_ZONE_RADIUS || distance.round() as u32 != ring {
+                continue;
+            }
+            for dy in FROST_ICE_LAYERS {
+                actions.push(Action::SetBlock {
+                    at: Cell {
+                        x: center.x + dx,
+                        y: center.y + dy,
+                        z: center.z + dz,
+                    },
+                    block: BlockKind::Ice,
+                });
+            }
+        }
+    }
+}
+
+fn frost_step(at: Vec3, enemies: TeamId, age: u32, actions: &mut Vec<Action>) {
+    if (age - 1).is_multiple_of(FROST_ICE_RING_TICKS) {
+        ice_ring(at.cell(), (age - 1) / FROST_ICE_RING_TICKS, actions);
+    }
+    if !age.is_multiple_of(FROST_PULSE_TICKS) {
+        return;
+    }
+    actions.push(Action::Effect {
+        team: enemies,
+        center: at,
+        radius: FROST_ZONE_RADIUS,
+        effect: EffectKind::Slowness,
+        duration_ticks: FROST_SLOWNESS_TICKS,
+        amplifier: FROST_SLOWNESS_AMPLIFIER,
+    });
+    actions.push(Action::Particle {
+        kind: ParticleKind::Snowflake,
+        at: Vec3 {
+            x: at.x,
+            y: at.y + 0.3,
+            z: at.z,
+        },
+        count: 25,
+    });
+    for (radius, points) in [
+        (FROST_ZONE_RADIUS, FROST_OUTER_SHELL_POINTS),
+        (
+            FROST_ZONE_RADIUS * FROST_INNER_SHELL_RATIO,
+            FROST_INNER_SHELL_POINTS,
+        ),
+    ] {
+        for point in sphere_points(at, radius, points) {
+            actions.push(Action::Particle {
+                kind: ParticleKind::Snowflake,
+                at: point,
+                count: 3,
+            });
+        }
+    }
+}
+
+fn sphere_points(center: Vec3, radius: f64, count: u32) -> Vec<Vec3> {
+    (0..count)
+        .map(|index| {
+            let height = 1.0 - 2.0 * (f64::from(index) + 0.5) / f64::from(count);
+            let ring = (1.0 - height * height).sqrt();
+            let angle = GOLDEN_ANGLE * f64::from(index);
+            Vec3 {
+                x: center.x + radius * ring * angle.cos(),
+                y: center.y + radius * height,
+                z: center.z + radius * ring * angle.sin(),
+            }
+        })
+        .collect()
 }
 
 fn within_warp_radius(at: Vec3, origin: Cell, cell: Cell) -> bool {
@@ -445,6 +543,172 @@ mod tests {
         )));
         assert_eq!(last_y, ORIGIN.y);
         assert!(effects.is_idle());
+    }
+
+    fn ice_cells(frames: &[Vec<Action>]) -> Vec<(usize, Cell)> {
+        frames
+            .iter()
+            .enumerate()
+            .flat_map(|(tick, frame)| {
+                frame.iter().filter_map(move |a| match a {
+                    Action::SetBlock {
+                        at,
+                        block: BlockKind::Ice,
+                    } => Some((tick, *at)),
+                    _ => None,
+                })
+            })
+            .collect()
+    }
+
+    fn horizontal(cell: Cell) -> f64 {
+        let origin = ORIGIN.cell();
+        f64::from((cell.x - origin.x).pow(2) + (cell.z - origin.z).pow(2)).sqrt()
+    }
+
+    #[test]
+    fn frost_slows_the_enemy_team_in_the_zone_on_every_pulse() {
+        let mut effects = Effects::new();
+        effects.start(SheepKind::Frozen, ORIGIN, TeamId::Red);
+        let frames = run(&mut effects, FROST_ZONE_DURATION_TICKS);
+        for (index, frame) in frames.iter().enumerate() {
+            let tick = index as u32 + 1;
+            let slows: Vec<&Action> = frame
+                .iter()
+                .filter(|a| matches!(a, Action::Effect { .. }))
+                .collect();
+            if tick.is_multiple_of(FROST_PULSE_TICKS) {
+                assert_eq!(slows.len(), 1, "tick {tick}");
+                assert!(matches!(
+                    slows[0],
+                    Action::Effect {
+                        team: TeamId::Blue,
+                        radius,
+                        effect: EffectKind::Slowness,
+                        duration_ticks,
+                        amplifier,
+                        ..
+                    } if *radius == FROST_ZONE_RADIUS
+                        && *duration_ticks == FROST_SLOWNESS_TICKS
+                        && *amplifier == FROST_SLOWNESS_AMPLIFIER
+                ));
+                assert!(frame.iter().any(|a| matches!(
+                    a,
+                    Action::Particle {
+                        kind: ParticleKind::Snowflake,
+                        ..
+                    }
+                )));
+            } else {
+                assert!(slows.is_empty(), "tick {tick}");
+            }
+        }
+        assert!(effects.is_idle());
+    }
+
+    fn distance(a: Vec3, b: Vec3) -> f64 {
+        ((a.x - b.x).powi(2) + (a.y - b.y).powi(2) + (a.z - b.z).powi(2)).sqrt()
+    }
+
+    #[test]
+    fn sphere_points_all_lie_on_the_sphere_and_cover_both_poles() {
+        let points = sphere_points(ORIGIN, 5.0, 48);
+        assert_eq!(points.len(), 48);
+        for point in &points {
+            assert!((distance(*point, ORIGIN) - 5.0).abs() < 1e-9);
+        }
+        assert!(points.iter().any(|p| p.y > ORIGIN.y + 4.5));
+        assert!(points.iter().any(|p| p.y < ORIGIN.y - 4.5));
+    }
+
+    #[test]
+    fn frost_particles_fill_the_whole_zone_as_a_sphere_and_not_only_the_ground() {
+        let mut effects = Effects::new();
+        effects.start(SheepKind::Frozen, ORIGIN, TeamId::Red);
+        let frames = run(&mut effects, FROST_PULSE_TICKS);
+        let points: Vec<Vec3> = frames
+            .last()
+            .unwrap()
+            .iter()
+            .filter_map(|a| match a {
+                Action::Particle {
+                    kind: ParticleKind::Snowflake,
+                    at,
+                    ..
+                } => Some(*at),
+                _ => None,
+            })
+            .collect();
+        assert!(points.len() >= (FROST_OUTER_SHELL_POINTS + FROST_INNER_SHELL_POINTS) as usize);
+        assert!(
+            points
+                .iter()
+                .all(|p| distance(*p, ORIGIN) <= FROST_ZONE_RADIUS + 1e-9)
+        );
+        let outer = points
+            .iter()
+            .filter(|p| (distance(**p, ORIGIN) - FROST_ZONE_RADIUS).abs() < 1e-9)
+            .count();
+        assert_eq!(outer, FROST_OUTER_SHELL_POINTS as usize);
+        assert!(
+            points
+                .iter()
+                .any(|p| p.y > ORIGIN.y + FROST_ZONE_RADIUS * 0.8)
+        );
+        assert!(
+            points
+                .iter()
+                .any(|p| p.y < ORIGIN.y - FROST_ZONE_RADIUS * 0.8)
+        );
+        assert!(
+            points
+                .iter()
+                .any(|p| distance(*p, ORIGIN) < FROST_ZONE_RADIUS * 0.7)
+        );
+    }
+
+    #[test]
+    fn frost_zone_covers_a_radius_of_five() {
+        assert_eq!(FROST_ZONE_RADIUS, 5.0);
+    }
+
+    #[test]
+    fn frost_ice_spreads_from_the_center_outward_within_the_radius() {
+        let mut effects = Effects::new();
+        effects.start(SheepKind::Frozen, ORIGIN, TeamId::Red);
+        let frames = run(&mut effects, FROST_ZONE_DURATION_TICKS);
+        let ice = ice_cells(&frames);
+        assert_eq!(ice.first().map(|(_, cell)| horizontal(*cell)), Some(0.0));
+        assert!(
+            ice.iter()
+                .all(|(_, cell)| horizontal(*cell) <= FROST_ZONE_RADIUS)
+        );
+        for pair in ice.windows(2) {
+            assert!(
+                pair[0].0 <= pair[1].0
+                    && horizontal(pair[0].1).round() <= horizontal(pair[1].1).round(),
+                "ice must spread outward"
+            );
+        }
+        let farthest = ice
+            .iter()
+            .map(|(_, cell)| horizontal(*cell))
+            .fold(0.0, f64::max);
+        assert!(farthest >= FROST_ZONE_RADIUS - 1.0);
+    }
+
+    #[test]
+    fn frost_turns_more_blocks_to_ice_than_the_old_flat_disc_of_radius_three() {
+        let mut effects = Effects::new();
+        effects.start(SheepKind::Frozen, ORIGIN, TeamId::Red);
+        let frames = run(&mut effects, FROST_ZONE_DURATION_TICKS);
+        let unique: std::collections::HashSet<Cell> = ice_cells(&frames)
+            .into_iter()
+            .map(|(_, cell)| cell)
+            .collect();
+        assert!(unique.len() > 29);
+        let layers: std::collections::HashSet<i32> = unique.iter().map(|cell| cell.y).collect();
+        assert_eq!(layers.len(), FROST_ICE_LAYERS.len());
     }
 
     #[test]

@@ -27,6 +27,13 @@ const fn explosion_yield() -> f32 {
     EXPLOSION_YIELD
 }
 
+const fn blocks_creature_spawn(reason: CreatureSpawnReason) -> bool {
+    !matches!(
+        reason,
+        CreatureSpawnReason::Custom | CreatureSpawnReason::Default | CreatureSpawnReason::Command
+    )
+}
+
 fn cancels_vanilla_explosion(entity: EntityType, cause: EntityDamageCause) -> bool {
     entity == EntityType::Player
         && matches!(
@@ -455,6 +462,19 @@ impl SheepWarsPlugin {
         }
     }
 
+    async fn on_entity_shoot_bow(&self, event: &mut EntityShootBow) {
+        let Some(game) = self.game() else { return };
+        if let Some(player) = event.player() {
+            game.track_arrow(player.uuid, event.projectile().clone());
+        }
+    }
+
+    async fn on_creature_spawn(&self, event: &mut CreatureSpawn) {
+        if blocks_creature_spawn(event.spawn_reason()) {
+            event.cancel();
+        }
+    }
+
     async fn on_entity_explode(&self, event: &mut EntityExplode) {
         if self
             .guard
@@ -495,6 +515,29 @@ mod tests {
 
     fn pos(x: i32, y: i32, z: i32) -> BlockPos {
         BlockPos { x, y, z }
+    }
+
+    #[test]
+    fn only_plugin_and_command_spawns_are_allowed() {
+        for reason in [
+            CreatureSpawnReason::Custom,
+            CreatureSpawnReason::Default,
+            CreatureSpawnReason::Command,
+        ] {
+            assert!(!blocks_creature_spawn(reason));
+        }
+        for reason in [
+            CreatureSpawnReason::Natural,
+            CreatureSpawnReason::ChunkGen,
+            CreatureSpawnReason::Spawner,
+            CreatureSpawnReason::TrialSpawner,
+            CreatureSpawnReason::Jockey,
+            CreatureSpawnReason::Reinforcements,
+            CreatureSpawnReason::Patrol,
+            CreatureSpawnReason::Raid,
+        ] {
+            assert!(blocks_creature_spawn(reason));
+        }
     }
 
     #[test]

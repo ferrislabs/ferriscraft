@@ -52,9 +52,11 @@ Moutons (laine) :
 | Kind | Nom | Laine | Comportement |
 |---|---|---|---|
 | Explosive | Mouton explosif | rouge | Explosion simple, puissance 7, dégâts forts, casse beaucoup de terrain. |
-| Torpedo | Mouton torpilleur | cyan | Vol droit sans gravité. Détruit les blocs dans une sphère de 3 à chaque tick. Détonne quand un joueur ennemi entre dans les 3 blocs : dégâts forts rayon 5. |
+| Torpedo | Mouton torpilleur | cyan | Vol droit sans gravité. Détruit les blocs dans une sphère de 3 à chaque tick, après un délai de 0,10 s (2 ticks). Détonne quand un joueur ennemi entre dans les 3 blocs : dégâts forts rayon 5. |
 | Seeker | Mouton chercheur | vert | Lancé en arc. Après impact, court vers l'ennemi le plus proche (vitesse de course), explose au contact ou à 2 s. |
-| Splitting | Mouton à fragmentation | gris | Petite explosion, puis 4 enfants `Explosive` qui explosent à leur tour. |
+| Splitting | Mouton à fragmentation | gris | Petite explosion, puis 4 enfants `Fragment` qui explosent à leur tour. |
+| Frozen | Mouton glacé | bleu clair | Zone de gel de rayon 5 pendant 8 s : les ennemis dedans sont ralentis (Slowness II, rafraîchi toutes les 10 ticks), avec particules de neige. La glace se pose du centre vers l'extérieur, sur deux couches. |
+| Fragment | Fragment | gris | Interne, hors tirage et hors inventaire. Moitié de taille, explose dès son premier contact avec le sol, sans mèche. |
 | Incendiary | Mouton enflammé | orange | Dégâts directs réduits. Enflamme le terrain sur un large rayon. |
 | Intergalactic | Mouton intergalactique | bleu | Météore (particules) du ciel vers l'impact. Détruit tous les blocs au-dessus de l'impact dans le cylindre (rayon 8). Tue les ennemis dans la zone. |
 | Boarding | Mouton d'abordage | blanc | Inchangé, couleur blanche. |
@@ -81,7 +83,7 @@ Chaque ligne devient un test dans le module indiqué.
 - `@spec-swi-6` Le torpilleur détonne dès qu'un joueur ennemi est à moins de 3 blocs, jamais pour un allié. `game::flight`
 - `@spec-swi-7` Le torpilleur émet un `ClearSphere` de rayon 3 centré sur lui à chaque tick de vol. `game::flight`
 - `@spec-swi-8` Le chercheur, après impact, se dirige vers l'ennemi le plus proche et explose au plus tard 40 ticks après l'impact. `game::flight`
-- `@spec-swi-9` Les enfants de la fragmentation sont des `Explosive`, au nombre de `SPLIT_COUNT`. `sheep::impact`
+- `@spec-swi-9` Les enfants de la fragmentation sont des `Fragment`, au nombre de `SPLIT_COUNT`. `sheep::impact`
 - `@spec-swi-10` L'explosif a une puissance et un rayon de destruction supérieurs à ceux de l'enflammé. `sheep::catalog`
 - `@spec-swi-11` L'enflammé inflige moins de dégâts que l'explosif et pose plus de feu que l'ancien. `sheep::impact`
 - `@spec-swi-12` Le champ de tremblement émet une secousse à 40, 80, 120, 160 et 200 ticks, puis s'éteint. `game::effects`
@@ -92,6 +94,17 @@ Chaque ligne devient un test dans le module indiqué.
 - `@spec-swi-17` Le don se déclenche toutes les 12 s par défaut et tire un mouton par joueur. `game::session`
 - `@spec-swi-18` Un joueur casse un bloc à la main sans objet. Bedrock et plateformes restent incassables. `plugin`
 - `@spec-swi-19` Casser un bloc de feu à la main l'éteint. `plugin`
+- `@spec-swi-21` Un `Fragment` n'a pas de mèche (`arms_on_impact` faux) et explose à son premier contact avec le sol, après un délai de grâce plus long que celui des autres moutons. `game::flight`
+- `@spec-swi-22` Un `Fragment` explose avec dégâts non létaux et sans enfants, et sa taille est inférieure à 1. `sheep::impact`
+- `@spec-swi-23` Après un abordage, le joueur ne subit aucun dégât de chute tant qu'il est en l'air, quelle que soit la durée de la chute. `game::fall_guard`
+- `@spec-swi-24` La protection dure 1 s (20 ticks) après son premier contact avec le sol, puis cesse. `game::fall_guard`
+- `@spec-swi-25` Seuls les spawns du plugin et des commandes sont autorisés : les créatures naturelles, de générateur, de patrouille ou de raid sont annulées. `plugin`
+- `@spec-swi-26` Le torpilleur ne détruit aucun bloc avant 2 ticks de vol. `game::flight`
+- `@spec-swi-27` La zone de gel couvre un rayon de 5, ralentit les ennemis toutes les 10 ticks pendant 160 ticks, et pose la glace du centre vers l'extérieur sur plus de blocs que l'ancien disque de rayon 3. `game::effects`
+- `@spec-swi-28` Le passager d'un abordage n'est téléporté en vol que s'il est à plus de 6 blocs du mouton. `game::flight`
+- `@spec-swi-29` Le chercheur garde son IA active après l'impact, car rspigot ignore la vélocité et la gravité d'un mob sans IA. Les autres moutons armés la désactivent. `game::flight`
+- `@spec-swi-30` À chaque impulsion, la zone de gel émet ses particules de neige sur deux coquilles sphériques de rayon 5 et 2,75 centrées sur l'impact, au-dessus comme au-dessous du centre, et jamais au-delà du rayon 5. `game::effects`
+- `@spec-swi-31` Le mouton d'abordage est lancé moins fort que les autres (1,5 contre 2,2) et le passager est plafonné à 2,0, sous la puissance d'un lancer normal. `sheep::catalog`, `game::flight`
 - `@spec-swi-20` Les explosions n'ont aucun rendement d'objets : `set_yield(0.0)` sur `EntityExplode` et `BlockExplode`. `plugin`
 
 ## Simulation
@@ -184,3 +197,15 @@ cargo test -p ferriscraft-sheepwars
 Puis en jeu dans k3d : lancer chaque mouton.
 
 Amended: 2026-11-22 Quake, Warp et Intergalactic atterrissent sans mèche de 3 s (`arms_on_impact` faux) : leur délai propre est dans `Effects`.
+
+Amended: 2026-11-22 Les enfants de la fragmentation sont un `SheepKind::Fragment` hors de `SheepKind::ALL` (14 variantes, 13 obtenables) : plus petits, sans mèche.
+
+Amended: 2026-11-22 La protection de chute de l'abordage n'est plus un délai fixe de 2 à 3 s : elle dure tant que le joueur est en l'air, plus 1 s après le sol (`FallGuards`).
+
+Amended: 2026-11-22 Le glacé devient une zone de gel temporisée (`Effects`). Le ralentissement de 25 % demandé est approché par Slowness II (30 %, le palier vanilla le plus proche). Le passager de l'abordage n'est plus téléporté à chaque tick : chaque téléportation renvoie au client la rotation connue du serveur, d'où la saccade.
+
+Amended: 2026-11-22 Le chercheur ne courait pas : le moteur coupait son IA à l'impact, or `finish_ai_step` n'appelle pas `travel` pour un mob sans IA (`living.rs`), donc sa vélocité était ignorée.
+
+Amended: 2026-11-22 Les particules de la zone de gel forment une sphère (deux coquilles, 68 points par impulsion) au lieu d'un anneau au sol.
+
+Amended: 2026-11-22 Le mouton d'abordage est ralenti : puissance de lancer 1,5 (portée d'environ 39 blocs à -20° au lieu de 70) et vitesse maximale du passager 2,0 au lieu de 3,2.

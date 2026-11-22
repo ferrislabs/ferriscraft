@@ -6,6 +6,7 @@ pub enum Intent {
     Broadcast(String),
     Tell { player: PlayerId, text: String },
     Title { text: String, subtitle: String },
+    Celebrate { team: TeamId },
     Enroll { player: PlayerId, team: TeamId },
     Unenroll { player: PlayerId, team: TeamId },
     SyncTeams,

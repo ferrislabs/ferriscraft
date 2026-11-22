@@ -48,6 +48,10 @@ pub enum ParticleKind {
     Heart,
     Portal,
     LargeSmoke,
+    TeamDust(TeamId),
+    EndRod,
+    Firework,
+    Totem,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,20 +231,10 @@ pub fn plan(kind: SheepKind, at: Vec3, thrower_team: TeamId) -> Vec<Action> {
             actions.push(sound(SoundKind::Explode, at));
             actions
         }
-        SheepKind::Frozen => {
-            let mut actions = disc(at.cell(), catalog::FROZEN_ICE_RADIUS, -1, BlockKind::Ice);
-            actions.push(Action::Effect {
-                team: enemies,
-                center: at,
-                radius: catalog::FROZEN_RADIUS,
-                effect: EffectKind::Slowness,
-                duration_ticks: catalog::FROZEN_SLOWNESS_TICKS,
-                amplifier: catalog::FROZEN_SLOWNESS_AMPLIFIER,
-            });
-            actions.push(particle(ParticleKind::Snowflake, at, 80));
-            actions.push(sound(SoundKind::Ice, at));
-            actions
-        }
+        SheepKind::Frozen => vec![
+            particle(ParticleKind::Snowflake, at, 80),
+            sound(SoundKind::Ice, at),
+        ],
         SheepKind::Explosive => vec![
             Action::Explode {
                 at,
@@ -255,6 +249,21 @@ pub fn plan(kind: SheepKind, at: Vec3, thrower_team: TeamId) -> Vec<Action> {
             },
             particle(ParticleKind::Explosion, at, 10),
             particle(ParticleKind::LargeSmoke, at, 30),
+            sound(SoundKind::Explode, at),
+        ],
+        SheepKind::Fragment => vec![
+            Action::Explode {
+                at,
+                power: catalog::FRAGMENT_POWER,
+                breaks_blocks: catalog::FRAGMENT_BREAKS_BLOCKS,
+            },
+            Action::Damage {
+                team: enemies,
+                center: at,
+                radius: catalog::FRAGMENT_DAMAGE_RADIUS,
+                damage: Damage::capped(catalog::FRAGMENT_DAMAGE),
+            },
+            particle(ParticleKind::Explosion, at, 4),
             sound(SoundKind::Explode, at),
         ],
         SheepKind::Torpedo => vec![
@@ -414,25 +423,6 @@ fn sound(kind: SoundKind, at: Vec3) -> Action {
     Action::Sound { kind, at }
 }
 
-fn disc(center: Cell, radius: i32, dy: i32, block: BlockKind) -> Vec<Action> {
-    let mut actions = Vec::new();
-    for dx in -radius..=radius {
-        for dz in -radius..=radius {
-            if dx * dx + dz * dz <= radius * radius {
-                actions.push(Action::SetBlock {
-                    at: Cell {
-                        x: center.x + dx,
-                        y: center.y + dy,
-                        z: center.z + dz,
-                    },
-                    block,
-                });
-            }
-        }
-    }
-    actions
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,14 +549,14 @@ mod tests {
     }
 
     #[test]
-    fn splitting_children_are_explosive_and_counted() {
+    fn splitting_children_are_fragments_and_counted() {
         let children = plan(SheepKind::Splitting, AT, TeamId::Red)
             .into_iter()
             .filter(|a| {
                 matches!(
                     a,
                     Action::SpawnSheep {
-                        kind: SheepKind::Explosive,
+                        kind: SheepKind::Fragment,
                         ..
                     }
                 )
@@ -574,6 +564,34 @@ mod tests {
             .count();
         assert_eq!(children, catalog::SPLIT_COUNT as usize);
         assert_eq!(catalog::SPLIT_COUNT, 4);
+    }
+
+    #[test]
+    fn a_fragment_explodes_and_hurts_without_one_shotting() {
+        let actions = plan(SheepKind::Fragment, AT, TeamId::Red);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Explode { at, .. } if *at == AT))
+        );
+        let damage = actions.iter().find_map(|a| match a {
+            Action::Damage { damage, .. } => Some(*damage),
+            _ => None,
+        });
+        assert!(damage.is_some_and(|d| !d.is_lethal() && d.at_distance(0.0, 4.0) < 20.0));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::SpawnSheep { .. }))
+        );
+    }
+
+    #[test]
+    fn a_fragment_is_smaller_than_the_explosive() {
+        const {
+            assert!(catalog::FRAGMENT_POWER < catalog::EXPLOSIVE_POWER);
+            assert!(catalog::FRAGMENT_SCALE < 1.0);
+        }
     }
 
     #[test]
@@ -601,23 +619,14 @@ mod tests {
     }
 
     #[test]
-    fn frozen_slows_the_enemy_team_only() {
+    fn frozen_only_announces_its_landing_and_leaves_the_frost_to_the_zone() {
         let actions = plan(SheepKind::Frozen, AT, TeamId::Red);
-        assert!(actions.iter().any(|a| matches!(
-            a,
-            Action::Effect {
-                team: TeamId::Blue,
-                effect: EffectKind::Slowness,
-                ..
-            }
-        )));
-        assert!(!actions.iter().any(|a| matches!(
-            a,
-            Action::Effect {
-                team: TeamId::Red,
-                ..
-            }
-        )));
+        assert!(actions.iter().any(|a| matches!(a, Action::Sound { .. })));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::Effect { .. } | Action::SetBlock { .. }))
+        );
     }
 
     #[test]

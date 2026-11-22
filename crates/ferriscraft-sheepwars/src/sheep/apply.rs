@@ -2,9 +2,9 @@ use std::time::Duration;
 
 use futures_util::future::join_all;
 use rspigot_plugin::{
-    BlockPos, BlockState, BlockType, DyeColor, Effect, EffectType, Entity, EntityType, Error,
-    Explosion, Material, Particle, ParticleBurst, Player, PlayerState, Position, Sound, SoundCue,
-    Vector, World,
+    Attribute, BlockPos, BlockState, BlockType, Color, DyeColor, Effect, EffectType, Entity,
+    EntityType, Error, Explosion, Material, Particle, ParticleBurst, Player, PlayerState, Position,
+    Sound, SoundCue, Vector, World,
 };
 
 use super::catalog::{self, WoolColor};
@@ -64,7 +64,18 @@ pub async fn apply(
                 duration_ticks,
                 amplifier,
             } => {
-                for (player, _) in matching_players(&live_players, center, radius, team) {
+                let targets: Vec<&Player> = matching_players(&live_players, center, radius, team)
+                    .map(|(player, _)| player)
+                    .collect();
+                tracing::info!(
+                    ?effect,
+                    ?team,
+                    radius,
+                    candidates = live_players.len(),
+                    targets = targets.len(),
+                    "effet de mouton appliqué"
+                );
+                for player in targets {
                     player
                         .effects
                         .add(Effect::new(effect_type(effect), duration_ticks, amplifier));
@@ -178,6 +189,11 @@ pub async fn apply(
                 entity.flags.set_invulnerable(false);
                 entity.name.set(catalog::display_name(kind));
                 entity.name.set_visible(true);
+                if kind == SheepKind::Fragment {
+                    entity
+                        .attributes
+                        .set(Attribute::Scale, catalog::FRAGMENT_SCALE);
+                }
                 entity.set_velocity(vector(velocity));
                 spawned.push((kind, entity, velocity));
             }
@@ -513,6 +529,13 @@ const fn block_pos(c: Cell) -> BlockPos {
     }
 }
 
+const fn team_color(team: TeamId) -> Color {
+    match team {
+        TeamId::Red => Color::rgb(255, 70, 70),
+        TeamId::Blue => Color::rgb(70, 110, 255),
+    }
+}
+
 const fn particle(kind: ParticleKind) -> Particle {
     match kind {
         ParticleKind::Explosion => Particle::Explosion,
@@ -522,6 +545,13 @@ const fn particle(kind: ParticleKind) -> Particle {
         ParticleKind::Heart => Particle::Heart,
         ParticleKind::Portal => Particle::Portal,
         ParticleKind::LargeSmoke => Particle::LargeSmoke,
+        ParticleKind::TeamDust(team) => Particle::Dust {
+            color: team_color(team),
+            scale: 1.2,
+        },
+        ParticleKind::EndRod => Particle::EndRod,
+        ParticleKind::Firework => Particle::Firework,
+        ParticleKind::Totem => Particle::TotemOfUndying,
     }
 }
 

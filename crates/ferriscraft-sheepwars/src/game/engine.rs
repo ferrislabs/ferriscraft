@@ -13,12 +13,18 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 
+use super::cosmetics::{
+    MAX_ARROW_AGE_TICKS, MAX_TRACKED_ARROWS, MAX_TRAIL_ACTIONS_PER_TICK, arrow_trail, capped,
+    celebrating, celebration_pulses, explosion_burst, sheep_trail, victory_pulse,
+};
 use super::display::lives_line;
 use super::effects::Effects;
+use super::fall_guard::FallGuards;
 use super::flight::{
     EYE_HEIGHT, Flight, LANDING_GRACE_TICKS, MAX_CONCURRENT_FLIGHTS, MAX_FLIGHT_TICKS,
-    arms_on_impact, can_launch, chase_detonates, chase_velocity, flight_velocity, fuse_label,
-    fuse_ticks, initial_velocity, starts_effect, torpedo_clear, torpedo_triggered,
+    RIDER_MAX_SPEED, arms_on_impact, can_launch, chase_detonates, chase_velocity,
+    disables_ai_when_armed, flight_velocity, fuse_label, fuse_ticks, initial_velocity,
+    rider_needs_teleport, starts_effect, torpedo_clear, torpedo_clears, torpedo_triggered,
 };
 use super::intent::Intent;
 use super::session::{ForceStartError, Session, VoidVerdict, launch_announcement};
@@ -34,6 +40,7 @@ use crate::sheep::{
 };
 
 pub const HUD_REFRESH_TICKS: u64 = 5;
+const ARROW_SPAWN_GRACE_TICKS: u32 = 10;
 pub const ACTION_BAR_REFRESH_TICKS: u64 = 20;
 const HEARTBEAT_FAILURE_LOG_EVERY: Duration = Duration::from_secs(30);
 pub const HUB_ITEM: Material = Material::RedBed;
@@ -41,6 +48,19 @@ const HUB_ITEM_SLOT: InventorySlot = InventorySlot::Hotbar(8);
 
 pub fn player_id(uuid: Uuid) -> PlayerId {
     PlayerId(uuid.as_u128())
+}
+
+#[derive(Debug)]
+struct TrackedArrow {
+    entity: Entity,
+    team: TeamId,
+    age: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Celebration {
+    team: TeamId,
+    age: u32,
 }
 
 #[derive(Debug)]
@@ -76,9 +96,11 @@ struct State {
     armed: Vec<ArmedSheep>,
     healings: Vec<ActiveHealing>,
     effects: Effects,
+    arrows: Vec<TrackedArrow>,
+    celebration: Option<Celebration>,
     sheep_kinds: HashMap<i32, SheepKind>,
     last_sheep_damager: HashMap<i32, PlayerId>,
-    fall_protected_until: HashMap<PlayerId, u64>,
+    fall_guards: FallGuards,
     hud: Hud,
     bar: BossBar,
     ticks: u64,
@@ -114,9 +136,11 @@ impl Game {
                 armed: Vec::new(),
                 healings: Vec::new(),
                 effects: Effects::new(),
+                arrows: Vec::new(),
+                celebration: None,
                 sheep_kinds: HashMap::new(),
                 last_sheep_damager: HashMap::new(),
-                fall_protected_until: HashMap::new(),
+                fall_guards: FallGuards::new(),
                 hud,
                 bar,
                 ticks: 0,
@@ -317,10 +341,7 @@ impl Game {
 
     pub fn is_fall_protected(&self, uuid: Uuid) -> bool {
         let state = self.lock();
-        state
-            .fall_protected_until
-            .get(&player_id(uuid))
-            .is_some_and(|until| state.ticks <= *until)
+        state.fall_guards.protects(player_id(uuid), state.ticks)
     }
 
     pub fn blocks_hit(&self, attacker: &Player, victim: &Player) -> bool {
@@ -450,8 +471,8 @@ impl Game {
         {
             let mut state = self.lock();
             if rider_attached {
-                let deadline = state.ticks + u64::from(MAX_FLIGHT_TICKS) + 40;
-                state.fall_protected_until.insert(id, deadline);
+                let now = state.ticks;
+                state.fall_guards.board(id, now);
             }
             state.sheep_kinds.insert(sheep.entity_id, kind);
             state.flights.push(Airborne {
@@ -476,6 +497,9 @@ impl Game {
         self.advance_armed().await;
         self.advance_healings().await;
         self.advance_effects().await;
+        self.advance_arrows().await;
+        self.advance_celebration().await;
+        self.advance_fall_guards().await;
         self.refresh();
         self.check_phase_changed();
     }
@@ -492,9 +516,11 @@ impl Game {
             totem.entity.remove();
         }
         state.effects = Effects::new();
+        state.arrows.clear();
+        state.celebration = None;
         state.sheep_kinds.clear();
         state.last_sheep_damager.clear();
-        state.fall_protected_until.clear();
+        state.fall_guards.clear();
         state.hud.close();
         state.bar.remove();
     }
@@ -547,6 +573,9 @@ impl Game {
                 if let Some(player) = self.player(player) {
                     player.message.send(text);
                 }
+            }
+            Intent::Celebrate { team } => {
+                self.lock().celebration = Some(Celebration { team, age: 0 });
             }
             Intent::Title { text, subtitle } => {
                 for player in self.everyone() {
@@ -674,9 +703,11 @@ impl Game {
             totem.entity.remove();
         }
         state.effects = Effects::new();
+        state.arrows.clear();
+        state.celebration = None;
         state.sheep_kinds.clear();
         state.last_sheep_damager.clear();
-        state.fall_protected_until.clear();
+        state.fall_guards.clear();
         for player in state.players.values() {
             for team in TeamId::ALL {
                 state.hud.remove_player(team, &player.name);
@@ -719,7 +750,7 @@ impl Game {
     }
 
     async fn advance_flights(&self) {
-        let (flights, players_with_teams, player_map, current_ticks, void_fall_y) = {
+        let (flights, players_with_teams, player_map, void_fall_y) = {
             let mut state = self.lock();
             if state.flights.is_empty() {
                 return;
@@ -730,13 +761,11 @@ impl Game {
                 .filter_map(|(id, team)| state.players.get(&id).cloned().map(|p| (p, team)))
                 .collect();
             let player_map = state.players.clone();
-            let current_ticks = state.ticks;
             let void_fall_y = state.session.layout().settings().void_fall_y;
             (
                 std::mem::take(&mut state.flights),
                 players_with_teams,
                 player_map,
-                current_ticks,
                 void_fall_y,
             )
         };
@@ -745,8 +774,8 @@ impl Game {
         let mut children = Vec::new();
         let mut new_armed = Vec::new();
         let mut new_healings = Vec::new();
+        let mut trail = Vec::new();
         let mut removed_ids = Vec::new();
-        let mut fall_updates: Vec<(PlayerId, u64)> = Vec::new();
 
         for mut airborne in flights {
             let entity_id = airborne.entity.entity_id;
@@ -798,14 +827,13 @@ impl Game {
                     Ok(rider_state) if !rider_state.dead => {
                         if rider_state.sneaking && airborne.flight.age >= LANDING_GRACE_TICKS {
                             airborne.rider_attached = false;
-                            fall_updates.push((airborne.flight.thrower, current_ticks + 40));
                         } else {
                             let rider_pos = vec3(rider_state.player.position);
                             let dx = pos.x - rider_pos.x;
                             let dy = (pos.y - 0.1) - rider_pos.y;
                             let dz = pos.z - rider_pos.z;
                             let dist_sq = dx * dx + dy * dy + dz * dz;
-                            if dist_sq > 2.5 * 2.5 {
+                            if rider_needs_teleport(dist_sq) {
                                 let _ = rider
                                     .location
                                     .teleport(Position {
@@ -821,10 +849,9 @@ impl Game {
                                     y: airborne.velocity.y + dy * 0.55,
                                     z: airborne.velocity.z + dz * 0.55,
                                 },
-                                3.2,
+                                RIDER_MAX_SPEED,
                             );
                             rider.movement.set_velocity(vector(pull));
-                            fall_updates.push((airborne.flight.thrower, current_ticks + 60));
                         }
                     }
                     _ => {
@@ -835,13 +862,14 @@ impl Game {
 
             let mut torpedo_hit = false;
             if flies_straight(airborne.flight.kind) {
-                if let Err(error) = apply(
-                    &self.arena.world,
-                    None,
-                    &players_with_teams,
-                    &[torpedo_clear(pos)],
-                )
-                .await
+                if torpedo_clears(airborne.flight.age)
+                    && let Err(error) = apply(
+                        &self.arena.world,
+                        None,
+                        &players_with_teams,
+                        &[torpedo_clear(pos)],
+                    )
+                    .await
                 {
                     tracing::warn!("échec du creusement du torpilleur : {error}");
                 }
@@ -884,7 +912,9 @@ impl Game {
                         pulses: 0,
                     });
                 } else if arms_on_impact(airborne.flight.kind) {
-                    airborne.entity.ai.set(false);
+                    if disables_ai_when_armed(airborne.flight.kind) {
+                        airborne.entity.ai.set(false);
+                    }
                     airborne.entity.flags.set_gravity(true);
                     airborne.entity.flags.set_invulnerable(false);
                     airborne.entity.flags.set_glowing(true);
@@ -904,9 +934,6 @@ impl Game {
                         remaining_ticks: fuse_ticks(airborne.flight.kind),
                     });
                 } else {
-                    if airborne.flight.kind == SheepKind::Boarding && airborne.rider_attached {
-                        fall_updates.push((airborne.flight.thrower, current_ticks + 60));
-                    }
                     if self.claim_sheep(entity_id) {
                         children.extend(
                             self.land_at(
@@ -927,20 +954,20 @@ impl Game {
                 airborne.entity.set_velocity(vector(next_velocity));
                 airborne.velocity = next_velocity;
                 airborne.last_pos = pos;
+                trail.extend(sheep_trail(airborne.flight.team, pos));
                 next.push(airborne);
             }
+        }
+
+        let trail = capped(trail, MAX_TRAIL_ACTIONS_PER_TICK);
+        if let Err(error) = apply(&self.arena.world, None, &players_with_teams, &trail).await {
+            tracing::warn!("échec de la traînée de mouton : {error}");
         }
 
         let mut state = self.lock();
         for id in removed_ids {
             state.sheep_kinds.remove(&id);
             state.last_sheep_damager.remove(&id);
-        }
-        state
-            .fall_protected_until
-            .retain(|_, until| *until >= current_ticks);
-        for (id, deadline) in fall_updates {
-            state.fall_protected_until.insert(id, deadline);
         }
         new_armed.retain(|armed| state.sheep_kinds.contains_key(&armed.entity.entity_id));
         new_healings.retain(|totem| state.sheep_kinds.contains_key(&totem.entity.entity_id));
@@ -1166,6 +1193,125 @@ impl Game {
         state.healings.extend(next_healings);
     }
 
+    async fn advance_fall_guards(&self) {
+        let (guarded, riding, now) = {
+            let mut state = self.lock();
+            let now = state.ticks;
+            state.fall_guards.prune(now);
+            let guarded: Vec<(PlayerId, Player)> = state
+                .fall_guards
+                .airborne()
+                .into_iter()
+                .filter_map(|id| state.players.get(&id).cloned().map(|player| (id, player)))
+                .collect();
+            let riding: Vec<PlayerId> = state
+                .flights
+                .iter()
+                .filter(|airborne| airborne.rider_attached)
+                .map(|airborne| airborne.flight.thrower)
+                .collect();
+            (guarded, riding, now)
+        };
+        for (id, player) in guarded {
+            let Ok(snapshot) = player.get_state().await else {
+                continue;
+            };
+            let grounded = snapshot.on_ground && !riding.contains(&id);
+            self.lock()
+                .fall_guards
+                .observe(id, now, grounded, snapshot.dead);
+        }
+    }
+
+    pub fn track_arrow(&self, shooter: Uuid, entity: Entity) {
+        let mut state = self.lock();
+        if state.arrows.len() >= MAX_TRACKED_ARROWS {
+            return;
+        }
+        let id = player_id(shooter);
+        let team = state
+            .session
+            .standing()
+            .into_iter()
+            .find_map(|(member, team)| (member == id).then_some(team));
+        if let Some(team) = team {
+            state.arrows.push(TrackedArrow {
+                entity,
+                team,
+                age: 0,
+            });
+        }
+    }
+
+    async fn advance_arrows(&self) {
+        let arrows = {
+            let mut state = self.lock();
+            if state.arrows.is_empty() {
+                return;
+            }
+            std::mem::take(&mut state.arrows)
+        };
+        let mut kept = Vec::with_capacity(arrows.len());
+        let mut trail = Vec::new();
+        for mut arrow in arrows {
+            arrow.age += 1;
+            if arrow.age > MAX_ARROW_AGE_TICKS {
+                continue;
+            }
+            match arrow.entity.get_state().await {
+                Ok(state) if state.on_ground => {}
+                Ok(state) => {
+                    trail.extend(arrow_trail(arrow.team, vec3(state.entity.position)));
+                    kept.push(arrow);
+                }
+                Err(_) if arrow.age <= ARROW_SPAWN_GRACE_TICKS => kept.push(arrow),
+                Err(_) => {}
+            }
+        }
+        self.lock().arrows.extend(kept);
+        let trail = capped(trail, MAX_TRAIL_ACTIONS_PER_TICK);
+        if let Err(error) = apply(&self.arena.world, None, &[], &trail).await {
+            tracing::warn!("échec de la traînée de flèche : {error}");
+        }
+    }
+
+    async fn advance_celebration(&self) {
+        let (team, winners) = {
+            let mut state = self.lock();
+            let Some(celebration) = state.celebration.as_mut() else {
+                return;
+            };
+            let age = celebration.age;
+            celebration.age += 1;
+            let team = celebration.team;
+            if !celebrating(age) {
+                state.celebration = None;
+                return;
+            }
+            if !celebration_pulses(age) {
+                return;
+            }
+            let winners: Vec<Player> = state
+                .session
+                .standing()
+                .into_iter()
+                .filter(|(_, member_team)| *member_team == team)
+                .filter_map(|(id, _)| state.players.get(&id).cloned())
+                .collect();
+            (team, winners)
+        };
+        let mut actions = Vec::new();
+        for winner in winners {
+            if let Ok(position) = winner.get_position().await {
+                actions.extend(victory_pulse(team, vec3(position)));
+            }
+        }
+        let actions = capped(actions, MAX_TRAIL_ACTIONS_PER_TICK);
+        if let Err(error) = apply(&self.arena.world, None, &[], &actions).await {
+            tracing::warn!("échec du feu d'artifice de victoire : {error}");
+        }
+    }
+
     async fn advance_effects(&self) {
         let (actions, players_with_teams) = {
             let mut state = self.lock();
@@ -1199,7 +1345,9 @@ impl Game {
             thrower,
             ..
         } = flight;
-        let actions = plan(kind, impact_pos, team);
+        let mut actions = plan(kind, impact_pos, team);
+        let burst = explosion_burst(&actions, team);
+        actions.extend(burst);
         if starts_effect(kind) {
             self.lock().effects.start(kind, impact_pos, team);
         }

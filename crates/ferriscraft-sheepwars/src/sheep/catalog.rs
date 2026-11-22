@@ -22,14 +22,18 @@ pub const TORPEDO_POWER: f32 = 3.0;
 pub const TORPEDO_DAMAGE: f32 = 16.0;
 pub const TORPEDO_DAMAGE_RADIUS: f64 = 5.0;
 pub const TORPEDO_MAX_FLIGHT_TICKS: u32 = 20 * 6;
+pub const TORPEDO_CLEAR_DELAY_TICKS: u32 = 2;
 
 pub const LIGHTNING_STRIKES: u32 = 3;
 pub const LIGHTNING_SPREAD: f64 = 2.5;
 
-pub const FROZEN_RADIUS: f64 = 6.0;
-pub const FROZEN_SLOWNESS_TICKS: i32 = 160;
-pub const FROZEN_SLOWNESS_AMPLIFIER: u8 = 2;
-pub const FROZEN_ICE_RADIUS: i32 = 3;
+pub const FROST_ZONE_RADIUS: f64 = 5.0;
+pub const FROST_ZONE_DURATION_TICKS: u32 = 160;
+pub const FROST_PULSE_TICKS: u32 = 10;
+pub const FROST_SLOWNESS_TICKS: i32 = 30;
+pub const FROST_SLOWNESS_AMPLIFIER: u8 = 1;
+pub const FROST_ICE_RING_TICKS: u32 = 3;
+pub const FROST_ICE_LAYERS: [i32; 2] = [-1, -2];
 
 pub const SEEKER_POWER: f32 = 3.5;
 pub const SEEKER_BREAKS_BLOCKS: bool = true;
@@ -48,6 +52,7 @@ pub const HEALING_DURATION_TICKS: u32 = 20 * 12;
 pub const HEALING_PULSE_TICKS: u32 = 20;
 pub const HEALING_PULSE_HEALTH: f32 = 2.0;
 pub const HEALING_THROW_POWER: f64 = 1.1;
+pub const BOARDING_THROW_POWER: f64 = 1.5;
 
 pub const QUAKE_RADIUS: f64 = 7.0;
 pub const QUAKE_LIFT: f64 = 1.25;
@@ -65,11 +70,18 @@ pub const DARKNESS_BLINDNESS_AMPLIFIER: u8 = 0;
 pub const SPLIT_COUNT: u32 = 4;
 pub const SPLIT_HORIZONTAL_SPEED: f64 = 0.85;
 pub const SPLIT_VERTICAL_SPEED: f64 = 0.75;
-pub const SPLIT_CHILD: SheepKind = SheepKind::Explosive;
+pub const SPLIT_CHILD: SheepKind = SheepKind::Fragment;
 pub const SPLIT_PARENT_POWER: f32 = 2.5;
 pub const SPLIT_PARENT_DAMAGE: f32 = 6.0;
 pub const SPLIT_PARENT_DAMAGE_RADIUS: f64 = 4.0;
 pub const SPLIT_PARENT_BREAKS_BLOCKS: bool = true;
+
+pub const FRAGMENT_POWER: f32 = 2.5;
+pub const FRAGMENT_BREAKS_BLOCKS: bool = true;
+pub const FRAGMENT_DAMAGE: f32 = 6.0;
+pub const FRAGMENT_DAMAGE_RADIUS: f64 = 4.0;
+pub const FRAGMENT_SCALE: f64 = 0.5;
+pub const FRAGMENT_LANDING_GRACE_TICKS: u32 = 8;
 
 pub const WARP_RADIUS: f64 = 8.0;
 pub const WARP_PUSH: f64 = 2.0;
@@ -115,6 +127,7 @@ pub const fn display_name(kind: SheepKind) -> &'static str {
         SheepKind::Seeker => "§aMouton chercheur",
         SheepKind::Torpedo => "§3Mouton torpilleur",
         SheepKind::Explosive => "§cMouton explosif",
+        SheepKind::Fragment => "§7Fragment",
         SheepKind::Splitting => "§7Mouton à fragmentation",
         SheepKind::Darkness => "§8Mouton ténébreux",
         SheepKind::Frozen => "§bMouton glacé",
@@ -133,6 +146,7 @@ pub const fn wool_color(kind: SheepKind) -> WoolColor {
         SheepKind::Seeker => WoolColor::Green,
         SheepKind::Torpedo => WoolColor::Cyan,
         SheepKind::Explosive => WoolColor::Red,
+        SheepKind::Fragment => WoolColor::Gray,
         SheepKind::Splitting => WoolColor::Gray,
         SheepKind::Darkness => WoolColor::Black,
         SheepKind::Frozen => WoolColor::LightBlue,
@@ -160,6 +174,7 @@ pub const fn drop_weight(kind: SheepKind) -> u32 {
         SheepKind::Splitting | SheepKind::Darkness | SheepKind::Lightning => 8,
         SheepKind::Warp | SheepKind::Quake => 6,
         SheepKind::Intergalactic => 3,
+        SheepKind::Fragment => 0,
     }
 }
 
@@ -183,6 +198,7 @@ pub const fn announces_launch(kind: SheepKind) -> bool {
 pub const fn launch_power(kind: SheepKind) -> f64 {
     match kind {
         SheepKind::Healing => HEALING_THROW_POWER,
+        SheepKind::Boarding => BOARDING_THROW_POWER,
         _ => DEFAULT_THROW_POWER,
     }
 }
@@ -251,6 +267,7 @@ mod tests {
             TORPEDO_DAMAGE,
             SEEKER_DAMAGE,
             SPLIT_PARENT_DAMAGE,
+            FRAGMENT_DAMAGE,
         ] {
             assert!(points <= crate::domain::MAX_NON_LETHAL);
         }
@@ -266,9 +283,9 @@ mod tests {
     }
 
     #[test]
-    fn healing_is_thrown_shorter_than_the_others() {
+    fn healing_and_boarding_are_thrown_shorter_than_the_others() {
         for kind in SheepKind::ALL {
-            if kind == SheepKind::Healing {
+            if matches!(kind, SheepKind::Healing | SheepKind::Boarding) {
                 assert!(launch_power(kind) < super::DEFAULT_THROW_POWER);
             } else {
                 assert_eq!(launch_power(kind), super::DEFAULT_THROW_POWER);
