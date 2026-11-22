@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -38,7 +39,7 @@ use crate::arena::{Arena, ArenaError, Point};
 use crate::config::SheepWarsConfig;
 use crate::domain::{PlayerId, SheepKind, TeamId};
 use crate::hud::{Hud, bossbar_progress, bossbar_title};
-use crate::orchestrator::SheepWarsOrchestratorClient;
+use crate::orchestrator::{SheepWarsOrchestratorClient, spectates_here};
 use crate::sheep::{
     Action, HEALING_DURATION_TICKS, HEALING_PULSE_TICKS, ParticleKind, SEEKER_RANGE,
     TORPEDO_TRIGGER_RADIUS, Vec3, apply, chases_after_impact, clamp_speed, display_name,
@@ -49,6 +50,27 @@ pub const HUD_REFRESH_TICKS: u64 = 5;
 const ARROW_SPAWN_GRACE_TICKS: u32 = 10;
 pub const ACTION_BAR_REFRESH_TICKS: u64 = 20;
 const HEARTBEAT_FAILURE_LOG_EVERY: Duration = Duration::from_secs(30);
+pub const SHUTDOWN_REPORT_GRACE: Duration = Duration::from_secs(5);
+const SHUTDOWN_POLL: Duration = Duration::from_millis(50);
+
+fn phase_for(shutting_down: bool, current: ServerPhase) -> ServerPhase {
+    if shutting_down {
+        ServerPhase::Ending
+    } else {
+        current
+    }
+}
+
+async fn wait_until_idle(in_flight: &AtomicUsize, grace: Duration) -> bool {
+    let deadline = Instant::now() + grace;
+    while in_flight.load(Ordering::Acquire) > 0 {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(SHUTDOWN_POLL).await;
+    }
+    true
+}
 pub const HUB_ITEM: Material = Material::RedBed;
 const HUB_ITEM_SLOT: InventorySlot = InventorySlot::Hotbar(8);
 
@@ -135,6 +157,8 @@ pub struct Game {
     background_tx: mpsc::UnboundedSender<Background>,
     background_rx: Mutex<mpsc::UnboundedReceiver<Background>>,
     state: Mutex<State>,
+    shutting_down: AtomicBool,
+    reports_in_flight: Arc<AtomicUsize>,
 }
 
 impl Game {
@@ -154,6 +178,8 @@ impl Game {
             heartbeat_notify: Arc::new(Notify::new()),
             background_tx,
             background_rx: Mutex::new(background_rx),
+            shutting_down: AtomicBool::new(false),
+            reports_in_flight: Arc::new(AtomicUsize::new(0)),
             state: Mutex::new(State {
                 session,
                 players: HashMap::new(),
@@ -226,11 +252,27 @@ impl Game {
         HeartbeatRequest {
             server_id: self.config.server_id.clone(),
             address: None,
-            phase: state.session.server_phase(),
+            phase: phase_for(
+                self.shutting_down.load(Ordering::Acquire),
+                state.session.server_phase(),
+            ),
             player_count,
             max_players,
             player_uuids,
             version: self.config.version.clone(),
+            kind: Default::default(),
+        }
+    }
+
+    pub async fn shutdown(&self, grace: Duration) {
+        self.shutting_down.store(true, Ordering::Release);
+        if let Some(orchestrator) = &self.orchestrator
+            && let Err(error) = orchestrator.send_heartbeat(&self.heartbeat_payload()).await
+        {
+            tracing::warn!("dernier heartbeat non envoyé : {error}");
+        }
+        if !wait_until_idle(&self.reports_in_flight, grace).await {
+            tracing::warn!("rapport de manche encore en cours à l'arrêt, abandon");
         }
     }
 
@@ -250,15 +292,33 @@ impl Game {
         }
     }
 
+    async fn should_watch(&self, uuid: Uuid) -> bool {
+        let Some(orchestrator) = &self.orchestrator else {
+            return false;
+        };
+        match orchestrator.fetch_queue_status(uuid).await {
+            Ok(status) => spectates_here(&status, &self.config.server_id),
+            Err(error) => {
+                tracing::debug!(%uuid, "statut de file indisponible : {error}");
+                false
+            }
+        }
+    }
+
     pub async fn admit(&self, player: Player) {
         let id = player_id(player.uuid);
+        let watch = self.should_watch(player.uuid).await;
         let intents = {
             let mut state = self.lock();
             state.bar.add_player(&player);
             state.names.insert(id, player.name.clone());
             state.names.insert(id, player.name.clone());
             state.players.insert(id, player.clone());
-            state.session.join(id)
+            if watch {
+                state.session.watch(id)
+            } else {
+                state.session.join(id)
+            }
         };
         self.fetch_profile(player.uuid);
         self.run(intents).await;
@@ -294,6 +354,8 @@ impl Game {
             })
         };
         let background = self.background_tx.clone();
+        let in_flight = Arc::clone(&self.reports_in_flight);
+        in_flight.fetch_add(1, Ordering::AcqRel);
         tokio::spawn(async move {
             let result = deliver(&retry_schedule(), || {
                 orchestrator.post_match_report(&report)
@@ -315,6 +377,7 @@ impl Game {
                     "rapport de manche non envoyé, budget de renvoi épuisé : {error}"
                 ),
             }
+            in_flight.fetch_sub(1, Ordering::AcqRel);
             let _ = background.send(Background::Report {
                 match_id: report.match_id,
                 result,
@@ -1606,5 +1669,51 @@ const fn vector(vec: Vec3) -> Vector {
         x: vec.x,
         y: vec.y,
         z: vec.z,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_forces_the_ending_phase() {
+        for phase in [
+            ServerPhase::Starting,
+            ServerPhase::Waiting,
+            ServerPhase::Countdown,
+            ServerPhase::InGame,
+            ServerPhase::Ending,
+        ] {
+            assert_eq!(phase_for(true, phase), ServerPhase::Ending);
+            assert_eq!(phase_for(false, phase), phase);
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_returns_at_once_when_no_report_is_pending() {
+        let in_flight = AtomicUsize::new(0);
+        let started = Instant::now();
+        assert!(wait_until_idle(&in_flight, Duration::from_secs(5)).await);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn shutdown_gives_up_on_a_report_that_never_settles() {
+        let in_flight = AtomicUsize::new(1);
+        let started = Instant::now();
+        assert!(!wait_until_idle(&in_flight, Duration::from_millis(200)).await);
+        assert!(started.elapsed() >= Duration::from_millis(200));
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_a_report_that_settles_in_time() {
+        let in_flight = Arc::new(AtomicUsize::new(1));
+        let settle = Arc::clone(&in_flight);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            settle.fetch_sub(1, Ordering::AcqRel);
+        });
+        assert!(wait_until_idle(&in_flight, Duration::from_secs(2)).await);
     }
 }

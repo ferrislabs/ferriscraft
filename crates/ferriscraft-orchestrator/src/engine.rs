@@ -1,14 +1,19 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use ferriscraft_protocol::{
     FleetStatusSnapshot, HeartbeatRequest, JoinQueueRequest, JoinQueueResponse, LeaveQueueResponse,
     LeaveReason, PlayerQueueState, PlayerQueueStatus, ProxyEvent, ProxyServerEntry,
-    ProxyStateSnapshot, QueueJoinStatus, QueuedPlayerSummary, ServerPhase, ServerSummary,
-    TransferCommand,
+    ProxyStateSnapshot, QueueJoinStatus, QueuedPlayerSummary, ServerKind, ServerPhase,
+    ServerSummary, TransferCommand,
 };
 use thiserror::Error;
 use uuid::Uuid;
+
+use crate::lobby::{DrainError, DrainResult, LobbyInstance, LobbyState};
+use crate::queue::{FIRST_SEQ, QueueEntryState, QueueMutation, QueueRecord};
+
+const SPECTATE_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -39,6 +44,13 @@ struct QueuedPlayer {
     uuid: Uuid,
     name: String,
     joined_at: Instant,
+    state: QueueEntryState,
+}
+
+impl QueuedPlayer {
+    fn is_waiting(&self) -> bool {
+        self.state == QueueEntryState::Waiting
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +58,7 @@ struct ActiveTransfer {
     command: TransferCommand,
     created_at: Instant,
     is_lobby_return: bool,
+    acked: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +80,8 @@ struct ManagedServer {
     version: Option<String>,
     registered_on_proxy: bool,
     seen_players: HashSet<Uuid>,
+    last_players: Vec<Uuid>,
+    arrived: HashMap<Uuid, (u64, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +159,28 @@ impl ManagedServer {
             age_secs: now.saturating_duration_since(self.created_at).as_secs(),
             version: self.version.clone(),
             outdated: self.outdated,
+            kind: ServerKind::SheepWars,
+            draining: false,
+        }
+    }
+}
+
+impl LobbyInstance {
+    fn summary(&self, now: Instant) -> ServerSummary {
+        ServerSummary {
+            server_id: self.id.clone(),
+            pod_name: Some(self.id.clone()),
+            address: self.address.clone().unwrap_or_default(),
+            phase: ServerPhase::Waiting,
+            player_count: self.player_count,
+            max_players: self.max_players,
+            ready: self.state == LobbyState::Ready,
+            heartbeat_age_secs: now.saturating_duration_since(self.last_heartbeat).as_secs(),
+            age_secs: now.saturating_duration_since(self.created_at).as_secs(),
+            version: self.version.clone(),
+            outdated: false,
+            kind: ServerKind::Lobby,
+            draining: self.state == LobbyState::Draining,
         }
     }
 }
@@ -159,9 +196,12 @@ pub struct FleetEngine {
     policy: FleetPolicy,
     servers: BTreeMap<String, ManagedServer>,
     deleting: HashSet<String>,
-    queue: VecDeque<QueuedPlayer>,
+    queue: BTreeMap<u64, QueuedPlayer>,
     transfers: HashMap<Uuid, ActiveTransfer>,
     player_transfers: HashMap<Uuid, Uuid>,
+    lobbies: BTreeMap<String, LobbyInstance>,
+    spectating: HashMap<Uuid, (String, Instant)>,
+    mutations: Vec<QueueMutation>,
 }
 
 impl FleetEngine {
@@ -170,9 +210,12 @@ impl FleetEngine {
             policy,
             servers: BTreeMap::new(),
             deleting: HashSet::new(),
-            queue: VecDeque::new(),
+            queue: BTreeMap::new(),
             transfers: HashMap::new(),
             player_transfers: HashMap::new(),
+            lobbies: BTreeMap::new(),
+            spectating: HashMap::new(),
+            mutations: Vec::new(),
         }
     }
 
@@ -180,7 +223,80 @@ impl FleetEngine {
         &self.policy
     }
 
+    pub fn take_mutations(&mut self) -> Vec<QueueMutation> {
+        std::mem::take(&mut self.mutations)
+    }
+
+    pub fn restore_mutations(&mut self, mut unpersisted: Vec<QueueMutation>) {
+        unpersisted.append(&mut self.mutations);
+        self.mutations = unpersisted;
+    }
+
+    pub fn restore_queue(&mut self, now: Instant, records: Vec<QueueRecord>) {
+        let wall_now = chrono::Utc::now();
+        for record in records {
+            let waited = (wall_now - record.joined_at).to_std().unwrap_or_default();
+            let joined_at = now.checked_sub(waited).unwrap_or(now);
+            if let QueueEntryState::Dispatched {
+                server_id,
+                transfer_id,
+            } = &record.state
+            {
+                let reason = "sheepwars_matchmaking".to_owned();
+                self.transfers.insert(
+                    *transfer_id,
+                    ActiveTransfer {
+                        command: TransferCommand {
+                            transfer_id: *transfer_id,
+                            player_uuid: record.player_uuid,
+                            target_server: server_id.clone(),
+                            reason,
+                        },
+                        created_at: now,
+                        is_lobby_return: false,
+                        acked: false,
+                    },
+                );
+                self.player_transfers
+                    .insert(record.player_uuid, *transfer_id);
+            }
+            self.queue.insert(
+                record.seq,
+                QueuedPlayer {
+                    uuid: record.player_uuid,
+                    name: record.name,
+                    joined_at,
+                    state: record.state,
+                },
+            );
+        }
+    }
+
+    pub fn needs_enqueue(&self, player_uuid: Uuid) -> bool {
+        !self.has_matchmaking_transfer(player_uuid) && self.entry_seq(player_uuid).is_none()
+    }
+
     pub fn join_queue(&mut self, now: Instant, req: JoinQueueRequest) -> JoinQueueResponse {
+        let seq = self.next_seq();
+        let resp = self.join_queue_with_seq(now, req, seq);
+        if resp.status == QueueJoinStatus::Queued
+            && let Some(entry) = self.queue.get(&seq)
+        {
+            self.mutations.push(QueueMutation::Insert {
+                seq,
+                player_uuid: entry.uuid,
+                name: entry.name.clone(),
+            });
+        }
+        resp
+    }
+
+    pub fn join_queue_with_seq(
+        &mut self,
+        now: Instant,
+        req: JoinQueueRequest,
+        seq: u64,
+    ) -> JoinQueueResponse {
         if let Some(transfer_id) = self.player_transfers.get(&req.player_uuid)
             && let Some(active) = self.transfers.get(transfer_id)
             && !active.is_lobby_return
@@ -196,25 +312,29 @@ impl FleetEngine {
             return self.build_join_response(QueueJoinStatus::AlreadyQueued, pos, None);
         }
 
-        self.queue.push_back(QueuedPlayer {
-            uuid: req.player_uuid,
-            name: req.player_name,
-            joined_at: now,
-        });
-        let pos = self.queue.len();
+        let player_uuid = req.player_uuid;
+        self.queue.insert(
+            seq,
+            QueuedPlayer {
+                uuid: req.player_uuid,
+                name: req.player_name,
+                joined_at: now,
+                state: QueueEntryState::Waiting,
+            },
+        );
+        let pos = self
+            .queue_position(player_uuid)
+            .unwrap_or_else(|| self.waiting_len());
         self.build_join_response(QueueJoinStatus::Queued, pos, None)
     }
 
     pub fn leave_queue(&mut self, player_uuid: Uuid, reason: LeaveReason) -> LeaveQueueResponse {
-        let mut removed = false;
-        if let Some(idx) = self
+        let removable = self
             .queue
-            .iter()
-            .position(|entry| entry.uuid == player_uuid)
-        {
-            self.queue.remove(idx);
-            removed = true;
-        }
+            .values()
+            .find(|entry| entry.uuid == player_uuid)
+            .is_some_and(|entry| entry.is_waiting() || reason == LeaveReason::ProxyDisconnect);
+        let removed = removable && self.remove_entry(player_uuid).is_some();
 
         if reason == LeaveReason::ProxyDisconnect
             && let Some(transfer_id) = self.player_transfers.remove(&player_uuid)
@@ -224,11 +344,17 @@ impl FleetEngine {
 
         LeaveQueueResponse {
             removed,
-            total_queued: self.queue.len(),
+            total_queued: self.waiting_len(),
         }
     }
 
-    pub fn player_status(&self, player_uuid: Uuid) -> PlayerQueueStatus {
+    pub fn player_status(&self, now: Instant, player_uuid: Uuid) -> PlayerQueueStatus {
+        let spectate_server = self
+            .spectating
+            .get(&player_uuid)
+            .filter(|(_, until)| now < *until)
+            .map(|(server_id, _)| server_id.clone());
+
         if let Some(transfer_id) = self.player_transfers.get(&player_uuid)
             && let Some(active) = self.transfers.get(transfer_id)
             && !active.is_lobby_return
@@ -236,9 +362,10 @@ impl FleetEngine {
             return PlayerQueueStatus {
                 state: PlayerQueueState::Transferring,
                 position: None,
-                total_queued: self.queue.len(),
+                total_queued: self.waiting_len(),
                 min_players: self.policy.queue_min_players,
                 target_server: Some(active.command.target_server.clone()),
+                spectate_server,
             };
         }
 
@@ -246,17 +373,19 @@ impl FleetEngine {
             PlayerQueueStatus {
                 state: PlayerQueueState::Queued,
                 position: Some(pos),
-                total_queued: self.queue.len(),
+                total_queued: self.waiting_len(),
                 min_players: self.policy.queue_min_players,
                 target_server: None,
+                spectate_server,
             }
         } else {
             PlayerQueueStatus {
                 state: PlayerQueueState::NotQueued,
                 position: None,
-                total_queued: self.queue.len(),
+                total_queued: self.waiting_len(),
                 min_players: self.policy.queue_min_players,
                 target_server: None,
+                spectate_server,
             }
         }
     }
@@ -288,6 +417,8 @@ impl FleetEngine {
                 version: None,
                 registered_on_proxy: false,
                 seen_players: HashSet::new(),
+                last_players: Vec::new(),
+                arrived: HashMap::new(),
             });
     }
 
@@ -300,6 +431,9 @@ impl FleetEngine {
         tcp_ready: bool,
         failed_or_terminating: bool,
     ) -> Vec<ProxyEvent> {
+        if failed_or_terminating {
+            self.requeue_lost_players(&server_id);
+        }
         let mut events = Vec::new();
         let entry = self
             .servers
@@ -322,6 +456,8 @@ impl FleetEngine {
                 version: None,
                 registered_on_proxy: false,
                 seen_players: HashSet::new(),
+                last_players: Vec::new(),
+                arrived: HashMap::new(),
             });
 
         if pod_name.is_some() {
@@ -365,6 +501,7 @@ impl FleetEngine {
     }
 
     pub fn remove_server(&mut self, server_id: &str) -> Option<ProxyEvent> {
+        self.requeue_lost_players(server_id);
         self.deleting.remove(server_id);
         let removed = self.servers.remove(server_id)?;
         if removed.registered_on_proxy {
@@ -391,6 +528,7 @@ impl FleetEngine {
     }
 
     pub fn mark_deleting(&mut self, now: Instant, server_id: &str) -> Option<ProxyEvent> {
+        self.requeue_lost_players(server_id);
         self.deleting.insert(server_id.to_owned());
         let server = self.servers.get_mut(server_id)?;
         server.set_phase(now, ServerPhase::Ending);
@@ -405,6 +543,9 @@ impl FleetEngine {
     }
 
     pub fn apply_heartbeat(&mut self, now: Instant, req: HeartbeatRequest) -> Vec<ProxyEvent> {
+        if req.kind == ServerKind::Lobby {
+            return self.apply_lobby_heartbeat(now, req);
+        }
         let mut events = Vec::new();
         let max_players = req.max_players.max(1);
         let entry = self
@@ -428,6 +569,8 @@ impl FleetEngine {
                 version: None,
                 registered_on_proxy: false,
                 seen_players: HashSet::new(),
+                last_players: Vec::new(),
+                arrived: HashMap::new(),
             });
 
         let addr_changed = req.address.is_some() && entry.address != req.address;
@@ -452,9 +595,12 @@ impl FleetEngine {
             entry.last_non_empty_at = now;
         }
 
-        // Clear matching active transfers once the game server reports the player connected.
         entry.seen_players.extend(req.player_uuids.iter().copied());
+        let mut arrivals = Vec::new();
         for uuid in &req.player_uuids {
+            if let Some(player) = self.remove_entry_by_uuid(*uuid) {
+                arrivals.push((*uuid, player));
+            }
             if let Some(tid) = self.player_transfers.get(uuid).copied()
                 && self
                     .transfers
@@ -467,9 +613,253 @@ impl FleetEngine {
         }
 
         if let Some(server) = self.servers.get_mut(&req.server_id) {
+            for (uuid, (seq, player)) in arrivals {
+                server.arrived.insert(uuid, (seq, player.name));
+            }
+            server.last_players = req.player_uuids;
             Self::sync_proxy_registration(server, addr_changed || phase_changed, &mut events);
         }
         events
+    }
+
+    fn apply_lobby_heartbeat(&mut self, now: Instant, req: HeartbeatRequest) -> Vec<ProxyEvent> {
+        let max_players = req.max_players.max(1);
+        let lobby = self
+            .lobbies
+            .entry(req.server_id.clone())
+            .or_insert_with(|| LobbyInstance {
+                id: req.server_id.clone(),
+                address: None,
+                state: LobbyState::Starting,
+                player_count: 0,
+                max_players,
+                player_uuids: Vec::new(),
+                version: None,
+                created_at: now,
+                last_heartbeat: now,
+                registered_on_proxy: false,
+            });
+        let mut changed = false;
+        if let Some(address) = req.address
+            && lobby.address.as_deref() != Some(address.as_str())
+        {
+            lobby.address = Some(address);
+            changed = true;
+        }
+        if req.phase == ServerPhase::Ending && lobby.state != LobbyState::Draining {
+            lobby.state = LobbyState::Draining;
+            changed = true;
+        }
+        if lobby.state == LobbyState::Starting && lobby.address.is_some() {
+            lobby.state = LobbyState::Ready;
+            changed = true;
+        }
+        lobby.player_count = req.player_count;
+        lobby.max_players = max_players;
+        if req.version.is_some() {
+            lobby.version = req.version;
+        }
+        lobby.last_heartbeat = now;
+
+        let mut events = Vec::new();
+        match (&lobby.address, lobby.state) {
+            (Some(address), LobbyState::Ready) if !lobby.registered_on_proxy || changed => {
+                lobby.registered_on_proxy = true;
+                events.push(ProxyEvent::ServerUpsert {
+                    name: lobby.id.clone(),
+                    address: address.clone(),
+                    phase: ServerPhase::Waiting,
+                    kind: ServerKind::Lobby,
+                });
+            }
+            (_, LobbyState::Ready) => {}
+            _ if lobby.registered_on_proxy => {
+                lobby.registered_on_proxy = false;
+                events.push(ProxyEvent::ServerRemove {
+                    name: lobby.id.clone(),
+                });
+            }
+            _ => {}
+        }
+
+        for uuid in &req.player_uuids {
+            if let Some(tid) = self.player_transfers.get(uuid).copied()
+                && self
+                    .transfers
+                    .get(&tid)
+                    .is_some_and(|t| t.is_lobby_return && t.command.target_server == req.server_id)
+            {
+                self.player_transfers.remove(uuid);
+                self.transfers.remove(&tid);
+            }
+        }
+        if let Some(lobby) = self.lobbies.get_mut(&req.server_id) {
+            lobby.player_uuids = req.player_uuids;
+        }
+        events
+    }
+
+    pub fn pick_lobby(&self) -> Option<&LobbyInstance> {
+        self.least_loaded_lobby(None, &HashMap::new())
+    }
+
+    fn least_loaded_lobby(
+        &self,
+        exclude: Option<&str>,
+        extra: &HashMap<String, u32>,
+    ) -> Option<&LobbyInstance> {
+        let mut pending: HashMap<&str, u32> = HashMap::new();
+        for transfer in self.transfers.values().filter(|t| t.is_lobby_return) {
+            *pending
+                .entry(transfer.command.target_server.as_str())
+                .or_insert(0) += 1;
+        }
+        self.lobbies
+            .values()
+            .filter(|l| l.state == LobbyState::Ready && Some(l.id.as_str()) != exclude)
+            .min_by_key(|l| {
+                let load = l.player_count
+                    + pending.get(l.id.as_str()).copied().unwrap_or(0)
+                    + extra.get(l.id.as_str()).copied().unwrap_or(0);
+                (load, l.id.as_str())
+            })
+    }
+
+    fn lobby_target(&self) -> String {
+        self.pick_lobby().map_or_else(
+            || self.policy.lobby_server_name.clone(),
+            |lobby| lobby.id.clone(),
+        )
+    }
+
+    pub fn drain_lobby(&mut self, now: Instant, id: &str) -> Result<DrainResult, DrainError> {
+        let Some(lobby) = self.lobbies.get(id) else {
+            return Err(if self.servers.contains_key(id) {
+                DrainError::NotALobby
+            } else {
+                DrainError::UnknownServer
+            });
+        };
+        let remaining_players = lobby
+            .player_count
+            .max(u32::try_from(lobby.player_uuids.len()).unwrap_or(u32::MAX));
+        let players = lobby.player_uuids.clone();
+        if remaining_players > 0 && self.least_loaded_lobby(Some(id), &HashMap::new()).is_none() {
+            return Err(DrainError::NoOtherLobby);
+        }
+
+        let mut events = Vec::new();
+        if let Some(lobby) = self.lobbies.get_mut(id) {
+            lobby.state = LobbyState::Draining;
+            if lobby.registered_on_proxy {
+                lobby.registered_on_proxy = false;
+                events.push(ProxyEvent::ServerRemove {
+                    name: lobby.id.clone(),
+                });
+            }
+        }
+
+        let mut assigned: HashMap<String, u32> = HashMap::new();
+        for player_uuid in players {
+            if self.player_transfers.contains_key(&player_uuid) {
+                continue;
+            }
+            let Some(target) = self
+                .least_loaded_lobby(Some(id), &assigned)
+                .map(|l| l.id.clone())
+            else {
+                break;
+            };
+            *assigned.entry(target.clone()).or_insert(0) += 1;
+            events.push(self.new_lobby_transfer(
+                now,
+                player_uuid,
+                target,
+                "mise à jour du lobby".to_owned(),
+            ));
+        }
+        Ok(DrainResult {
+            remaining_players,
+            events,
+        })
+    }
+
+    fn new_lobby_transfer(
+        &mut self,
+        now: Instant,
+        player_uuid: Uuid,
+        target_server: String,
+        reason: String,
+    ) -> ProxyEvent {
+        let transfer_id = Uuid::new_v4();
+        let command = TransferCommand {
+            transfer_id,
+            player_uuid,
+            target_server: target_server.clone(),
+            reason: reason.clone(),
+        };
+        self.transfers.insert(
+            transfer_id,
+            ActiveTransfer {
+                command,
+                created_at: now,
+                is_lobby_return: true,
+                acked: false,
+            },
+        );
+        self.player_transfers.insert(player_uuid, transfer_id);
+        ProxyEvent::TransferPlayer {
+            transfer_id,
+            player_uuid,
+            target_server,
+            reason,
+        }
+    }
+
+    fn requeue_lost_players(&mut self, server_id: &str) {
+        let Some(server) = self.servers.get_mut(server_id) else {
+            return;
+        };
+        if !matches!(server.phase, ServerPhase::Waiting | ServerPhase::Countdown) {
+            return;
+        }
+        let joined_at = server.last_heartbeat.unwrap_or(server.created_at);
+        let mut players: Vec<(u64, Uuid, String)> = std::mem::take(&mut server.last_players)
+            .into_iter()
+            .map(|uuid| match server.arrived.get(&uuid) {
+                Some((seq, name)) => (*seq, uuid, name.clone()),
+                None => (u64::MAX, uuid, uuid.to_string()),
+            })
+            .collect();
+        players.retain(|(_, uuid, _)| self.entry_seq(*uuid).is_none());
+        if players.is_empty() {
+            return;
+        }
+        players.sort_by_key(|(seq, _, _)| *seq);
+        let base = self
+            .queue
+            .keys()
+            .next()
+            .copied()
+            .unwrap_or(FIRST_SEQ)
+            .saturating_sub(players.len() as u64);
+        for (offset, (_, uuid, name)) in players.into_iter().enumerate() {
+            let seq = base + offset as u64;
+            self.mutations.push(QueueMutation::Insert {
+                seq,
+                player_uuid: uuid,
+                name: name.clone(),
+            });
+            self.queue.insert(
+                seq,
+                QueuedPlayer {
+                    uuid,
+                    name,
+                    joined_at,
+                    state: QueueEntryState::Waiting,
+                },
+            );
+        }
     }
 
     pub fn update_server_phase(
@@ -495,37 +885,14 @@ impl FleetEngine {
         player_uuid: Uuid,
         reason: Option<String>,
     ) -> ProxyEvent {
-        if let Some(idx) = self.queue.iter().position(|e| e.uuid == player_uuid) {
-            self.queue.remove(idx);
-        }
+        self.remove_entry(player_uuid);
         if let Some(old_tid) = self.player_transfers.remove(&player_uuid) {
             self.transfers.remove(&old_tid);
         }
 
-        let transfer_id = Uuid::new_v4();
+        let target_server = self.lobby_target();
         let reason = reason.unwrap_or_else(|| "retour au hub".to_owned());
-        let command = TransferCommand {
-            transfer_id,
-            player_uuid,
-            target_server: self.policy.lobby_server_name.clone(),
-            reason: reason.clone(),
-        };
-        self.transfers.insert(
-            transfer_id,
-            ActiveTransfer {
-                command: command.clone(),
-                created_at: now,
-                is_lobby_return: true,
-            },
-        );
-        self.player_transfers.insert(player_uuid, transfer_id);
-
-        ProxyEvent::TransferPlayer {
-            transfer_id,
-            player_uuid,
-            target_server: command.target_server,
-            reason,
-        }
+        self.new_lobby_transfer(now, player_uuid, target_server, reason)
     }
 
     pub fn queue_spectate_transfer(
@@ -541,12 +908,12 @@ impl FleetEngine {
         if self.deleting.contains(server_id) || !server.ready_for_proxy() {
             return Err(EngineError::NotJoinable(server_id.to_owned()));
         }
-        if let Some(idx) = self.queue.iter().position(|e| e.uuid == player_uuid) {
-            self.queue.remove(idx);
-        }
+        self.remove_entry(player_uuid);
         if let Some(old_tid) = self.player_transfers.remove(&player_uuid) {
             self.transfers.remove(&old_tid);
         }
+        self.spectating
+            .insert(player_uuid, (server_id.to_owned(), now + SPECTATE_TTL));
         let transfer_id = Uuid::new_v4();
         let reason = "spectate".to_owned();
         let command = TransferCommand {
@@ -561,6 +928,7 @@ impl FleetEngine {
                 command,
                 created_at: now,
                 is_lobby_return: false,
+                acked: false,
             },
         );
         self.player_transfers.insert(player_uuid, transfer_id);
@@ -572,12 +940,41 @@ impl FleetEngine {
         })
     }
 
-    pub fn ack_transfer(&mut self, transfer_id: Uuid, _success: bool) {
-        if let Some(active) = self.transfers.remove(&transfer_id)
-            && self.player_transfers.get(&active.command.player_uuid) == Some(&transfer_id)
-        {
-            self.player_transfers.remove(&active.command.player_uuid);
+    pub fn ack_transfer(&mut self, now: Instant, transfer_id: Uuid, success: bool) {
+        let Some(active) = self.transfers.get_mut(&transfer_id) else {
+            return;
+        };
+        if success && !active.is_lobby_return {
+            active.created_at = now;
+            active.acked = true;
+            return;
         }
+        let is_lobby_return = active.is_lobby_return;
+        let player_uuid = active.command.player_uuid;
+        self.transfers.remove(&transfer_id);
+        if self.player_transfers.get(&player_uuid) == Some(&transfer_id) {
+            self.player_transfers.remove(&player_uuid);
+        }
+        if !is_lobby_return {
+            self.requeue_dispatched(player_uuid, transfer_id);
+        }
+    }
+
+    fn requeue_dispatched(&mut self, player_uuid: Uuid, transfer_id: Uuid) {
+        let Some(entry) = self.queue.values_mut().find(|entry| {
+            entry.uuid == player_uuid
+                && matches!(
+                    &entry.state,
+                    QueueEntryState::Dispatched { transfer_id: tid, .. } if *tid == transfer_id
+                )
+        }) else {
+            return;
+        };
+        entry.state = QueueEntryState::Waiting;
+        self.mutations.push(QueueMutation::SetState {
+            player_uuid,
+            state: QueueEntryState::Waiting,
+        });
     }
 
     pub fn tick(&mut self, now: Instant) -> TickActions {
@@ -596,6 +993,27 @@ impl FleetEngine {
             self.transfers.remove(&tid);
             if self.player_transfers.get(&uuid) == Some(&tid) {
                 self.player_transfers.remove(&uuid);
+            }
+            self.requeue_dispatched(uuid, tid);
+        }
+
+        self.spectating.retain(|_, (_, until)| now < *until);
+
+        let lost: Vec<String> = self
+            .lobbies
+            .values()
+            .filter(|l| {
+                now.saturating_duration_since(l.last_heartbeat) >= self.policy.heartbeat_timeout
+            })
+            .map(|l| l.id.clone())
+            .collect();
+        for id in lost {
+            if let Some(lobby) = self.lobbies.remove(&id)
+                && lobby.registered_on_proxy
+            {
+                actions
+                    .proxy_events
+                    .push(ProxyEvent::ServerRemove { name: lobby.id });
             }
         }
 
@@ -619,12 +1037,12 @@ impl FleetEngine {
 
     fn dispatch_queued_players(&mut self, now: Instant) -> Vec<ProxyEvent> {
         let mut events = Vec::new();
-        if self.queue.is_empty() {
+        if self.waiting_len() == 0 {
             return events;
         }
 
         loop {
-            if self.queue.is_empty() {
+            if self.waiting_len() == 0 {
                 break;
             }
 
@@ -673,27 +1091,46 @@ impl FleetEngine {
 
             // Only open an empty server once queue meets queue_min_players.
             // If a server already has players waiting inside, backfill immediately!
-            if !has_players && self.queue.len() < self.policy.queue_min_players {
+            if !has_players && self.waiting_len() < self.policy.queue_min_players {
                 break;
             }
 
-            let dispatch_count = self.queue.len().min(free_slots as usize);
+            let dispatch_count = self.waiting_len().min(free_slots as usize);
             if dispatch_count == 0 {
                 break;
             }
 
-            for _ in 0..dispatch_count {
-                let Some(player) = self.queue.pop_front() else {
-                    break;
+            let seqs: Vec<u64> = self
+                .queue
+                .iter()
+                .filter(|(_, entry)| entry.is_waiting())
+                .take(dispatch_count)
+                .map(|(seq, _)| *seq)
+                .collect();
+            for seq in seqs {
+                let Some(player) = self.queue.get_mut(&seq) else {
+                    continue;
                 };
-                if let Some(old_tid) = self.player_transfers.remove(&player.uuid) {
+                let player_uuid = player.uuid;
+                let transfer_id = Uuid::new_v4();
+                player.state = QueueEntryState::Dispatched {
+                    server_id: target_server.clone(),
+                    transfer_id,
+                };
+                self.mutations.push(QueueMutation::SetState {
+                    player_uuid,
+                    state: QueueEntryState::Dispatched {
+                        server_id: target_server.clone(),
+                        transfer_id,
+                    },
+                });
+                if let Some(old_tid) = self.player_transfers.remove(&player_uuid) {
                     self.transfers.remove(&old_tid);
                 }
-                let transfer_id = Uuid::new_v4();
                 let reason = "sheepwars_matchmaking".to_owned();
                 let command = TransferCommand {
                     transfer_id,
-                    player_uuid: player.uuid,
+                    player_uuid,
                     target_server: target_server.clone(),
                     reason: reason.clone(),
                 };
@@ -703,12 +1140,13 @@ impl FleetEngine {
                         command,
                         created_at: now,
                         is_lobby_return: false,
+                        acked: false,
                     },
                 );
-                self.player_transfers.insert(player.uuid, transfer_id);
+                self.player_transfers.insert(player_uuid, transfer_id);
                 events.push(ProxyEvent::TransferPlayer {
                     transfer_id,
-                    player_uuid: player.uuid,
+                    player_uuid,
                     target_server: target_server.clone(),
                     reason,
                 });
@@ -806,16 +1244,15 @@ impl FleetEngine {
             })
             .count();
 
-        let needed_for_queue = if self.queue.is_empty() {
+        let needed_for_queue = if self.waiting_len() == 0 {
             0
         } else {
-            self.queue
-                .len()
+            self.waiting_len()
                 .div_ceil(self.policy.max_players_per_server as usize)
                 .max(1)
         };
 
-        let target_available = if self.queue.is_empty() {
+        let target_available = if self.waiting_len() == 0 {
             // Maintain at least min_replicas total servers when idle; keep standby if min_replicas > 0.
             self.policy
                 .min_replicas
@@ -900,7 +1337,8 @@ impl FleetEngine {
 
         let queued_players = self
             .queue
-            .iter()
+            .values()
+            .filter(|q| q.is_waiting())
             .enumerate()
             .map(|(idx, q)| QueuedPlayerSummary {
                 player_uuid: q.uuid,
@@ -911,7 +1349,7 @@ impl FleetEngine {
             .collect();
 
         FleetStatusSnapshot {
-            queue_len: self.queue.len(),
+            queue_len: self.waiting_len(),
             min_players: self.policy.queue_min_players,
             max_players_per_server: self.policy.max_players_per_server,
             min_replicas: self.policy.min_replicas,
@@ -923,6 +1361,8 @@ impl FleetEngine {
             queued_players,
             servers,
             orchestrator_version: None,
+            lobbies: self.lobbies.values().map(|l| l.summary(now)).collect(),
+            proxy_version: None,
         }
     }
 
@@ -936,11 +1376,30 @@ impl FleetEngine {
                     name: s.server_id.clone(),
                     address: addr.clone(),
                     phase: s.phase,
+                    kind: ServerKind::SheepWars,
                 })
             })
+            .chain(
+                self.lobbies
+                    .values()
+                    .filter(|l| l.state == LobbyState::Ready)
+                    .filter_map(|l| {
+                        l.address.as_ref().map(|addr| ProxyServerEntry {
+                            name: l.id.clone(),
+                            address: addr.clone(),
+                            phase: ServerPhase::Waiting,
+                            kind: ServerKind::Lobby,
+                        })
+                    }),
+            )
             .collect();
 
-        let pending_transfers = self.transfers.values().map(|t| t.command.clone()).collect();
+        let pending_transfers = self
+            .transfers
+            .values()
+            .filter(|t| !t.acked)
+            .map(|t| t.command.clone())
+            .collect();
 
         ProxyStateSnapshot {
             lobby_server_name: self.policy.lobby_server_name.clone(),
@@ -962,6 +1421,7 @@ impl FleetEngine {
                     name: server.server_id.clone(),
                     address: addr.clone(),
                     phase: server.phase,
+                    kind: ServerKind::SheepWars,
                 });
             }
         } else if !should_register && server.registered_on_proxy {
@@ -974,9 +1434,50 @@ impl FleetEngine {
 
     fn queue_position(&self, uuid: Uuid) -> Option<usize> {
         self.queue
-            .iter()
+            .values()
+            .filter(|entry| entry.is_waiting())
             .position(|entry| entry.uuid == uuid)
             .map(|idx| idx + 1)
+    }
+
+    fn waiting_len(&self) -> usize {
+        self.queue
+            .values()
+            .filter(|entry| entry.is_waiting())
+            .count()
+    }
+
+    fn next_seq(&self) -> u64 {
+        self.queue
+            .keys()
+            .next_back()
+            .map_or(FIRST_SEQ, |seq| seq + 1)
+    }
+
+    fn entry_seq(&self, uuid: Uuid) -> Option<u64> {
+        self.queue
+            .iter()
+            .find(|(_, entry)| entry.uuid == uuid)
+            .map(|(seq, _)| *seq)
+    }
+
+    fn has_matchmaking_transfer(&self, uuid: Uuid) -> bool {
+        self.player_transfers
+            .get(&uuid)
+            .and_then(|tid| self.transfers.get(tid))
+            .is_some_and(|active| !active.is_lobby_return)
+    }
+
+    fn remove_entry_by_uuid(&mut self, uuid: Uuid) -> Option<(u64, QueuedPlayer)> {
+        let seq = self.entry_seq(uuid)?;
+        let player = self.queue.remove(&seq)?;
+        self.mutations
+            .push(QueueMutation::Remove { player_uuid: uuid });
+        Some((seq, player))
+    }
+
+    fn remove_entry(&mut self, uuid: Uuid) -> Option<QueuedPlayer> {
+        self.remove_entry_by_uuid(uuid).map(|(_, player)| player)
     }
 
     fn pending_transfer_counts(&self) -> HashMap<String, u32> {
@@ -1013,7 +1514,7 @@ impl FleetEngine {
         JoinQueueResponse {
             status,
             position,
-            total_queued: self.queue.len(),
+            total_queued: self.waiting_len(),
             min_players: self.policy.queue_min_players,
             target_server,
             ready_servers,
@@ -1130,17 +1631,20 @@ mod tests {
         engine.tick(t0);
 
         assert_eq!(
-            engine.player_status(p1).state,
+            engine.player_status(t0, p1).state,
             PlayerQueueState::Transferring
         );
         engine.leave_queue(p1, LeaveReason::LobbyQuit);
         assert_eq!(
-            engine.player_status(p1).state,
+            engine.player_status(t0, p1).state,
             PlayerQueueState::Transferring
         );
 
         engine.leave_queue(p1, LeaveReason::ProxyDisconnect);
-        assert_eq!(engine.player_status(p1).state, PlayerQueueState::NotQueued);
+        assert_eq!(
+            engine.player_status(t0, p1).state,
+            PlayerQueueState::NotQueued
+        );
     }
 
     #[test]
@@ -1165,6 +1669,7 @@ mod tests {
                 max_players: 4,
                 player_uuids: Vec::new(),
                 version: None,
+                kind: Default::default(),
             },
         );
 
@@ -1203,6 +1708,7 @@ mod tests {
                 max_players: 4,
                 player_uuids: Vec::new(),
                 version: None,
+                kind: Default::default(),
             },
         );
         engine.upsert_infra_server(
@@ -1223,6 +1729,7 @@ mod tests {
                 max_players: 4,
                 player_uuids: Vec::new(),
                 version: None,
+                kind: Default::default(),
             },
         );
 
@@ -1260,6 +1767,7 @@ mod tests {
                 max_players: 4,
                 player_uuids: Vec::new(),
                 version: None,
+                kind: Default::default(),
             },
         );
         assert!(hb_events.iter().any(|e| matches!(
@@ -1321,6 +1829,7 @@ mod tests {
                 max_players: 4,
                 player_uuids,
                 version: None,
+                kind: Default::default(),
             },
         );
     }
@@ -1611,6 +2120,7 @@ mod tests {
                 max_players: 4,
                 player_uuids: Vec::new(),
                 version: Some("abc1234".to_owned()),
+                kind: Default::default(),
             },
         );
         heartbeat(&mut engine, t0, "sheepwars-1", ServerPhase::Waiting, 0);
@@ -1654,5 +2164,707 @@ mod tests {
             engine.queue_spectate_transfer(t0, "sheepwars-1", Uuid::from_u128(1)),
             Err(EngineError::NotJoinable(_))
         ));
+    }
+
+    fn uid(n: u128) -> Uuid {
+        Uuid::from_u128(n)
+    }
+
+    fn lobby_heartbeat(
+        engine: &mut FleetEngine,
+        now: Instant,
+        id: &str,
+        address: Option<&str>,
+        players: &[u128],
+    ) -> Vec<ProxyEvent> {
+        engine.apply_heartbeat(
+            now,
+            HeartbeatRequest {
+                server_id: id.to_owned(),
+                address: address.map(str::to_owned),
+                phase: ServerPhase::Waiting,
+                player_count: players.len() as u32,
+                max_players: 50,
+                player_uuids: players.iter().map(|n| uid(*n)).collect(),
+                version: None,
+                kind: ServerKind::Lobby,
+            },
+        )
+    }
+
+    fn game_heartbeat(
+        engine: &mut FleetEngine,
+        now: Instant,
+        id: &str,
+        phase: ServerPhase,
+        players: &[u128],
+    ) {
+        engine.apply_heartbeat(
+            now,
+            HeartbeatRequest {
+                server_id: id.to_owned(),
+                address: None,
+                phase,
+                player_count: players.len() as u32,
+                max_players: 4,
+                player_uuids: players.iter().map(|n| uid(*n)).collect(),
+                version: None,
+                kind: ServerKind::SheepWars,
+            },
+        );
+    }
+
+    fn transfer_ids(actions: &TickActions) -> Vec<(Uuid, Uuid)> {
+        actions
+            .proxy_events
+            .iter()
+            .filter_map(|event| match event {
+                ProxyEvent::TransferPlayer {
+                    transfer_id,
+                    player_uuid,
+                    ..
+                } => Some((*player_uuid, *transfer_id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn queued(engine: &FleetEngine, now: Instant) -> Vec<Uuid> {
+        engine
+            .snapshot(now)
+            .queued_players
+            .iter()
+            .map(|p| p.player_uuid)
+            .collect()
+    }
+
+    fn lobby_transfer_targets(events: &[ProxyEvent]) -> Vec<(Uuid, &str)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ProxyEvent::TransferPlayer {
+                    player_uuid,
+                    target_server,
+                    ..
+                } => Some((*player_uuid, target_server.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lobby_heartbeat_registers_a_lobby_instance_and_not_a_sheepwars_server() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        let events = lobby_heartbeat(&mut engine, t0, "lobby-a", Some("10.0.0.3:25565"), &[]);
+        assert_eq!(
+            events,
+            [ProxyEvent::ServerUpsert {
+                name: "lobby-a".to_owned(),
+                address: "10.0.0.3:25565".to_owned(),
+                phase: ServerPhase::Waiting,
+                kind: ServerKind::Lobby,
+            }]
+        );
+        let snap = engine.snapshot(t0);
+        assert!(snap.servers.is_empty());
+        assert_eq!(snap.lobbies.len(), 1);
+        assert_eq!(snap.lobbies[0].kind, ServerKind::Lobby);
+        assert!(snap.lobbies[0].ready);
+        assert!(!snap.lobbies[0].draining);
+        assert_eq!(
+            engine.pick_lobby().map(|l| l.state),
+            Some(LobbyState::Ready)
+        );
+        let proxy = engine.proxy_snapshot();
+        assert_eq!(proxy.servers.len(), 1);
+        assert_eq!(proxy.servers[0].kind, ServerKind::Lobby);
+        assert!(
+            lobby_heartbeat(&mut engine, t0, "lobby-a", Some("10.0.0.3:25565"), &[]).is_empty()
+        );
+    }
+
+    #[test]
+    fn lobby_without_address_stays_starting_until_it_has_one() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        assert!(lobby_heartbeat(&mut engine, t0, "lobby-a", None, &[]).is_empty());
+        assert!(engine.pick_lobby().is_none());
+        assert!(!engine.snapshot(t0).lobbies[0].ready);
+        let events = lobby_heartbeat(&mut engine, t0, "lobby-a", Some("10.0.0.3:25565"), &[]);
+        assert_eq!(events.len(), 1);
+        assert!(engine.pick_lobby().is_some());
+    }
+
+    #[test]
+    fn lobby_is_removed_after_the_heartbeat_timeout() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        lobby_heartbeat(&mut engine, t0, "lobby-a", Some("10.0.0.3:25565"), &[]);
+        assert!(
+            engine
+                .tick(t0 + Duration::from_secs(29))
+                .proxy_events
+                .is_empty()
+        );
+        let actions = engine.tick(t0 + Duration::from_secs(30));
+        assert_eq!(
+            actions.proxy_events,
+            [ProxyEvent::ServerRemove {
+                name: "lobby-a".to_owned()
+            }]
+        );
+        assert!(engine.pick_lobby().is_none());
+        assert!(engine.snapshot(t0).lobbies.is_empty());
+    }
+
+    #[test]
+    fn lobbies_are_ignored_by_fleet_planning_and_infra_reaping() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        lobby_heartbeat(&mut engine, t0, "lobby-a", Some("10.0.0.3:25565"), &[1, 2]);
+        let actions = engine.tick(t0);
+        assert_eq!(actions.servers_to_create, 1);
+        assert!(actions.servers_to_delete.is_empty());
+        assert!(engine.retain_infra_servers(&HashSet::new()).is_empty());
+        assert_eq!(engine.snapshot(t0).lobbies.len(), 1);
+        let late = engine.tick(t0 + Duration::from_secs(25));
+        assert!(late.servers_to_delete.is_empty());
+    }
+
+    #[test]
+    fn pick_lobby_returns_the_ready_instance_with_the_fewest_players() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        assert!(engine.pick_lobby().is_none());
+        lobby_heartbeat(
+            &mut engine,
+            t0,
+            "lobby-a",
+            Some("10.0.0.3:25565"),
+            &[1, 2, 3],
+        );
+        lobby_heartbeat(&mut engine, t0, "lobby-b", Some("10.0.0.4:25565"), &[4]);
+        lobby_heartbeat(&mut engine, t0, "lobby-c", None, &[]);
+        assert_eq!(engine.pick_lobby().map(|l| l.id.as_str()), Some("lobby-b"));
+    }
+
+    #[test]
+    fn plc_4_a_draining_lobby_is_never_picked() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        lobby_heartbeat(&mut engine, t0, "lobby-a", Some("10.0.0.3:25565"), &[]);
+        lobby_heartbeat(
+            &mut engine,
+            t0,
+            "lobby-b",
+            Some("10.0.0.4:25565"),
+            &[1, 2, 3],
+        );
+        assert_eq!(engine.pick_lobby().map(|l| l.id.as_str()), Some("lobby-a"));
+        engine.drain_lobby(t0, "lobby-a").unwrap();
+        assert_eq!(engine.pick_lobby().map(|l| l.id.as_str()), Some("lobby-b"));
+        let events = lobby_heartbeat(&mut engine, t0, "lobby-a", Some("10.0.0.3:25565"), &[]);
+        assert!(events.is_empty());
+        assert_eq!(engine.pick_lobby().map(|l| l.id.as_str()), Some("lobby-b"));
+        assert!(engine.snapshot(t0).lobbies.iter().any(|l| l.draining));
+        let proxy = engine.proxy_snapshot();
+        assert_eq!(proxy.servers.len(), 1);
+        assert_eq!(proxy.servers[0].name, "lobby-b");
+    }
+
+    #[test]
+    fn lobby_returns_target_the_picked_instance_or_fall_back_to_the_service() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        let fallback = engine.queue_lobby_transfer(t0, uid(1), None);
+        assert!(matches!(
+            fallback,
+            ProxyEvent::TransferPlayer { ref target_server, .. } if target_server == "lobby"
+        ));
+        lobby_heartbeat(&mut engine, t0, "lobby-a", Some("10.0.0.3:25565"), &[1, 2]);
+        lobby_heartbeat(&mut engine, t0, "lobby-b", Some("10.0.0.4:25565"), &[3]);
+        let picked = engine.queue_lobby_transfer(t0, uid(9), Some("fin de partie".to_owned()));
+        assert!(matches!(
+            picked,
+            ProxyEvent::TransferPlayer { ref target_server, .. } if target_server == "lobby-b"
+        ));
+    }
+
+    #[test]
+    fn drain_spreads_players_over_the_least_loaded_other_lobbies_and_removes_the_instance() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        lobby_heartbeat(
+            &mut engine,
+            t0,
+            "lobby-a",
+            Some("10.0.0.3:25565"),
+            &[1, 2, 3],
+        );
+        lobby_heartbeat(&mut engine, t0, "lobby-b", Some("10.0.0.4:25565"), &[]);
+        lobby_heartbeat(&mut engine, t0, "lobby-c", Some("10.0.0.5:25565"), &[]);
+        let result = engine.drain_lobby(t0, "lobby-a").unwrap();
+        assert_eq!(result.remaining_players, 3);
+        assert_eq!(
+            result.events[0],
+            ProxyEvent::ServerRemove {
+                name: "lobby-a".to_owned()
+            }
+        );
+        assert_eq!(
+            lobby_transfer_targets(&result.events),
+            [
+                (uid(1), "lobby-b"),
+                (uid(2), "lobby-c"),
+                (uid(3), "lobby-b")
+            ]
+        );
+        assert_eq!(
+            engine
+                .snapshot(t0)
+                .lobbies
+                .iter()
+                .filter(|l| l.draining)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn drain_can_be_polled_without_duplicating_transfers() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        lobby_heartbeat(&mut engine, t0, "lobby-a", Some("10.0.0.3:25565"), &[1, 2]);
+        lobby_heartbeat(&mut engine, t0, "lobby-b", Some("10.0.0.4:25565"), &[]);
+        assert_eq!(engine.drain_lobby(t0, "lobby-a").unwrap().events.len(), 3);
+        let again = engine.drain_lobby(t0, "lobby-a").unwrap();
+        assert_eq!(again.remaining_players, 2);
+        assert!(again.events.is_empty());
+        lobby_heartbeat(&mut engine, t0, "lobby-a", Some("10.0.0.3:25565"), &[]);
+        let done = engine.drain_lobby(t0, "lobby-a").unwrap();
+        assert_eq!(done.remaining_players, 0);
+        assert!(done.events.is_empty());
+    }
+
+    #[test]
+    fn plc_5_drain_without_another_ready_lobby_is_refused() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        lobby_heartbeat(&mut engine, t0, "lobby-a", Some("10.0.0.3:25565"), &[1]);
+        assert_eq!(
+            engine.drain_lobby(t0, "lobby-a").unwrap_err(),
+            DrainError::NoOtherLobby
+        );
+        lobby_heartbeat(&mut engine, t0, "lobby-b", None, &[]);
+        assert_eq!(
+            engine.drain_lobby(t0, "lobby-a").unwrap_err(),
+            DrainError::NoOtherLobby
+        );
+        assert!(engine.pick_lobby().is_some());
+    }
+
+    #[test]
+    fn drain_rejects_unknown_ids_and_sheepwars_servers() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        waiting(&mut engine, t0, "sheepwars-1");
+        assert_eq!(
+            engine.drain_lobby(t0, "nope").unwrap_err(),
+            DrainError::UnknownServer
+        );
+        assert_eq!(
+            engine.drain_lobby(t0, "sheepwars-1").unwrap_err(),
+            DrainError::NotALobby
+        );
+    }
+
+    #[test]
+    fn join_and_dispatch_are_reported_as_queue_mutations() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        waiting(&mut engine, t0, "sheepwars-1");
+        queue(&mut engine, t0, 10);
+        queue(&mut engine, t0, 11);
+        engine.tick(t0);
+        let mutations = engine.take_mutations();
+        assert!(
+            matches!(mutations[0], QueueMutation::Insert { player_uuid, .. } if player_uuid == uid(10))
+        );
+        assert!(
+            matches!(mutations[1], QueueMutation::Insert { player_uuid, .. } if player_uuid == uid(11))
+        );
+        assert!(matches!(
+            &mutations[2],
+            QueueMutation::SetState { player_uuid, state: QueueEntryState::Dispatched { server_id, .. } }
+                if *player_uuid == uid(10) && server_id == "sheepwars-1"
+        ));
+        assert_eq!(mutations.len(), 4);
+        assert!(engine.take_mutations().is_empty());
+        engine.restore_mutations(mutations);
+        assert_eq!(engine.take_mutations().len(), 4);
+    }
+
+    #[test]
+    fn dispatched_entries_leave_the_queue_only_when_their_uuid_is_in_a_heartbeat() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        waiting(&mut engine, t0, "sheepwars-1");
+        queue(&mut engine, t0, 10);
+        queue(&mut engine, t0, 11);
+        let actions = engine.tick(t0);
+        let (_, first) = transfer_ids(&actions)[0];
+        engine.take_mutations();
+
+        engine.ack_transfer(t0, first, true);
+        assert!(engine.take_mutations().is_empty());
+        assert_eq!(
+            engine.player_status(t0, uid(10)).state,
+            PlayerQueueState::Transferring
+        );
+
+        game_heartbeat(&mut engine, t0, "sheepwars-1", ServerPhase::Waiting, &[10]);
+        assert_eq!(
+            engine.take_mutations(),
+            [QueueMutation::Remove {
+                player_uuid: uid(10)
+            }]
+        );
+        assert_eq!(
+            engine.player_status(t0, uid(10)).state,
+            PlayerQueueState::NotQueued
+        );
+        assert_eq!(
+            engine.player_status(t0, uid(11)).state,
+            PlayerQueueState::Transferring
+        );
+    }
+
+    #[test]
+    fn leaving_voluntarily_removes_a_waiting_entry_and_proxy_disconnect_removes_a_dispatched_one() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        queue(&mut engine, t0, 10);
+        engine.take_mutations();
+        assert!(engine.leave_queue(uid(10), LeaveReason::UserToggle).removed);
+        assert_eq!(
+            engine.take_mutations(),
+            [QueueMutation::Remove {
+                player_uuid: uid(10)
+            }]
+        );
+
+        waiting(&mut engine, t0, "sheepwars-1");
+        queue(&mut engine, t0, 11);
+        queue(&mut engine, t0, 12);
+        engine.tick(t0);
+        engine.take_mutations();
+        assert!(!engine.leave_queue(uid(11), LeaveReason::LobbyQuit).removed);
+        assert!(engine.take_mutations().is_empty());
+        assert!(
+            engine
+                .leave_queue(uid(11), LeaveReason::ProxyDisconnect)
+                .removed
+        );
+        assert_eq!(
+            engine.take_mutations(),
+            [QueueMutation::Remove {
+                player_uuid: uid(11)
+            }]
+        );
+    }
+
+    #[test]
+    fn plc_14_a_failed_transfer_puts_the_player_back_at_their_place() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        waiting(&mut engine, t0, "sheepwars-1");
+        queue(&mut engine, t0, 10);
+        queue(&mut engine, t0, 11);
+        let actions = engine.tick(t0);
+        let ids = transfer_ids(&actions);
+        game_heartbeat(&mut engine, t0, "sheepwars-1", ServerPhase::InGame, &[]);
+        queue(&mut engine, t0, 12);
+        engine.take_mutations();
+
+        engine.ack_transfer(t0, ids[0].1, false);
+        assert_eq!(queued(&engine, t0), [uid(10), uid(12)]);
+        assert_eq!(engine.player_status(t0, uid(10)).position, Some(1));
+        assert_eq!(
+            engine.take_mutations(),
+            [QueueMutation::SetState {
+                player_uuid: uid(10),
+                state: QueueEntryState::Waiting
+            }]
+        );
+    }
+
+    #[test]
+    fn plc_14_an_expired_transfer_puts_the_player_back_at_their_place() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        waiting(&mut engine, t0, "sheepwars-1");
+        queue(&mut engine, t0, 10);
+        queue(&mut engine, t0, 11);
+        engine.tick(t0);
+        game_heartbeat(&mut engine, t0, "sheepwars-1", ServerPhase::InGame, &[]);
+        queue(&mut engine, t0, 12);
+        engine.take_mutations();
+
+        engine.tick(t0 + Duration::from_secs(14));
+        assert_eq!(queued(&engine, t0), [uid(12)]);
+
+        game_heartbeat(
+            &mut engine,
+            t0 + Duration::from_secs(14),
+            "sheepwars-1",
+            ServerPhase::InGame,
+            &[],
+        );
+        engine.tick(t0 + Duration::from_secs(15));
+        assert_eq!(queued(&engine, t0), [uid(10), uid(11), uid(12)]);
+        let mutations = engine.take_mutations();
+        assert_eq!(
+            mutations
+                .iter()
+                .filter(|m| matches!(
+                    m,
+                    QueueMutation::SetState {
+                        state: QueueEntryState::Waiting,
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+    }
+
+    fn dispatched_record(seq: u64, n: u128, server: &str) -> QueueRecord {
+        QueueRecord {
+            seq,
+            player_uuid: uid(n),
+            name: format!("p{n}"),
+            joined_at: chrono::Utc::now(),
+            state: QueueEntryState::Dispatched {
+                server_id: server.to_owned(),
+                transfer_id: Uuid::from_u128(n + 1000),
+            },
+        }
+    }
+
+    #[test]
+    fn restore_queue_keeps_the_seq_order() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        let records = [30, 10, 20]
+            .iter()
+            .map(|seq| QueueRecord {
+                seq: *seq,
+                player_uuid: uid(u128::from(*seq)),
+                name: format!("p{seq}"),
+                joined_at: chrono::Utc::now(),
+                state: QueueEntryState::Waiting,
+            })
+            .collect();
+        engine.restore_queue(t0, records);
+        assert_eq!(queued(&engine, t0), [uid(10), uid(20), uid(30)]);
+        assert_eq!(engine.player_status(t0, uid(20)).position, Some(2));
+        assert!(engine.take_mutations().is_empty());
+    }
+
+    #[test]
+    fn plc_15_a_dispatched_entry_survives_a_restart_until_a_heartbeat_shows_the_player() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        engine.restore_queue(t0, vec![dispatched_record(5, 10, "sheepwars-1")]);
+        let status = engine.player_status(t0, uid(10));
+        assert_eq!(status.state, PlayerQueueState::Transferring);
+        assert_eq!(status.target_server.as_deref(), Some("sheepwars-1"));
+        engine.tick(t0 + Duration::from_secs(10));
+        assert_eq!(
+            engine.player_status(t0, uid(10)).state,
+            PlayerQueueState::Transferring
+        );
+
+        waiting(&mut engine, t0, "sheepwars-1");
+        game_heartbeat(
+            &mut engine,
+            t0 + Duration::from_secs(11),
+            "sheepwars-1",
+            ServerPhase::Waiting,
+            &[10],
+        );
+        assert_eq!(
+            engine.player_status(t0, uid(10)).state,
+            PlayerQueueState::NotQueued
+        );
+        assert_eq!(
+            engine.take_mutations(),
+            [QueueMutation::Remove {
+                player_uuid: uid(10)
+            }]
+        );
+    }
+
+    #[test]
+    fn plc_15_a_dispatched_entry_not_seen_before_the_timeout_is_waiting_again() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        engine.restore_queue(
+            t0,
+            vec![
+                dispatched_record(5, 10, "sheepwars-1"),
+                QueueRecord {
+                    seq: 6,
+                    player_uuid: uid(11),
+                    name: "p11".to_owned(),
+                    joined_at: chrono::Utc::now(),
+                    state: QueueEntryState::Waiting,
+                },
+            ],
+        );
+        assert_eq!(queued(&engine, t0), [uid(11)]);
+        engine.tick(t0 + Duration::from_secs(15));
+        assert_eq!(queued(&engine, t0), [uid(10), uid(11)]);
+        assert_eq!(engine.player_status(t0, uid(10)).position, Some(1));
+        assert_eq!(
+            engine.take_mutations(),
+            [QueueMutation::SetState {
+                player_uuid: uid(10),
+                state: QueueEntryState::Waiting
+            }]
+        );
+    }
+
+    fn game_with_arrived_players(engine: &mut FleetEngine, t0: Instant) {
+        waiting(engine, t0, "sheepwars-1");
+        queue(engine, t0, 10);
+        queue(engine, t0, 11);
+        engine.tick(t0);
+        game_heartbeat(engine, t0, "sheepwars-1", ServerPhase::Waiting, &[11, 10]);
+        queue(engine, t0, 12);
+        engine.take_mutations();
+    }
+
+    #[test]
+    fn requeues_the_players_of_a_waiting_server_that_disappears_ahead_of_later_arrivals() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        game_with_arrived_players(&mut engine, t0);
+        assert_eq!(queued(&engine, t0), [uid(12)]);
+
+        engine.remove_server("sheepwars-1");
+        assert_eq!(queued(&engine, t0), [uid(10), uid(11), uid(12)]);
+        let mutations = engine.take_mutations();
+        let seqs: Vec<(Uuid, u64)> = mutations
+            .iter()
+            .filter_map(|m| match m {
+                QueueMutation::Insert {
+                    seq, player_uuid, ..
+                } => Some((*player_uuid, *seq)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(seqs.len(), 2);
+        assert_eq!(seqs[0].0, uid(10));
+        assert_eq!(seqs[1].0, uid(11));
+        assert!(seqs[0].1 < seqs[1].1);
+        assert!(seqs[1].1 < FIRST_SEQ + 3);
+        assert_eq!(engine.player_status(t0, uid(10)).position, Some(1));
+        engine.remove_server("sheepwars-1");
+        assert!(engine.take_mutations().is_empty());
+    }
+
+    #[test]
+    fn requeues_when_the_heartbeat_of_a_waiting_server_is_lost() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        game_with_arrived_players(&mut engine, t0);
+        game_heartbeat(
+            &mut engine,
+            t0,
+            "sheepwars-1",
+            ServerPhase::Countdown,
+            &[10, 20, 11, 21],
+        );
+        let actions = engine.tick(t0 + Duration::from_secs(30));
+        assert_eq!(
+            deleted(&actions),
+            [("sheepwars-1", DeletionReason::HeartbeatLost)]
+        );
+        assert_eq!(
+            queued(&engine, t0),
+            [uid(10), uid(11), uid(20), uid(21), uid(12)]
+        );
+    }
+
+    #[test]
+    fn requeues_when_the_pod_is_terminating() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        game_with_arrived_players(&mut engine, t0);
+        engine.upsert_infra_server(t0, "sheepwars-1".to_owned(), None, None, true, true);
+        assert_eq!(queued(&engine, t0), [uid(10), uid(11), uid(12)]);
+    }
+
+    #[test]
+    fn does_not_requeue_the_players_of_a_game_in_progress() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        game_with_arrived_players(&mut engine, t0);
+        game_heartbeat(
+            &mut engine,
+            t0,
+            "sheepwars-1",
+            ServerPhase::InGame,
+            &[10, 11],
+        );
+        engine.remove_server("sheepwars-1");
+        assert_eq!(queued(&engine, t0), [uid(12)]);
+    }
+
+    #[test]
+    fn spectate_server_is_reported_for_sixty_seconds() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        infra(&mut engine, t0, "sheepwars-1");
+        heartbeat(&mut engine, t0, "sheepwars-1", ServerPhase::InGame, 2);
+        assert_eq!(engine.player_status(t0, uid(7)).spectate_server, None);
+        engine
+            .queue_spectate_transfer(t0, "sheepwars-1", uid(7))
+            .unwrap();
+        let status = engine.player_status(t0 + Duration::from_secs(59), uid(7));
+        assert_eq!(status.spectate_server.as_deref(), Some("sheepwars-1"));
+        assert_eq!(
+            engine
+                .player_status(t0 + Duration::from_secs(60), uid(7))
+                .spectate_server,
+            None
+        );
+    }
+
+    #[test]
+    fn a_lobby_shutting_down_is_never_picked_again() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        lobby_heartbeat(&mut engine, t0, "lobby-a", Some("10.0.0.1:25565"), &[]);
+        let events = engine.apply_heartbeat(
+            t0,
+            HeartbeatRequest {
+                server_id: "lobby-a".to_owned(),
+                address: Some("10.0.0.1:25565".to_owned()),
+                phase: ServerPhase::Ending,
+                player_count: 0,
+                max_players: 50,
+                player_uuids: Vec::new(),
+                version: None,
+                kind: ServerKind::Lobby,
+            },
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProxyEvent::ServerRemove { name } if name == "lobby-a"
+        )));
+        assert!(engine.pick_lobby().is_none());
     }
 }

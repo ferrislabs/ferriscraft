@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use ferriscraft_protocol::{
     HeartbeatRequest, MatchReport, MatchReportAck, PhaseUpdateRequest, PlayerProfile,
-    SendToLobbyRequest, ServerPhase,
+    PlayerQueueStatus, SendToLobbyRequest, ServerPhase,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -13,6 +13,12 @@ pub enum OrchestratorClientError {
     Transport(#[from] reqwest::Error),
     #[error("réponse orchestrateur HTTP {0}")]
     HttpStatus(u16),
+}
+
+pub const QUEUE_STATUS_TIMEOUT: Duration = Duration::from_secs(2);
+
+pub fn spectates_here(status: &PlayerQueueStatus, server_id: &str) -> bool {
+    status.spectate_server.as_deref() == Some(server_id)
 }
 
 #[derive(Debug, Clone)]
@@ -128,5 +134,48 @@ impl SheepWarsOrchestratorClient {
             return Err(OrchestratorClientError::HttpStatus(resp.status().as_u16()));
         }
         Ok(resp.json().await?)
+    }
+
+    pub async fn fetch_queue_status(
+        &self,
+        player_uuid: Uuid,
+    ) -> Result<PlayerQueueStatus, OrchestratorClientError> {
+        let resp = self
+            .apply_auth(self.http.get(format!(
+                "{}/api/v1/queue/player/{player_uuid}",
+                self.base_url
+            )))
+            .timeout(QUEUE_STATUS_TIMEOUT)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(OrchestratorClientError::HttpStatus(resp.status().as_u16()));
+        }
+        Ok(resp.json().await?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ferriscraft_protocol::PlayerQueueState;
+
+    use super::*;
+
+    fn status(spectate_server: Option<&str>) -> PlayerQueueStatus {
+        PlayerQueueStatus {
+            state: PlayerQueueState::NotQueued,
+            position: None,
+            total_queued: 0,
+            min_players: 2,
+            target_server: None,
+            spectate_server: spectate_server.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn spectates_only_when_the_target_is_this_server() {
+        assert!(spectates_here(&status(Some("sw-1")), "sw-1"));
+        assert!(!spectates_here(&status(Some("sw-2")), "sw-1"));
+        assert!(!spectates_here(&status(None), "sw-1"));
     }
 }

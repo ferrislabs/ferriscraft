@@ -27,7 +27,7 @@ Mettre à jour, redémarrer et revenir en arrière sur les plugins `ferriscraft-
 
 Contraintes : Kubernetes >= 1.29 en prod (sidecars natifs).
 
-Décisions : [ADR 0001](../adr/0001-etat-du-lobby-dans-postgres.md), [ADR 0002](../adr/0002-plusieurs-lobbies-et-drain.md), [ADR 0003](../adr/0003-sdk-rspigot-fige-par-tag-git.md), [ADR 0004](../adr/0004-file-sheepwars-dans-postgres.md).
+Décisions : [ADR 0001](../adr/0001-etat-du-lobby-dans-postgres.md), [ADR 0002](../adr/0002-plusieurs-lobbies-et-drain.md), [ADR 0010](../adr/0010-rspigot-fige-par-commit.md) (remplace 0003), [ADR 0004](../adr/0004-file-sheepwars-dans-postgres.md).
 
 ## Glossary
 
@@ -83,7 +83,8 @@ Deux adapters par port : Postgres (prod) et fichier (dev local, comportement act
 ### Adapters
 
 - **Postgres** : `sqlx`, pool partagé. Tables `lobby_layout` (une ligne, JSON, `updated_at`, dernière écriture gagne) et `player_sessions` (clé `player_uuid` + `realm`).
-- **Postgres orchestrateur** : même cluster CNPG, base et utilisateur séparés. Table `queue_entries` (`seq bigserial`, `player_uuid` unique, `name`, `joined_at timestamptz`, `state`, `server_id`, `transfer_id`). Adapter mémoire pour le dev local et les tests.
+- **Postgres lobby** : cluster CNPG `ferriscraft-lobby-db` (base `lobby`), déclaré dans l'app `ferriscraft-deps` du dépôt infra. Secret `ferriscraft-lobby-db-app`. Le lobby n'a jamais accès à la base de l'orchestrateur.
+- **Postgres orchestrateur** : la base de l'orchestrateur (`ferriscraft-db`, déjà utilisée par la progression). Migrations dans `crates/ferriscraft-progression-pg/migrations`, une seule source pour cette base. Table `queue_entries` (`seq bigserial`, `player_uuid` unique, `name`, `joined_at timestamptz`, `state`, `server_id`, `transfer_id`). Adapter mémoire pour le dev local et les tests.
 - **Orchestrateur indisponible** : le plugin lobby réessaie `queue/join` et `queue/leave` pendant 10 s avant d'afficher une erreur au joueur. Les heartbeats en échec sont ignorés, le suivant part 2 s plus tard. Le registre des serveurs se reconstruit avec les heartbeats.
 - **Fichier** : code actuel de `LayoutStore` et `SessionStore`, déplacé derrière le port.
 - **Migrations** : `sqlx migrate`, lancées par un Job Helm (hook ArgoCD `PreSync`). Le plugin ne migre jamais au démarrage.
@@ -95,7 +96,7 @@ Deux adapters par port : Postgres (prod) et fichier (dev local, comportement act
   - Plugin lobby en sidecar natif (`initContainers` + `restartPolicy: Always`). Il démarre avant rspigot et s'arrête après lui, donc il reste actif pendant le drain.
   - `preStop` sur le conteneur rspigot : appelle `drain`, attend `player_count == 0`, plafonné à `lobby.drainTimeoutSecs` (défaut 60). `terminationGracePeriodSeconds` = drain + 15.
   - `POD_NAME` et `POD_IP` via Downward API.
-  - Cluster CloudNativePG + Secret de connexion, désactivable (`postgres.enabled`) pour le dev en fichier.
+  - Secret de connexion lobby (`lobby.storage.existingDatabaseSecret`), vide = fichiers (dev). Les clusters CNPG sont dans le dépôt infra.
   - Values prod : `global.imageTag` obligatoire (`required`), refus de `latest`.
 
 ### Errors
@@ -202,7 +203,7 @@ Pas nécessaire pour le drain. Pour la file, `plc-14` et `plc-15` se testent sur
 
 | # | Nom | Mission | Dépend de | Fichiers |
 |---|---|---|---|---|
-| W1 | SDK figé | SDK rspigot en `git` + `tag`, CI clone ce tag, image rspigot taguée par version | — | `Cargo.toml`, `Cargo.lock`, `.github/workflows/images.yml`, `docker-bake.hcl` |
+| W1 | SDK figé | `rspigot.ref`, CI clone ce commit, `RSPIGOT_REF` dans les images (ADR 0010) | — | `rspigot.ref`, `.github/workflows/images.yml`, `docker-bake.hcl`, `Dockerfile` |
 | W2 | Stockage lobby | Ports + adapters Postgres/fichier, migrations sqlx | W1 | `crates/ferriscraft-lobby/src/{config,auth,storage/*}.rs`, `crates/ferriscraft-lobby/migrations/` |
 | W3 | Registre et drain | `ServerKind`, `LobbyState`, registre lobby, `/drain`, `pick_lobby`, heartbeat lobby | W1 | `crates/ferriscraft-protocol/src/lib.rs`, `crates/ferriscraft-orchestrator/src/{api,engine}.rs`, `crates/ferriscraft-lobby/src/orchestrator.rs` |
 | W4 | Velocity | Choix du lobby initial et de repli parmi `lobby-*` | W3 | `proxy/velocity-plugin/**` |
@@ -247,6 +248,14 @@ pub enum QueueEntryState {
     Dispatched { server_id: String, transfer_id: Uuid },
 }
 ```
+
+Ajouts (avec les restes des issues #17 et #18) :
+
+- `ServerSummary` gagne `kind: ServerKind` et `draining: bool`. `FleetStatusSnapshot` gagne `lobbies: Vec<ServerSummary>` (les instances de lobby, `servers` reste SheepWars) et `proxy_version`.
+- `ProxyServerEntry` et `ProxyEvent::ServerUpsert` gagnent `kind`. Velocity choisit un lobby parmi les serveurs `kind == lobby`, et se replie sur le serveur statique `lobby` (Service) s'il n'en connaît aucun.
+- Velocity envoie sa version dans l'en-tête `x-ferriscraft-version` (`PROXY_VERSION_HEADER`) sur `GET /api/v1/proxy/events` et `GET /api/v1/proxy/state`.
+- `PlayerQueueStatus.spectate_server` : rempli pendant 60 s après `POST /servers/{id}/spectate`. SheepWars le lit à l'arrivée du joueur et le met en spectateur au lieu de l'inscrire dans une équipe.
+- Un serveur SheepWars en `waiting` ou `countdown` qui disparaît avec des joueurs : ces joueurs repassent en tête de file, dans leur ordre d'arrivée.
 
 ```http
 POST /api/v1/servers/{server_id}/drain

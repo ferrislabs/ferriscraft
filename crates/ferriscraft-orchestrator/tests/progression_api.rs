@@ -100,6 +100,7 @@ impl Harness {
                 max_players: 8,
                 player_uuids: players.to_vec(),
                 version: None,
+                kind: Default::default(),
             })
             .send()
             .await

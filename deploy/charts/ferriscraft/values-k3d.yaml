@@ -18,6 +18,7 @@ orchestrator:
     idleTtlSecs: 60
 
 lobby:
+  replicas: 1
   ferriskey:
     url: "http://host.docker.internal:3333"
     publicUrl: "http://localhost:3333"

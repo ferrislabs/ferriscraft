@@ -16,33 +16,42 @@ name = "ferriscraft-lobby"
 path = "src/main.rs"
 
 [[bin]]
+name = "ferriscraft-lobby-migrate"
+path = "src/bin/migrate.rs"
+
+[[bin]]
 name = "normalize-anvil"
 path = "src/bin/normalize_anvil.rs"
 
 [dependencies]
-rspigot-anvil.workspace = true
-rspigot-core.workspace = true
-rspigot-domain.workspace = true
-rspigot-nbt.workspace = true
-rspigot-plugin.workspace = true
 base64.workspace = true
 dotenvy.workspace = true
 ferriscraft-progression.workspace = true
 ferriscraft-protocol.workspace = true
 futures-util.workspace = true
 reqwest.workspace = true
+rspigot-anvil.workspace = true
+rspigot-core.workspace = true
+rspigot-domain.workspace = true
+rspigot-nbt.workspace = true
+rspigot-plugin.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-tracing.workspace = true
 tracing-subscriber.workspace = true
+tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+testcontainers-modules.workspace = true
 axum.workspace = true
 crossbeam-channel.workspace = true
 rspigot-plugins.workspace = true
+
+[features]
+postgres-tests = []
 
 [lints]
 workspace = true

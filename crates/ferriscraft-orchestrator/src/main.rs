@@ -1,8 +1,13 @@
 use ferriscraft_orchestrator::api::{AppState, build_router};
 use ferriscraft_orchestrator::config::{BackendMode, OrchestratorConfig};
-use ferriscraft_orchestrator::engine::{FleetEngine, FleetPolicy};
+use std::time::Instant;
+
+use ferriscraft_orchestrator::engine::FleetPolicy;
 use ferriscraft_orchestrator::k8s::run_k8s_reconcile_loop;
 use ferriscraft_orchestrator::progression::{ProgressionService, ProgressionStore};
+use ferriscraft_orchestrator::queue::{
+    MemoryQueueRepository, PgQueueRepository, QueueStore, restore_engine,
+};
 use ferriscraft_orchestrator::static_backend::run_static_reconcile_loop;
 use ferriscraft_progression::MemoryProgressionRepository;
 use ferriscraft_progression_pg::PgProgressionRepository;
@@ -33,7 +38,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         heartbeat_timeout: config.heartbeat_timeout,
     };
 
-    let engine = FleetEngine::new(policy);
+    let queue_store = match config.progression_database_url.as_deref() {
+        Some(url) => match PgQueueRepository::connect(url).await {
+            Ok(repo) => QueueStore::Postgres(repo),
+            Err(err) => {
+                tracing::error!(error = %err, "connexion à la base de la file d'attente impossible");
+                std::process::exit(1);
+            }
+        },
+        None => {
+            tracing::warn!("file d'attente en mémoire, perdue au redémarrage");
+            QueueStore::Memory(MemoryQueueRepository::default())
+        }
+    };
+    let engine = match restore_engine(policy, &queue_store, Instant::now()).await {
+        Ok(engine) => engine,
+        Err(err) => {
+            tracing::error!(error = %err, "rechargement de la file d'attente impossible");
+            std::process::exit(1);
+        }
+    };
     let store = match config.progression_database_url.as_deref() {
         Some(url) => match PgProgressionRepository::connect(url).await {
             Ok(repo) => ProgressionStore::Postgres(repo),
@@ -48,6 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let state = AppState::new(engine, config.api_token.clone())
+        .with_queue(queue_store)
         .with_version(config.version.clone())
         .with_progression(ProgressionService::new(store));
 

@@ -11,7 +11,9 @@ mod session;
 pub use cosmetics::{Loadout, SheepTrail, VictoryEffect};
 pub use display::lives_line;
 pub use effects::Effects;
-pub use engine::{ACTION_BAR_REFRESH_TICKS, Game, HUB_ITEM, HUD_REFRESH_TICKS, player_id};
+pub use engine::{
+    ACTION_BAR_REFRESH_TICKS, Game, HUB_ITEM, HUD_REFRESH_TICKS, SHUTDOWN_REPORT_GRACE, player_id,
+};
 pub use fall_guard::{FallGuards, LANDING_PROTECTION_TICKS};
 pub use flight::{
     EYE_HEIGHT, Flight, LANDING_GRACE_TICKS, MAX_CONCURRENT_FLIGHTS, MAX_FLIGHT_TICKS,

@@ -22,6 +22,7 @@ use crate::capitainerie::{
 use crate::chat::{ChatBadge, ChatSystem};
 use crate::config::{ConfigError, EnvConfig, LayoutStore, WaypointPose};
 use crate::gadgets::{AuraTrail, GadgetManager, LobbyGadget};
+use crate::heartbeat::HeartbeatReporter;
 use crate::hud::{HubMetrics, HudManager, PlayerHudInput};
 use crate::menus::{
     GadgetsMenuAction, GamesMenuAction, MenuManager, OptionsMenuAction, apply_lobby_hotbar,
@@ -77,6 +78,7 @@ struct SharedState {
     chat: ChatSystem,
     npcs: Arc<NpcDirector>,
     orchestrator: Option<Arc<OrchestratorClient>>,
+    heartbeat: Option<Arc<HeartbeatReporter>>,
     lobby_version: Option<String>,
     sheepwars_queue: RwLock<HashSet<Uuid>>,
     portal_last_blast: RwLock<HashMap<Uuid, Instant>>,
@@ -90,9 +92,14 @@ pub struct FerrisCraftLobby {
 }
 
 impl FerrisCraftLobby {
-    pub fn new(config: EnvConfig, layout: LayoutStore) -> Self {
+    pub fn new(
+        config: EnvConfig,
+        layout: LayoutStore,
+        auth: AuthManager,
+        heartbeat: Option<Arc<HeartbeatReporter>>,
+    ) -> Self {
         let layout = Arc::new(layout);
-        let auth = Arc::new(AuthManager::new(config.clone()));
+        let auth = Arc::new(auth);
         let npcs = Arc::new(NpcDirector::new(
             Arc::clone(&layout),
             config.capitainerie_url.clone(),
@@ -116,6 +123,7 @@ impl FerrisCraftLobby {
                 chat: ChatSystem::default(),
                 npcs,
                 orchestrator,
+                heartbeat,
                 lobby_version: crate::config::lobby_version(),
                 sheepwars_queue: RwLock::new(HashSet::new()),
                 portal_last_blast: RwLock::new(HashMap::new()),
@@ -1117,12 +1125,12 @@ impl FerrisCraftLobby {
                     OptionsMenuAction::FerrisKeyAction => {
                         player.inventory.close();
                         if self.state.auth.is_authenticated(player.uuid) {
-                            self.state.auth.logout(player.uuid);
-                            player
-                                .message
-                                .send("§eVotre compte FerrisKey a été délié de cette session.");
                             let lobby = self.clone();
                             tokio::spawn(async move {
+                                lobby.state.auth.logout(player.uuid).await;
+                                player
+                                    .message
+                                    .send("§eVotre compte FerrisKey a été délié de cette session.");
                                 lobby.refresh_single_player_ui(&player).await;
                                 lobby.sync_progression(&player).await;
                             });
@@ -1155,13 +1163,14 @@ impl FerrisCraftLobby {
             .menus
             .servers_menu_server_ids(player.uuid, clicked_inv)
         {
-            if let Some(index) = decode_servers_slot(slot, ids.len()) {
+            if let Some(index) = decode_servers_slot(slot, ids.len())
+                && let Some(server_id) = ids[index].clone()
+            {
                 player
                     .sound
                     .play(SoundCue::new(Sound::UiButtonClick).volume(0.7));
                 player.inventory.close();
                 let lobby = self.clone();
-                let server_id = ids[index].clone();
                 tokio::spawn(async move {
                     lobby.spectate_server(&player, &server_id).await;
                 });
@@ -1659,6 +1668,10 @@ impl FerrisCraftLobby {
             npcs.run_background_loops(srv_npcs, auth).await;
         });
 
+        if let Some(heartbeat) = &self.state.heartbeat {
+            Arc::clone(heartbeat).spawn_loop(server.clone());
+        }
+
         let lobby_hud = self.clone();
         let srv_hud = server.clone();
         tokio::spawn(async move {
@@ -1722,6 +1735,8 @@ impl FerrisCraftLobby {
     async fn on_player_join(&self, event: &PlayerJoin) {
         let player = event.player().clone();
         let lobby = self.clone();
+
+        lobby.state.auth.hydrate(player.uuid).await;
 
         player.game_mode.set(GameMode::Adventure);
         player.health.set(20.0);
@@ -1809,6 +1824,7 @@ impl FerrisCraftLobby {
     async fn on_player_leave(&self, event: &PlayerLeave) {
         let player = event.player();
         self.state.auth.cancel_pending(player.uuid);
+        self.state.auth.evict(player.uuid);
         self.state.menus.discard_options(player.uuid);
         self.state.menus.discard_gadgets(player.uuid);
         self.state.menus.discard_progress(player.uuid);
@@ -2582,7 +2598,7 @@ impl FerrisCraftLobby {
     #[command("logout")]
     async fn cmd_logout(&self, ctx: Context) {
         let player = ctx.sender.clone();
-        if self.state.auth.logout(player.uuid) {
+        if self.state.auth.logout(player.uuid).await {
             if !self.state.auth.uses_separate_capitainerie_auth() {
                 self.state.npcs.leave_captain_chat(player.uuid);
             }
@@ -2630,7 +2646,7 @@ impl FerrisCraftLobby {
             ctx.reply("§7Capitainerie utilise la même session que le Lobby (/logout).");
             return;
         }
-        if self.state.auth.capitainerie_logout(player.uuid) {
+        if self.state.auth.capitainerie_logout(player.uuid).await {
             self.state.npcs.leave_captain_chat(player.uuid);
             ctx.reply("§eVotre compte Capitainerie a été déconnecté.");
         } else {
@@ -2727,7 +2743,7 @@ impl FerrisCraftLobby {
                     snap.agent_workstations.len()
                 ));
             }
-            "reload" => match self.state.layout.reload() {
+            "reload" => match self.state.layout.reload().await {
                 Ok(_) => {
                     self.state
                         .npcs
@@ -2738,11 +2754,15 @@ impl FerrisCraftLobby {
                 Err(err) => ctx.reply(format!("§cErreur de rechargement : {err}")),
             },
             "setspawn" => {
-                let res = self.state.layout.update(|l| {
-                    l.spawn = pose;
-                    l.pois.insert("spawn".to_owned(), pose);
-                    Ok(())
-                });
+                let res = self
+                    .state
+                    .layout
+                    .update(|l| {
+                        l.spawn = pose;
+                        l.pois.insert("spawn".to_owned(), pose);
+                        Ok(())
+                    })
+                    .await;
                 match res {
                     Ok(_) => ctx.reply("§a✔ Point de Spawn mis à jour sur votre position."),
                     Err(err) => ctx.reply(format!("§c{err}")),
@@ -2753,10 +2773,14 @@ impl FerrisCraftLobby {
                     ctx.reply("§eUsage : /lobby setpoi <spawn|plaza|portal|capitainerie|castle>");
                     return;
                 };
-                let res = self.state.layout.update(|l| {
-                    l.pois.insert(name.clone(), pose);
-                    Ok(())
-                });
+                let res = self
+                    .state
+                    .layout
+                    .update(|l| {
+                        l.pois.insert(name.clone(), pose);
+                        Ok(())
+                    })
+                    .await;
                 match res {
                     Ok(_) => ctx.reply(format!("§a✔ Point d'intérêt '{name}' enregistré.")),
                     Err(err) => ctx.reply(format!("§c{err}")),
@@ -2767,16 +2791,20 @@ impl FerrisCraftLobby {
                     ctx.reply("§eUsage : /lobby setpedestal <1..7>");
                     return;
                 };
-                let res = self.state.layout.update(|l| {
-                    let slot = idx
-                        .checked_sub(1)
-                        .and_then(|i| l.pedestals.get_mut(i))
-                        .ok_or_else(|| {
-                            ConfigError::OutOfBounds(format!("plot {idx} invalide (1..=7)"))
-                        })?;
-                    slot.pose = pose;
-                    Ok(())
-                });
+                let res = self
+                    .state
+                    .layout
+                    .update(|l| {
+                        let slot = idx
+                            .checked_sub(1)
+                            .and_then(|i| l.pedestals.get_mut(i))
+                            .ok_or_else(|| {
+                                ConfigError::OutOfBounds(format!("plot {idx} invalide (1..=7)"))
+                            })?;
+                        slot.pose = pose;
+                        Ok(())
+                    })
+                    .await;
                 match res {
                     Ok(_) => {
                         self.state
@@ -2789,10 +2817,14 @@ impl FerrisCraftLobby {
                 }
             }
             "setcaptain" => {
-                let res = self.state.layout.update(|l| {
-                    l.captain = pose;
-                    Ok(())
-                });
+                let res = self
+                    .state
+                    .layout
+                    .update(|l| {
+                        l.captain = pose;
+                        Ok(())
+                    })
+                    .await;
                 match res {
                     Ok(_) => {
                         self.state
@@ -2809,18 +2841,22 @@ impl FerrisCraftLobby {
                     ctx.reply("§eUsage : /lobby setstation <index_0_based>");
                     return;
                 };
-                let res = self.state.layout.update(|l| {
-                    if idx < l.agent_workstations.len() {
-                        l.agent_workstations[idx] = pose;
-                    } else if idx == l.agent_workstations.len() {
-                        l.agent_workstations.push(pose);
-                    } else {
-                        return Err(ConfigError::OutOfBounds(format!(
-                            "poste {idx} hors limites"
-                        )));
-                    }
-                    Ok(())
-                });
+                let res = self
+                    .state
+                    .layout
+                    .update(|l| {
+                        if idx < l.agent_workstations.len() {
+                            l.agent_workstations[idx] = pose;
+                        } else if idx == l.agent_workstations.len() {
+                            l.agent_workstations.push(pose);
+                        } else {
+                            return Err(ConfigError::OutOfBounds(format!(
+                                "poste {idx} hors limites"
+                            )));
+                        }
+                        Ok(())
+                    })
+                    .await;
                 match res {
                     Ok(_) => ctx.reply(format!(
                         "§a✔ Poste de travail Capitainerie #{idx} enregistré."
@@ -2835,25 +2871,29 @@ impl FerrisCraftLobby {
                     );
                     return;
                 };
-                let res = self.state.layout.update(|l| {
-                    let npc = l
-                        .ambient_npcs
-                        .iter_mut()
-                        .find(|n| n.id == npc_id)
-                        .ok_or_else(|| {
-                            ConfigError::OutOfBounds(format!("PNJ '{npc_id}' introuvable"))
-                        })?;
-                    if wp_idx < npc.waypoints.len() {
-                        npc.waypoints[wp_idx] = pose;
-                    } else if wp_idx == npc.waypoints.len() {
-                        npc.waypoints.push(pose);
-                    } else {
-                        return Err(ConfigError::OutOfBounds(format!(
-                            "waypoint {wp_idx} hors limites"
-                        )));
-                    }
-                    Ok(())
-                });
+                let res = self
+                    .state
+                    .layout
+                    .update(|l| {
+                        let npc = l
+                            .ambient_npcs
+                            .iter_mut()
+                            .find(|n| n.id == npc_id)
+                            .ok_or_else(|| {
+                                ConfigError::OutOfBounds(format!("PNJ '{npc_id}' introuvable"))
+                            })?;
+                        if wp_idx < npc.waypoints.len() {
+                            npc.waypoints[wp_idx] = pose;
+                        } else if wp_idx == npc.waypoints.len() {
+                            npc.waypoints.push(pose);
+                        } else {
+                            return Err(ConfigError::OutOfBounds(format!(
+                                "waypoint {wp_idx} hors limites"
+                            )));
+                        }
+                        Ok(())
+                    })
+                    .await;
                 match res {
                     Ok(_) => {
                         self.state

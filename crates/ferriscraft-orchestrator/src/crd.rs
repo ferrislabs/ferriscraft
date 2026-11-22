@@ -144,6 +144,8 @@ mod tests {
             age_secs: 10,
             version: Some("1.2.3".to_owned()),
             outdated: false,
+            kind: Default::default(),
+            draining: false,
         }
     }
 

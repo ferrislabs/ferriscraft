@@ -1,25 +1,20 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 use rspigot_plugin::{Facing, Material, Player, Position, Rotation};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::storage::{
+    Backoff, FileLayoutRepository, LayoutBackend, LayoutRepository, RepositoryError, WriteGate,
+    load_or_seed,
+};
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    #[error("lecture de la configuration impossible ({path}) : {source}")]
-    Io {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("JSON de configuration invalide ({path}) : {source}")]
-    Json {
-        path: PathBuf,
-        #[source]
-        source: serde_json::Error,
-    },
+    #[error("{0}")]
+    Repository(#[from] RepositoryError),
     #[error("indice hors limites : {0}")]
     OutOfBounds(String),
 }
@@ -544,37 +539,34 @@ impl Default for LobbyLayout {
 }
 
 pub struct LayoutStore {
-    path: PathBuf,
+    repo: LayoutBackend,
+    gate: Arc<WriteGate>,
     inner: RwLock<LobbyLayout>,
+    write_order: tokio::sync::Mutex<()>,
 }
 
 impl LayoutStore {
-    pub fn load_or_create(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
-        let path = path.as_ref().to_path_buf();
-        let layout = if path.exists() {
-            let raw = std::fs::read_to_string(&path).map_err(|source| ConfigError::Io {
-                path: path.clone(),
-                source,
-            })?;
-            serde_json::from_str::<LobbyLayout>(&raw).map_err(|source| ConfigError::Json {
-                path: path.clone(),
-                source,
-            })?
-        } else {
-            let default = LobbyLayout::default();
-            Self::write_file(&path, &default)?;
-            default
-        };
+    pub async fn open(
+        repo: LayoutBackend,
+        seed: &LobbyLayout,
+        gate: Arc<WriteGate>,
+        backoff: Backoff,
+    ) -> Result<Self, RepositoryError> {
+        let layout = load_or_seed(&repo, seed, backoff).await?;
         Ok(Self {
-            path,
+            repo,
+            gate,
             inner: RwLock::new(layout),
+            write_order: tokio::sync::Mutex::new(()),
         })
     }
 
     pub fn in_memory(layout: LobbyLayout) -> Self {
         Self {
-            path: PathBuf::new(),
+            repo: LayoutBackend::File(FileLayoutRepository::new(PathBuf::new())),
+            gate: Arc::new(WriteGate::default()),
             inner: RwLock::new(layout),
+            write_order: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -584,53 +576,27 @@ impl LayoutStore {
             .map_or_else(|e| e.into_inner().clone(), |guard| guard.clone())
     }
 
-    pub fn reload(&self) -> Result<LobbyLayout, ConfigError> {
-        if self.path.as_os_str().is_empty() || !self.path.exists() {
+    pub async fn reload(&self) -> Result<LobbyLayout, ConfigError> {
+        let Some(stored) = self.repo.load().await? else {
             return Ok(self.snapshot());
-        }
-        let raw = std::fs::read_to_string(&self.path).map_err(|source| ConfigError::Io {
-            path: self.path.clone(),
-            source,
-        })?;
-        let parsed: LobbyLayout =
-            serde_json::from_str(&raw).map_err(|source| ConfigError::Json {
-                path: self.path.clone(),
-                source,
-            })?;
+        };
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        *guard = parsed.clone();
-        Ok(parsed)
+        *guard = stored.clone();
+        Ok(stored)
     }
 
-    pub fn update<F>(&self, mutate: F) -> Result<LobbyLayout, ConfigError>
+    pub async fn update<F>(&self, mutate: F) -> Result<LobbyLayout, ConfigError>
     where
         F: FnOnce(&mut LobbyLayout) -> Result<(), ConfigError>,
     {
+        let _order = self.write_order.lock().await;
+        let _write = self.gate.try_enter()?;
+        let mut next = self.snapshot();
+        mutate(&mut next)?;
+        self.repo.save(&next).await?;
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        mutate(&mut guard)?;
-        let snapshot = guard.clone();
-        drop(guard);
-        if !self.path.as_os_str().is_empty() {
-            Self::write_file(&self.path, &snapshot)?;
-        }
-        Ok(snapshot)
-    }
-
-    fn write_file(path: &Path, layout: &LobbyLayout) -> Result<(), ConfigError> {
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent).map_err(|source| ConfigError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
-        let pretty = serde_json::to_string_pretty(layout).map_err(|source| ConfigError::Json {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        std::fs::write(path, format!("{pretty}\n")).map_err(|source| ConfigError::Io {
-            path: path.to_path_buf(),
-            source,
-        })
+        guard.clone_from(&next);
+        Ok(next)
     }
 }
 
@@ -649,11 +615,22 @@ mod tests {
         assert_eq!(center.main_material(), Some(Material::WhiteWool));
     }
 
-    #[test]
-    fn layout_store_updates_and_persists_cleanly() {
+    async fn open_file_store(path: &std::path::Path) -> LayoutStore {
+        LayoutStore::open(
+            LayoutBackend::File(FileLayoutRepository::new(path.to_path_buf())),
+            &LobbyLayout::default(),
+            Arc::new(WriteGate::default()),
+            Backoff::startup(),
+        )
+        .await
+        .expect("open store")
+    }
+
+    #[tokio::test]
+    async fn layout_store_updates_and_persists_cleanly() {
         let dir = std::env::temp_dir().join(format!("ferriscraft_cfg_{}", uuid::Uuid::new_v4()));
         let file = dir.join("lobby.json");
-        let store = LayoutStore::load_or_create(&file).expect("create default");
+        let store = open_file_store(&file).await;
         assert!(file.exists());
 
         let new_spawn = WaypointPose::new(12.5, 70.0, -3.5, 90.0, 5.0);
@@ -663,18 +640,37 @@ mod tests {
                 layout.pois.insert("spawn".to_owned(), new_spawn);
                 Ok(())
             })
+            .await
             .expect("update spawn");
 
-        let reloaded = LayoutStore::load_or_create(&file).expect("reload");
+        let reloaded = open_file_store(&file).await;
         assert_eq!(reloaded.snapshot().spawn, new_spawn);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn closed_gate_rejects_layout_updates() {
+        let gate = Arc::new(WriteGate::default());
+        let store = LayoutStore::open(
+            LayoutBackend::File(FileLayoutRepository::new(PathBuf::new())),
+            &LobbyLayout::default(),
+            Arc::clone(&gate),
+            Backoff::startup(),
+        )
+        .await
+        .expect("open store");
+        gate.close().await;
+        let err = store.update(|_| Ok(())).await.expect_err("rejected");
+        assert!(matches!(
+            err,
+            ConfigError::Repository(RepositoryError::Unavailable(_))
+        ));
     }
 
     #[test]
     fn workspace_lobby_json_matches_default_and_south_projection_is_positive_z() {
         let root_json = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lobby.json");
-        let store = LayoutStore::load_or_create(&root_json).expect("load workspace lobby.json");
-        let snap = store.snapshot();
+        let snap = crate::storage::bundled_layout(&root_json).expect("load workspace lobby.json");
         assert_eq!(snap, LobbyLayout::default());
         assert_eq!(snap.spawn, WaypointPose::new(13.5, 29.0, -82.5, 0.0, 0.0));
 

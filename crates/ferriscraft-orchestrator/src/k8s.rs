@@ -591,6 +591,7 @@ async fn reconcile_once(
         actions
     };
     state.emit_proxy_events(events);
+    state.flush_queue_logged().await;
 
     for ServerDeletion { server_id, reason } in actions.servers_to_delete {
         if reason.is_abnormal() {

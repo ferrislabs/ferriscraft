@@ -10,6 +10,7 @@ on:
       - .dockerignore
       - Dockerfile
       - docker-bake.hcl
+      - rspigot.ref
       - Cargo.toml
       - Cargo.lock
       - crates/**
@@ -40,10 +41,15 @@ jobs:
         with:
           path: ferriscraft
 
+      - name: Read pinned rspigot commit
+        id: rspigot
+        run: echo "ref=$(tr -d '[:space:]' < ferriscraft/rspigot.ref)" >> "$GITHUB_OUTPUT"
+
       - name: Checkout rspigot
         uses: actions/checkout@v4
         with:
           repository: ferrislabs/rspigot
+          ref: ${{ steps.rspigot.outputs.ref }}
           path: rspigot
           token: ${{ secrets.RSPIGOT_READ_TOKEN || secrets.GITHUB_TOKEN }}
 
@@ -75,6 +81,7 @@ jobs:
           IMAGE_TAG: pr-${{ github.event.pull_request.number }}
           EXTRA_TAG: pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
           RSPIGOT_DIR: ${{ github.workspace }}/rspigot
+          RSPIGOT_REF: ${{ steps.rspigot.outputs.ref }}
 
       - name: Build & Push Images (BuildKit Bake)
         if: github.event_name != 'pull_request'
@@ -94,3 +101,4 @@ jobs:
           IMAGE_TAG: latest
           EXTRA_TAG: ${{ github.sha }}
           RSPIGOT_DIR: ${{ github.workspace }}/rspigot
+          RSPIGOT_REF: ${{ steps.rspigot.outputs.ref }}

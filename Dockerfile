@@ -87,7 +87,9 @@ COPY --from=orchestrator-builder /app/target/release/ferriscraft-migrate /usr/lo
 USER ferriscraft
 EXPOSE 8080
 ARG FERRISCRAFT_VERSION=dev
-ENV FERRISCRAFT_VERSION=${FERRISCRAFT_VERSION}
+ARG RSPIGOT_REF=local
+ENV FERRISCRAFT_VERSION=${FERRISCRAFT_VERSION} \
+    RSPIGOT_REF=${RSPIGOT_REF}
 ENTRYPOINT ["/usr/local/bin/ferriscraft-orchestrator"]
 
 # ==============================================================================
@@ -134,6 +136,7 @@ FROM ${DEBIAN_RUNTIME_IMAGE} AS rspigot
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
+        curl \
         python3 \
         unzip \
     && rm -rf /var/lib/apt/lists/*
@@ -145,7 +148,9 @@ COPY --chmod=0755 deploy/docker/rspigot-entrypoint.sh /usr/local/bin/rspigot-ent
 
 EXPOSE 25565 25580 25581
 ARG FERRISCRAFT_VERSION=dev
-ENV FERRISCRAFT_VERSION=${FERRISCRAFT_VERSION}
+ARG RSPIGOT_REF=local
+ENV FERRISCRAFT_VERSION=${FERRISCRAFT_VERSION} \
+    RSPIGOT_REF=${RSPIGOT_REF}
 ENTRYPOINT ["/usr/local/bin/rspigot-entrypoint.sh"]
 
 # ==============================================================================
@@ -179,15 +184,19 @@ COPY crates ./crates
 RUN --mount=type=cache,id=ferriscraft-cargo-registry-plugins,sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=ferriscraft-cargo-git-plugins,sharing=locked,target=/usr/local/cargo/git \
     --mount=type=cache,id=ferriscraft-cargo-target-lobby,sharing=locked,target=/opt/ferrislabs/ferriscraft/target \
-    cargo build --release --bin ferriscraft-lobby \
-    && cp /opt/ferrislabs/ferriscraft/target/release/ferriscraft-lobby /usr/local/bin/ferriscraft-lobby
+    cargo build --release --bin ferriscraft-lobby --bin ferriscraft-lobby-migrate \
+    && cp /opt/ferrislabs/ferriscraft/target/release/ferriscraft-lobby /usr/local/bin/ferriscraft-lobby \
+    && cp /opt/ferrislabs/ferriscraft/target/release/ferriscraft-lobby-migrate /usr/local/bin/ferriscraft-lobby-migrate
 
 FROM distroless-runtime AS lobby
 
 COPY --from=plugins-builder /usr/local/bin/ferriscraft-lobby /usr/local/bin/ferriscraft-lobby
+COPY --from=plugins-builder /usr/local/bin/ferriscraft-lobby-migrate /usr/local/bin/ferriscraft-lobby-migrate
 COPY --chown=65532:65532 lobby.json /app/lobby.json
 ARG FERRISCRAFT_VERSION=dev
-ENV FERRISCRAFT_VERSION=${FERRISCRAFT_VERSION}
+ARG RSPIGOT_REF=local
+ENV FERRISCRAFT_VERSION=${FERRISCRAFT_VERSION} \
+    RSPIGOT_REF=${RSPIGOT_REF}
 ENTRYPOINT ["/usr/local/bin/ferriscraft-lobby"]
 
 FROM chef AS sheepwars-cook
@@ -211,7 +220,9 @@ FROM distroless-runtime AS sheepwars
 
 COPY --from=sheepwars-builder /opt/ferrislabs/ferriscraft/target/release/ferriscraft-sheepwars /usr/local/bin/ferriscraft-sheepwars
 ARG FERRISCRAFT_VERSION=dev
-ENV FERRISCRAFT_VERSION=${FERRISCRAFT_VERSION}
+ARG RSPIGOT_REF=local
+ENV FERRISCRAFT_VERSION=${FERRISCRAFT_VERSION} \
+    RSPIGOT_REF=${RSPIGOT_REF}
 ENTRYPOINT ["/usr/local/bin/ferriscraft-sheepwars"]
 
 # ==============================================================================
@@ -247,5 +258,7 @@ COPY --chmod=0755 deploy/docker/velocity-entrypoint.sh /usr/local/bin/velocity-e
 
 EXPOSE 25565
 ARG FERRISCRAFT_VERSION=dev
-ENV FERRISCRAFT_VERSION=${FERRISCRAFT_VERSION}
+ARG RSPIGOT_REF=local
+ENV FERRISCRAFT_VERSION=${FERRISCRAFT_VERSION} \
+    RSPIGOT_REF=${RSPIGOT_REF}
 ENTRYPOINT ["/usr/local/bin/velocity-entrypoint.sh"]

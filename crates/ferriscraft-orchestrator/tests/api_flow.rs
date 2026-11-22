@@ -81,6 +81,7 @@ async fn end_to_end_queue_matchmaking_sse_and_auth() {
             max_players: 8,
             player_uuids: Vec::new(),
             version: Some("abc1234".to_owned()),
+            kind: Default::default(),
         })
         .send()
         .await

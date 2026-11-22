@@ -174,6 +174,13 @@ impl Session {
         }
     }
 
+    pub fn watch(&mut self, player: PlayerId) -> Vec<Intent> {
+        self.sideline(
+            player,
+            "§eVous regardez cette partie en spectateur. §d/hub §epour revenir au Hub.",
+        )
+    }
+
     pub fn leave(&mut self, player: PlayerId) -> Vec<Intent> {
         let Some(team) = self.round.team_of(player) else {
             return Vec::new();
@@ -1011,6 +1018,24 @@ mod tests {
         let intents = session.quit(A);
         assert!(intents.contains(&Intent::Spectate { player: A }));
         assert_eq!(session.round().team_of(A), None);
+    }
+
+    #[test]
+    fn watching_sidelines_in_any_phase_without_a_team() {
+        let mut waiting = session();
+        let intents = waiting.watch(A);
+        assert!(intents.contains(&Intent::Spectate { player: A }));
+        assert_eq!(waiting.round().team_of(A), None);
+        assert!(!intents.iter().any(|i| matches!(i, Intent::Enroll { .. })));
+        let tell = intents.iter().find_map(|i| match i {
+            Intent::Tell { text, .. } => Some(text.as_str()),
+            _ => None,
+        });
+        assert!(tell.is_some_and(|t| t.contains("spectateur") && t.contains("/hub")));
+        let mut running = started();
+        let intents = running.watch(C);
+        assert!(intents.contains(&Intent::Spectate { player: C }));
+        assert_eq!(running.round().team_of(C), None);
     }
 
     #[test]

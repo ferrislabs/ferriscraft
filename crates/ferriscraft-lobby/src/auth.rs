@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::fmt;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -11,6 +12,10 @@ use thiserror::Error;
 use tokio::sync::watch;
 
 use crate::config::EnvConfig;
+use crate::storage::{
+    CAPITAINERIE_REALM, FileSessionRepository, LOBBY_REALM, SessionBackend, SessionRepository,
+    WriteGate,
+};
 
 const REFRESH_MARGIN_SECS: u64 = 30;
 const DEFAULT_TOKEN_LIFETIME_SECS: u64 = 300;
@@ -172,13 +177,33 @@ pub struct UserClaims {
     pub exp: Option<u64>,
 }
 
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RefreshToken(String);
+
+impl RefreshToken {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for RefreshToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RefreshToken(<redacted>)")
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerSession {
     pub player_uuid: Uuid,
     pub claims: UserClaims,
     pub access_token: String,
     #[serde(default)]
-    pub refresh_token: Option<String>,
+    pub refresh_token: Option<RefreshToken>,
     pub expires_at: u64,
 }
 
@@ -221,7 +246,7 @@ impl DeviceAuthorization {
 struct TokenSuccess {
     access_token: String,
     #[serde(default)]
-    refresh_token: Option<String>,
+    refresh_token: Option<RefreshToken>,
     #[serde(default)]
     expires_in: Option<u64>,
     #[serde(default)]
@@ -377,19 +402,47 @@ fn rewrite_public_url(url: &str, internal_base: &str, public_base: &str) -> Stri
 }
 
 struct SessionStore {
-    path: PathBuf,
+    realm: &'static str,
+    backend: SessionBackend,
+    gate: Arc<WriteGate>,
     sessions: RwLock<HashMap<Uuid, PlayerSession>>,
     pending_cancels: RwLock<HashMap<Uuid, watch::Sender<bool>>>,
 }
 
 impl SessionStore {
-    fn new(path: PathBuf) -> Self {
-        let loaded = Self::load_sessions(&path);
+    fn new(realm: &'static str, backend: SessionBackend, gate: Arc<WriteGate>) -> Self {
         Self {
-            path,
-            sessions: RwLock::new(loaded),
+            realm,
+            backend,
+            gate,
+            sessions: RwLock::new(HashMap::new()),
             pending_cancels: RwLock::new(HashMap::new()),
         }
+    }
+
+    async fn hydrate(&self, uuid: Uuid) {
+        if self.is_authenticated(uuid) {
+            return;
+        }
+        match self.backend.get(uuid, self.realm).await {
+            Ok(Some(session)) => {
+                self.sessions
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(uuid, session);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!("Session {} illisible pour {uuid} : {err}", self.realm);
+            }
+        }
+    }
+
+    fn evict(&self, uuid: Uuid) {
+        self.sessions
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&uuid);
     }
 
     fn session_of(&self, uuid: Uuid) -> Option<PlayerSession> {
@@ -436,7 +489,7 @@ impl SessionStore {
         rx
     }
 
-    fn logout(&self, uuid: Uuid) -> bool {
+    async fn logout(&self, uuid: Uuid) -> bool {
         self.cancel_pending(uuid);
         let removed = self
             .sessions
@@ -444,13 +497,20 @@ impl SessionStore {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&uuid)
             .is_some();
-        if removed {
-            self.persist_sessions();
+        let deleted = match self.gate.try_enter() {
+            Ok(_guard) => self.backend.delete(uuid, self.realm).await,
+            Err(err) => Err(err),
+        };
+        if let Err(err) = deleted {
+            tracing::warn!(
+                "Session {} non supprimée du stockage pour {uuid} : {err}",
+                self.realm
+            );
         }
         removed
     }
 
-    fn store_tokens(
+    async fn store_tokens(
         &self,
         player_uuid: Uuid,
         granted: TokenSuccess,
@@ -491,44 +551,17 @@ impl SessionStore {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(player_uuid, session.clone());
-        self.persist_sessions();
+        let stored = match self.gate.try_enter() {
+            Ok(_guard) => self.backend.put(self.realm, &session).await,
+            Err(err) => Err(err),
+        };
+        if let Err(err) = stored {
+            tracing::warn!(
+                "Session {} non enregistrée dans le stockage pour {player_uuid} : {err}",
+                self.realm
+            );
+        }
         session
-    }
-
-    fn load_sessions(path: &Path) -> HashMap<Uuid, PlayerSession> {
-        if path.as_os_str().is_empty() || !path.exists() {
-            return HashMap::new();
-        }
-        let Ok(raw) = std::fs::read_to_string(path) else {
-            return HashMap::new();
-        };
-        serde_json::from_str::<Vec<PlayerSession>>(&raw)
-            .map(|list| list.into_iter().map(|s| (s.player_uuid, s)).collect())
-            .unwrap_or_default()
-    }
-
-    fn persist_sessions(&self) {
-        if self.path.as_os_str().is_empty() {
-            return;
-        }
-        let list: Vec<PlayerSession> = self
-            .sessions
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .cloned()
-            .collect();
-        let Ok(raw) = serde_json::to_string_pretty(&list) else {
-            return;
-        };
-        if std::fs::write(&self.path, format!("{raw}\n")).is_ok() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ =
-                    std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
-            }
-        }
     }
 }
 
@@ -541,12 +574,24 @@ pub struct AuthManager {
 
 impl AuthManager {
     pub fn new(config: EnvConfig) -> Self {
-        let lobby_store = SessionStore::new(config.sessions_path.clone());
-        let capitainerie_store = if config.has_dedicated_capitainerie_auth() {
-            SessionStore::new(config.capitainerie_sessions_path.clone())
+        let lobby = SessionBackend::File(FileSessionRepository::new(config.sessions_path.clone()));
+        let capitainerie_path = if config.has_dedicated_capitainerie_auth() {
+            config.capitainerie_sessions_path.clone()
         } else {
-            SessionStore::new(PathBuf::new())
+            PathBuf::new()
         };
+        let capitainerie = SessionBackend::File(FileSessionRepository::new(capitainerie_path));
+        Self::with_backends(config, lobby, capitainerie, Arc::new(WriteGate::default()))
+    }
+
+    pub fn with_backends(
+        config: EnvConfig,
+        lobby: SessionBackend,
+        capitainerie: SessionBackend,
+        gate: Arc<WriteGate>,
+    ) -> Self {
+        let lobby_store = SessionStore::new(LOBBY_REALM, lobby, Arc::clone(&gate));
+        let capitainerie_store = SessionStore::new(CAPITAINERIE_REALM, capitainerie, gate);
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .build()
@@ -636,8 +681,20 @@ impl AuthManager {
         self.lobby_store.is_authenticated(uuid)
     }
 
-    pub fn logout(&self, uuid: Uuid) -> bool {
-        self.lobby_store.logout(uuid)
+    pub async fn hydrate(&self, uuid: Uuid) {
+        self.lobby_store.hydrate(uuid).await;
+        if self.config.has_dedicated_capitainerie_auth() {
+            self.capitainerie_store.hydrate(uuid).await;
+        }
+    }
+
+    pub fn evict(&self, uuid: Uuid) {
+        self.lobby_store.evict(uuid);
+        self.capitainerie_store.evict(uuid);
+    }
+
+    pub async fn logout(&self, uuid: Uuid) -> bool {
+        self.lobby_store.logout(uuid).await
     }
 
     pub fn capitainerie_session_of(&self, uuid: Uuid) -> Option<PlayerSession> {
@@ -653,8 +710,8 @@ impl AuthManager {
             .is_authenticated(uuid)
     }
 
-    pub fn capitainerie_logout(&self, uuid: Uuid) -> bool {
-        self.store_for(AuthScope::Capitainerie).logout(uuid)
+    pub async fn capitainerie_logout(&self, uuid: Uuid) -> bool {
+        self.store_for(AuthScope::Capitainerie).logout(uuid).await
     }
 
     pub fn cancel_pending(&self, uuid: Uuid) {
@@ -708,8 +765,11 @@ impl AuthManager {
 
         let mut device: DeviceAuthorization = response.json().await?;
         if let Some(public_base) = target.public_base_url {
-            device.verification_uri =
-                rewrite_public_url(&device.verification_uri, target.internal_base_url, public_base);
+            device.verification_uri = rewrite_public_url(
+                &device.verification_uri,
+                target.internal_base_url,
+                public_base,
+            );
             device.verification_uri_complete = device
                 .verification_uri_complete
                 .map(|uri| rewrite_public_url(&uri, target.internal_base_url, public_base));
@@ -783,7 +843,8 @@ impl AuthManager {
 
             if response.status().is_success() {
                 let granted: TokenSuccess = response.json().await?;
-                let session = store.store_tokens(player_uuid, granted, None);
+                let session = store.store_tokens(player_uuid, granted, None).await;
+                tracing::info!("Session {} ouverte pour {player_uuid}", store.realm);
                 return Ok(session);
             }
 
@@ -853,13 +914,13 @@ impl AuthManager {
         }
 
         let Some(refresh_token) = current.refresh_token.clone() else {
-            store.logout(player_uuid);
+            store.logout(player_uuid).await;
             return Err(expired_err());
         };
 
         let mut form = vec![
             ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token.as_str()),
+            ("refresh_token", refresh_token.expose()),
             ("client_id", target.client_id),
         ];
         if let Some(secret) = target.client_secret {
@@ -875,12 +936,20 @@ impl AuthManager {
             .await?;
 
         if !response.status().is_success() {
-            store.logout(player_uuid);
+            tracing::info!(
+                "Rafraîchissement de la session {} refusé pour {player_uuid} (HTTP {})",
+                store.realm,
+                response.status().as_u16()
+            );
+            store.logout(player_uuid).await;
             return Err(expired_err());
         }
 
         let granted: TokenSuccess = response.json().await?;
-        let refreshed = store.store_tokens(player_uuid, granted, Some(current));
+        let refreshed = store
+            .store_tokens(player_uuid, granted, Some(current))
+            .await;
+        tracing::info!("Session {} rafraîchie pour {player_uuid}", store.realm);
         Ok(refreshed.access_token)
     }
 
@@ -1062,9 +1131,141 @@ mod tests {
                 .session_of(player_id)
                 .unwrap()
                 .refresh_token
-                .as_deref(),
+                .as_ref()
+                .map(RefreshToken::expose),
             Some("ref-2")
         );
+    }
+
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn refresh_token_debug_is_redacted() {
+        let token = RefreshToken::new("rt-super-secret");
+        assert_eq!(format!("{token:?}"), "RefreshToken(<redacted>)");
+        let session = PlayerSession {
+            player_uuid: Uuid::new_v4(),
+            claims: UserClaims {
+                sub: "u".to_owned(),
+                username: "n".to_owned(),
+                display_name: None,
+                email: None,
+                roles: Vec::new(),
+                exp: None,
+            },
+            access_token: "at".to_owned(),
+            refresh_token: Some(token),
+            expires_at: 0,
+        };
+        assert!(!format!("{session:?}").contains("rt-super-secret"));
+        assert!(!format!("{session:#?}").contains("rt-super-secret"));
+        let json = serde_json::to_string(&session).expect("serialize");
+        assert!(json.contains("rt-super-secret"));
+    }
+
+    #[tokio::test]
+    async fn login_then_refresh_never_logs_the_refresh_token() {
+        let app = Router::new()
+            .route(
+                "/realms/ferriscraft/protocol/openid-connect/auth/device",
+                post(|| async {
+                    Json(json!({
+                        "device_code": "dev-1",
+                        "user_code": "ABCD-1234",
+                        "verification_uri": "http://localhost:3333/device",
+                        "expires_in": 300,
+                        "interval": 1
+                    }))
+                }),
+            )
+            .route(
+                "/realms/ferriscraft/protocol/openid-connect/token",
+                post(|Form(form): Form<HashMap<String, String>>| async move {
+                    let jwt = make_jwt(&json!({"sub": "u-1", "preferred_username": "p"}));
+                    let refresh =
+                        if form.get("grant_type").map(String::as_str) == Some("refresh_token") {
+                            "rt-SECRET-second"
+                        } else {
+                            "rt-SECRET-first"
+                        };
+                    Json(json!({
+                        "access_token": jwt,
+                        "refresh_token": refresh,
+                        "expires_in": 10
+                    }))
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(capture.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let mut cfg = EnvConfig::from_env();
+        cfg.ferriskey_base_url = format!("http://{addr}");
+        cfg.ferriskey_public_url = None;
+        cfg.ferriskey_realm = "ferriscraft".to_owned();
+        cfg.ferriskey_client_id = "ferriscraft-lobby".to_owned();
+        cfg.capitainerie_ferriskey_url = cfg.ferriskey_base_url.clone();
+        cfg.capitainerie_realm = "ferriscraft".to_owned();
+        cfg.capitainerie_client_id = "ferriscraft-lobby".to_owned();
+        cfg.sessions_path = PathBuf::new();
+        cfg.capitainerie_sessions_path = PathBuf::new();
+        let manager = AuthManager::new(cfg);
+
+        let player_id = Uuid::new_v4();
+        let (device, cancel_rx) = manager.start_device_flow(player_id).await.expect("start");
+        let session = manager
+            .poll_device_flow(player_id, &device, cancel_rx)
+            .await
+            .expect("login");
+        tracing::info!("session après login : {session:?}");
+        manager
+            .valid_access_token(player_id)
+            .await
+            .expect("refresh");
+        let refreshed = manager.session_of(player_id).expect("session");
+        tracing::info!("session après refresh : {refreshed:?}");
+        assert_eq!(
+            refreshed.refresh_token.as_ref().map(RefreshToken::expose),
+            Some("rt-SECRET-second")
+        );
+
+        let logs = String::from_utf8(capture.0.lock().unwrap_or_else(|e| e.into_inner()).clone())
+            .expect("utf8 logs");
+        assert!(logs.contains("rafraîchie"), "logs: {logs}");
+        assert!(!logs.contains("rt-SECRET"), "logs: {logs}");
     }
 
     #[tokio::test]
@@ -1218,7 +1419,7 @@ mod tests {
             Some(cap_tok.as_str())
         );
 
-        assert!(manager.capitainerie_logout(player_id));
+        assert!(manager.capitainerie_logout(player_id).await);
         assert!(!manager.is_capitainerie_authenticated(player_id));
         assert!(manager.is_authenticated(player_id));
     }

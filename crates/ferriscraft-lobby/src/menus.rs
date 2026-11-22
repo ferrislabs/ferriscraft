@@ -676,12 +676,14 @@ pub fn populate_gadgets_menu(
     );
 }
 
+type ServerMenuIds = Vec<Option<String>>;
+
 #[derive(Default)]
 pub struct MenuManager {
     games_menu: RwLock<Option<CustomInventory>>,
     options_menus: RwLock<HashMap<Uuid, CustomInventory>>,
     gadgets_menus: RwLock<HashMap<Uuid, CustomInventory>>,
-    servers_menus: RwLock<HashMap<Uuid, (CustomInventory, Vec<String>)>>,
+    servers_menus: RwLock<HashMap<Uuid, (CustomInventory, ServerMenuIds)>>,
     progress_menus: RwLock<HashMap<Uuid, (CustomInventory, ProgressMenuKind)>>,
 }
 
@@ -870,14 +872,19 @@ impl MenuManager {
             &inv,
             lobby_version,
             snapshot.orchestrator_version.as_deref(),
+            snapshot.proxy_version.as_deref(),
             &snapshot.servers,
+            &snapshot.lobbies,
         );
         self.servers_menus
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(
                 player.uuid,
-                (inv.clone(), sorted_server_ids(&snapshot.servers)),
+                (
+                    inv.clone(),
+                    sorted_server_ids(&snapshot.servers, &snapshot.lobbies),
+                ),
             );
         player.inventory.open(&inv).await
     }
@@ -886,7 +893,7 @@ impl MenuManager {
         &self,
         player_uuid: Uuid,
         inv_ref: Option<&InventoryRef>,
-    ) -> Option<Vec<String>> {
+    ) -> Option<ServerMenuIds> {
         let custom = inv_ref.and_then(InventoryRef::custom)?;
         self.servers_menus
             .read()

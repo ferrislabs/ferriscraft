@@ -1,6 +1,8 @@
 global:
   imageRegistry: ghcr.io/ferrislabs
   imageTag: latest
+  # true en staging et en prod : refuse un imageTag vide ou "latest".
+  immutableTags: false
   imagePullPolicy: IfNotPresent
   imagePullSecrets: []
 
@@ -80,7 +82,15 @@ orchestrator:
       memory: 256Mi
 
 lobby:
-  replicas: 1
+  # 2 instances : une mise à jour draine une instance pendant que l'autre sert.
+  replicas: 2
+  # Temps laissé aux joueurs pour partir vers l'autre instance avant l'arrêt.
+  drainTimeoutSecs: 60
+  storage:
+    # Secret CloudNativePG du lobby (ex. ferriscraft-lobby-db-app).
+    # Vide : layout et sessions en fichiers, perdus au redémarrage (dev / k3d).
+    existingDatabaseSecret: ""
+    databaseUriKey: uri
   rspigotImage:
     repository: ferriscraft-rspigot
     tag: ""

@@ -14,6 +14,10 @@ variable "RSPIGOT_DIR" {
   default = "/opt/minecraft/dev/rspigot"
 }
 
+variable "RSPIGOT_REF" {
+  default = "local"
+}
+
 function "image_tags" {
   params = [name]
   result = concat(
@@ -31,6 +35,7 @@ target "_common" {
   context    = "."
   args = {
     FERRISCRAFT_VERSION = EXTRA_TAG != "" ? EXTRA_TAG : IMAGE_TAG
+    RSPIGOT_REF         = RSPIGOT_REF
   }
 }
 

@@ -48,4 +48,5 @@ async fn reconcile_static_once(state: &AppState, config: &OrchestratorConfig) {
     }
 
     state.emit_proxy_events(events);
+    state.flush_queue_logged().await;
 }

@@ -55,11 +55,64 @@ pub fn decode_servers_slot(slot: i32, server_count: usize) -> Option<usize> {
     (index < server_count.min(SERVERS_MAX)).then_some(index)
 }
 
-pub fn sorted_server_ids(servers: &[ServerSummary]) -> Vec<String> {
-    let mut ids: Vec<String> = servers.iter().map(|s| s.server_id.clone()).collect();
-    ids.sort();
-    ids.truncate(SERVERS_MAX);
-    ids
+pub fn sorted_server_ids(
+    servers: &[ServerSummary],
+    lobbies: &[ServerSummary],
+) -> Vec<Option<String>> {
+    ordered_entries(servers, lobbies)
+        .into_iter()
+        .map(|(server, is_lobby)| (!is_lobby).then(|| server.server_id.clone()))
+        .collect()
+}
+
+fn ordered_entries<'a>(
+    servers: &'a [ServerSummary],
+    lobbies: &'a [ServerSummary],
+) -> Vec<(&'a ServerSummary, bool)> {
+    let mut games: Vec<&ServerSummary> = servers.iter().collect();
+    games.sort_by(|a, b| a.server_id.cmp(&b.server_id));
+    let mut instances: Vec<&ServerSummary> = lobbies.iter().collect();
+    instances.sort_by(|a, b| a.server_id.cmp(&b.server_id));
+    games
+        .into_iter()
+        .map(|server| (server, false))
+        .chain(instances.into_iter().map(|server| (server, true)))
+        .take(SERVERS_MAX)
+        .collect()
+}
+
+pub fn lobby_style(server: &ServerSummary) -> (Material, &'static str) {
+    if server.draining {
+        (Material::SoulLantern, "Drain")
+    } else if server.ready {
+        (Material::Lantern, "Prêt")
+    } else {
+        (Material::Lantern, "Démarrage")
+    }
+}
+
+fn lobby_item(server: &ServerSummary) -> ItemStack {
+    let (material, label) = lobby_style(server);
+    let color = if server.draining { "§6" } else { "§b" };
+    let mut lore = vec![
+        "§7Instance de lobby".to_owned(),
+        format!("§7État {color}{label}"),
+        format!("§7Joueurs §f{}/{}", server.player_count, server.max_players),
+        format!(
+            "§7Version §f{}",
+            short_version_or_unknown(server.version.as_deref())
+        ),
+        format!("§7Âge §f{}", format_age(server.age_secs)),
+    ];
+    if server.draining {
+        lore.push("§6Les joueurs sont transférés vers un autre lobby".to_owned());
+    }
+    if server.outdated {
+        lore.push("§cAncienne version".to_owned());
+    }
+    ItemStack::new(material, 1)
+        .name(format!("{color}{}", server.server_id))
+        .lore(lore)
 }
 
 fn server_item(server: &ServerSummary) -> ItemStack {
@@ -96,28 +149,46 @@ pub fn populate_servers_menu(
     inv: &CustomInventory,
     lobby_version: Option<&str>,
     orchestrator_version: Option<&str>,
+    proxy_version: Option<&str>,
     servers: &[ServerSummary],
+    lobbies: &[ServerSummary],
 ) {
     inv.set(
         SERVERS_SLOT_HEADER,
         Some(
             ItemStack::new(Material::Book, 1)
                 .name("§dVersions déployées")
-                .lore([
-                    format!("§7Lobby §f{}", short_version_or_unknown(lobby_version)),
-                    format!(
-                        "§7Orchestrateur §f{}",
-                        short_version_or_unknown(orchestrator_version)
-                    ),
-                ]),
+                .lore(header_lore(
+                    lobby_version,
+                    orchestrator_version,
+                    proxy_version,
+                )),
         ),
     );
-    let mut sorted: Vec<&ServerSummary> = servers.iter().collect();
-    sorted.sort_by(|a, b| a.server_id.cmp(&b.server_id));
-    for (index, server) in sorted.into_iter().take(SERVERS_MAX).enumerate() {
+    for (index, (server, is_lobby)) in ordered_entries(servers, lobbies).into_iter().enumerate() {
         let slot = SERVERS_FIRST_SLOT + u16::try_from(index).unwrap_or(0);
-        inv.set(slot, Some(server_item(server)));
+        let item = if is_lobby {
+            lobby_item(server)
+        } else {
+            server_item(server)
+        };
+        inv.set(slot, Some(item));
     }
+}
+
+pub fn header_lore(
+    lobby_version: Option<&str>,
+    orchestrator_version: Option<&str>,
+    proxy_version: Option<&str>,
+) -> Vec<String> {
+    vec![
+        format!("§7Lobby §f{}", short_version_or_unknown(lobby_version)),
+        format!(
+            "§7Orchestrateur §f{}",
+            short_version_or_unknown(orchestrator_version)
+        ),
+        format!("§7Proxy §f{}", short_version_or_unknown(proxy_version)),
+    ]
 }
 
 #[cfg(test)]
@@ -198,6 +269,8 @@ mod tests {
             age_secs: 0,
             version: None,
             outdated: false,
+            kind: Default::default(),
+            draining: false,
         }
     }
 
@@ -207,9 +280,53 @@ mod tests {
             .rev()
             .map(|i| summary(&format!("s{i:02}")))
             .collect();
-        let ids = sorted_server_ids(&servers);
+        let ids = sorted_server_ids(&servers, &[]);
         assert_eq!(ids.len(), SERVERS_MAX);
-        assert_eq!(ids[0], "s00");
-        assert_eq!(ids[35], "s35");
+        assert_eq!(ids[0].as_deref(), Some("s00"));
+        assert_eq!(ids[35].as_deref(), Some("s35"));
+    }
+
+    #[test]
+    fn lobbies_follow_games_and_are_not_clickable() {
+        let servers = vec![summary("sw-b"), summary("sw-a")];
+        let lobbies = vec![summary("lobby-1"), summary("lobby-0")];
+        let ids = sorted_server_ids(&servers, &lobbies);
+        assert_eq!(
+            ids,
+            vec![Some("sw-a".to_owned()), Some("sw-b".to_owned()), None, None]
+        );
+        let order: Vec<&str> = ordered_entries(&servers, &lobbies)
+            .into_iter()
+            .map(|(s, _)| s.server_id.as_str())
+            .collect();
+        assert_eq!(order, ["sw-a", "sw-b", "lobby-0", "lobby-1"]);
+    }
+
+    #[test]
+    fn lobby_items_have_a_distinct_material_and_a_drain_state() {
+        let ready = summary("lobby-0");
+        let mut draining = summary("lobby-1");
+        draining.draining = true;
+        assert_eq!(lobby_style(&ready), (Material::Lantern, "Prêt"));
+        assert_eq!(lobby_style(&draining), (Material::SoulLantern, "Drain"));
+        assert_ne!(lobby_style(&ready).0, phase_style(ready.phase).0);
+    }
+
+    #[test]
+    fn header_shows_lobby_orchestrator_and_proxy_versions() {
+        let lore = header_lore(
+            Some("dev"),
+            Some(SHA),
+            Some("pr-3-221bc38da1571c58215910983e4ab060145106f9"),
+        );
+        assert_eq!(
+            lore,
+            vec![
+                "§7Lobby §fdev".to_owned(),
+                "§7Orchestrateur §f221bc38".to_owned(),
+                "§7Proxy §fpr-3-221bc38".to_owned(),
+            ]
+        );
+        assert_eq!(header_lore(None, None, None)[2], "§7Proxy §f?");
     }
 }

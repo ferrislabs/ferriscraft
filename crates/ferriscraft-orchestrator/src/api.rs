@@ -8,15 +8,16 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use chrono::Utc;
 use ferriscraft_progression::{
     EquipError, MemoryProgressionRepository, ProgressionStoreError, Unlock, UnlockError,
 };
 use ferriscraft_protocol::{
-    AdminCoinGrant, EquipRequest, FleetStatusSnapshot, HeartbeatRequest, JoinQueueRequest,
-    JoinQueueResponse, LeaveQueueRequest, LeaveQueueResponse, MatchReport, MatchReportAck,
-    PhaseUpdateRequest, PlayerIdentityUpdate, PlayerProfile, PlayerQueueStatus,
-    ProxyDisconnectRequest, ProxyEvent, ProxyStateSnapshot, PurchaseRequest, SendToLobbyRequest,
-    SpectateRequest, TransferAckRequest,
+    AdminCoinGrant, DrainResponse, EquipRequest, FleetStatusSnapshot, HeartbeatRequest,
+    JoinQueueRequest, JoinQueueResponse, LeaveQueueRequest, LeaveQueueResponse, MatchReport,
+    MatchReportAck, PROXY_VERSION_HEADER, PhaseUpdateRequest, PlayerIdentityUpdate, PlayerProfile,
+    PlayerQueueStatus, ProxyDisconnectRequest, ProxyEvent, ProxyStateSnapshot, PurchaseRequest,
+    SendToLobbyRequest, SpectateRequest, TransferAckRequest,
 };
 use futures_util::stream::{self, Stream};
 use serde_json::json;
@@ -24,7 +25,11 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::engine::{EngineError, FleetEngine};
+use crate::lobby::DrainError;
 use crate::progression::{ProgressionError, ProgressionService, ProgressionStore};
+use crate::queue::{
+    NewQueueEntry, QueueRepository, QueueStore, QueueStoreError, persist as persist_mutation,
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -33,6 +38,9 @@ pub struct AppState {
     pub api_token: Option<String>,
     pub version: Option<String>,
     pub progression: ProgressionService<ProgressionStore>,
+    pub queue: QueueStore,
+    persist_lock: Arc<tokio::sync::Mutex<()>>,
+    proxy_version: Arc<Mutex<Option<String>>>,
 }
 
 impl AppState {
@@ -46,6 +54,54 @@ impl AppState {
             progression: ProgressionService::new(ProgressionStore::Memory(
                 MemoryProgressionRepository::default(),
             )),
+            queue: QueueStore::default(),
+            persist_lock: Arc::new(tokio::sync::Mutex::new(())),
+            proxy_version: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[must_use]
+    pub fn with_queue(mut self, queue: QueueStore) -> Self {
+        self.queue = queue;
+        self
+    }
+
+    pub async fn flush_queue(&self) -> Result<(), QueueStoreError> {
+        let _serialized = self.persist_lock.lock().await;
+        loop {
+            let batch = self
+                .engine
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take_mutations();
+            if batch.is_empty() {
+                return Ok(());
+            }
+            for (done, mutation) in batch.iter().enumerate() {
+                if let Err(err) = persist_mutation(&self.queue, mutation).await {
+                    self.engine
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .restore_mutations(batch[done..].to_vec());
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    pub async fn flush_queue_logged(&self) {
+        if let Err(err) = self.flush_queue().await {
+            tracing::warn!(error = %err, "Écriture de la file d'attente différée");
+        }
+    }
+
+    fn record_proxy_version(&self, headers: &HeaderMap) {
+        if let Some(version) = headers
+            .get(PROXY_VERSION_HEADER)
+            .and_then(|v| v.to_str().ok())
+        {
+            *self.proxy_version.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(version.to_owned());
         }
     }
 
@@ -74,6 +130,8 @@ pub enum ApiError {
     BadRequest(String),
     Conflict(String),
     Progression(ProgressionError),
+    Queue(QueueStoreError),
+    Drain(DrainError),
 }
 
 fn unlock_json(unlock: Unlock) -> serde_json::Value {
@@ -149,6 +207,21 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, msg) = match self {
             Self::Progression(err) => return progression_response(err),
+            Self::Queue(err) => {
+                tracing::warn!(error = %err, "File d'attente indisponible");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": "queue_unavailable" })),
+                )
+                    .into_response();
+            }
+            Self::Drain(err) => {
+                let status = match err {
+                    DrainError::UnknownServer => StatusCode::NOT_FOUND,
+                    DrainError::NotALobby | DrainError::NoOtherLobby => StatusCode::CONFLICT,
+                };
+                return (status, Json(json!({ "error": err.to_string() }))).into_response();
+            }
             Self::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
                 "jeton orchestrateur invalide".to_owned(),
@@ -158,6 +231,18 @@ impl IntoResponse for ApiError {
             Self::Conflict(m) => (StatusCode::CONFLICT, m),
         };
         (status, Json(json!({ "error": msg }))).into_response()
+    }
+}
+
+impl From<QueueStoreError> for ApiError {
+    fn from(value: QueueStoreError) -> Self {
+        Self::Queue(value)
+    }
+}
+
+impl From<DrainError> for ApiError {
+    fn from(value: DrainError) -> Self {
+        Self::Drain(value)
     }
 }
 
@@ -198,6 +283,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/servers", get(list_servers))
         .route("/api/v1/servers/heartbeat", post(server_heartbeat))
         .route("/api/v1/servers/{server_id}/phase", post(update_phase))
+        .route("/api/v1/servers/{server_id}/drain", post(drain_server))
         .route(
             "/api/v1/servers/{server_id}/spectate",
             post(spectate_server),
@@ -254,6 +340,11 @@ async fn get_status(
         engine.snapshot(Instant::now())
     };
     snap.orchestrator_version.clone_from(&state.version);
+    snap.proxy_version = state
+        .proxy_version
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     Ok(Json(snap))
 }
 
@@ -274,13 +365,35 @@ async fn join_queue(
         return Err(ApiError::BadRequest("player_name vide".to_owned()));
     }
     let player_uuid = req.player_uuid;
-    let (mut resp, events) = {
+    let needs_insert = {
+        let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
+        engine.needs_enqueue(player_uuid)
+    };
+    let seq = if needs_insert {
+        Some(
+            state
+                .queue
+                .insert(NewQueueEntry {
+                    player_uuid,
+                    name: &req.player_name,
+                    joined_at: Utc::now(),
+                    seq: None,
+                })
+                .await?,
+        )
+    } else {
+        None
+    };
+    let (resp, events) = {
         let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
-        let resp = engine.join_queue(now, req);
+        let resp = match seq {
+            Some(seq) => engine.join_queue_with_seq(now, req, seq),
+            None => engine.join_queue(now, req),
+        };
         let actions = engine.tick(now);
         let snap = engine.snapshot(now);
-        let post_status = engine.player_status(player_uuid);
+        let post_status = engine.player_status(now, player_uuid);
         let mut updated = resp;
         updated.total_queued = post_status.total_queued;
         updated.ready_servers = snap.ready_servers;
@@ -294,7 +407,7 @@ async fn join_queue(
         }
         (updated, actions.proxy_events)
     };
-    let _ = &mut resp;
+    state.flush_queue().await?;
     state.emit_proxy_events(events);
     Ok(Json(resp))
 }
@@ -309,6 +422,7 @@ async fn leave_queue(
         let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
         engine.leave_queue(req.player_uuid, req.reason)
     };
+    state.flush_queue().await?;
     Ok(Json(resp))
 }
 
@@ -320,7 +434,7 @@ async fn player_status(
     check_auth(&headers, state.api_token.as_deref())?;
     let status = {
         let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
-        engine.player_status(uuid)
+        engine.player_status(Instant::now(), uuid)
     };
     Ok(Json(status))
 }
@@ -339,8 +453,25 @@ async fn server_heartbeat(
         events.extend(actions.proxy_events);
         events
     };
+    state.flush_queue_logged().await;
     state.emit_proxy_events(events);
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn drain_server(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(server_id): Path<String>,
+) -> Result<Json<DrainResponse>, ApiError> {
+    check_auth(&headers, state.api_token.as_deref())?;
+    let result = {
+        let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
+        engine.drain_lobby(Instant::now(), &server_id)?
+    };
+    state.emit_proxy_events(result.events);
+    Ok(Json(DrainResponse {
+        remaining_players: result.remaining_players,
+    }))
 }
 
 async fn update_phase(
@@ -358,6 +489,7 @@ async fn update_phase(
         events.extend(actions.proxy_events);
         events
     };
+    state.flush_queue_logged().await;
     state.emit_proxy_events(events);
     Ok(StatusCode::NO_CONTENT)
 }
@@ -373,6 +505,7 @@ async fn spectate_server(
         let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
         engine.queue_spectate_transfer(Instant::now(), &server_id, req.player_uuid)?
     };
+    state.flush_queue_logged().await;
     state.emit_proxy_events(vec![event]);
     Ok(StatusCode::ACCEPTED)
 }
@@ -388,6 +521,7 @@ async fn send_player_to_lobby(
         let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
         engine.queue_lobby_transfer(Instant::now(), uuid, req.reason)
     };
+    state.flush_queue_logged().await;
     state.emit_proxy_events(vec![event]);
     Ok(StatusCode::ACCEPTED)
 }
@@ -397,6 +531,7 @@ async fn proxy_state(
     headers: HeaderMap,
 ) -> Result<Json<ProxyStateSnapshot>, ApiError> {
     check_auth(&headers, state.api_token.as_deref())?;
+    state.record_proxy_version(&headers);
     let snap = {
         let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
         engine.proxy_snapshot()
@@ -409,6 +544,7 @@ async fn proxy_events(
     headers: HeaderMap,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     check_auth(&headers, state.api_token.as_deref())?;
+    state.record_proxy_version(&headers);
     let rx = state.proxy_tx.subscribe();
     let stream = stream::unfold(rx, |mut rx| async move {
         loop {
@@ -442,8 +578,11 @@ async fn ack_transfer(
     if !req.success {
         tracing::warn!(%transfer_id, message = ?req.message, "Transfert Velocity échoué");
     }
-    let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
-    engine.ack_transfer(transfer_id, req.success);
+    {
+        let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
+        engine.ack_transfer(Instant::now(), transfer_id, req.success);
+    }
+    state.flush_queue_logged().await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -460,6 +599,7 @@ async fn proxy_player_disconnected(
             ferriscraft_protocol::LeaveReason::ProxyDisconnect,
         )
     };
+    state.flush_queue().await?;
     Ok(Json(resp))
 }
 

@@ -8,6 +8,7 @@ import com.velocitypowered.api.command.SimpleCommand;
 import com.velocitypowered.api.event.Subscribe;
 import com.velocitypowered.api.event.connection.DisconnectEvent;
 import com.velocitypowered.api.event.player.KickedFromServerEvent;
+import com.velocitypowered.api.event.player.PlayerChooseInitialServerEvent;
 import com.velocitypowered.api.event.proxy.ProxyInitializeEvent;
 import com.velocitypowered.api.event.proxy.ProxyShutdownEvent;
 import com.velocitypowered.api.plugin.Plugin;
@@ -55,6 +56,8 @@ public final class FerrisCraftVelocityPlugin {
     private final String orchestratorUrl;
     private final String apiToken;
     private final Set<String> managedServers = ConcurrentHashMap.newKeySet();
+    private final Set<String> lobbyInstances = ConcurrentHashMap.newKeySet();
+    private final String version;
     private final Set<String> handledTransfers = ConcurrentHashMap.newKeySet();
     private final AtomicBoolean running = new AtomicBoolean(true);
 
@@ -74,6 +77,9 @@ public final class FerrisCraftVelocityPlugin {
             rawUrl = "http://127.0.0.1:8080";
         }
         this.orchestratorUrl = rawUrl.replaceAll("/+$", "");
+
+        String rawVersion = System.getenv("FERRISCRAFT_VERSION");
+        this.version = (rawVersion == null || rawVersion.isBlank()) ? "dev" : rawVersion.trim();
 
         String token = System.getenv("ORCHESTRATOR_TOKEN");
         this.apiToken = (token == null || token.isBlank()) ? null : token.trim();
@@ -114,16 +120,30 @@ public final class FerrisCraftVelocityPlugin {
     }
 
     @Subscribe
+    public void onChooseInitialServer(PlayerChooseInitialServerEvent event) {
+        Optional<RegisteredServer> target = pickLobbyInstance(null).or(() -> proxy.getServer(lobbyServerName));
+        target.ifPresent(event::setInitialServer);
+    }
+
+    @Subscribe
     public void onKickedFromServer(KickedFromServerEvent event) {
         String kickedFrom = event.getServer().getServerInfo().getName();
         if (kickedFrom.equals(lobbyServerName)) {
             return;
         }
-        Optional<RegisteredServer> lobby = proxy.getServer(lobbyServerName);
-        if (lobby.isPresent()) {
-            Component notice = Component.text("Retour au Hub : le serveur de jeu a fermé.", NamedTextColor.YELLOW);
-            event.setResult(KickedFromServerEvent.RedirectPlayer.create(lobby.get(), notice));
+        Optional<RegisteredServer> target = pickLobbyInstance(kickedFrom).or(() -> proxy.getServer(lobbyServerName));
+        if (target.isPresent()) {
+            Component notice = Component.text("Retour au Hub : le serveur a fermé.", NamedTextColor.YELLOW);
+            event.setResult(KickedFromServerEvent.RedirectPlayer.create(target.get(), notice));
         }
+    }
+
+    private Optional<RegisteredServer> pickLobbyInstance(String excluded) {
+        Map<String, Integer> counts = new HashMap<>();
+        for (String name : lobbyInstances) {
+            proxy.getServer(name).ifPresent(reg -> counts.put(name, reg.getPlayersConnected().size()));
+        }
+        return LobbySelector.pick(counts, excluded).flatMap(proxy::getServer);
     }
 
     private void runSseLoop() {
@@ -155,6 +175,7 @@ public final class FerrisCraftVelocityPlugin {
         HttpRequest.Builder req = HttpRequest.newBuilder()
                 .uri(URI.create(orchestratorUrl + "/api/v1/proxy/events"))
                 .header("Accept", "text/event-stream")
+                .header("x-ferriscraft-version", version)
                 .GET();
         if (apiToken != null) {
             req.header("Authorization", "Bearer " + apiToken);
@@ -190,6 +211,7 @@ public final class FerrisCraftVelocityPlugin {
             HttpRequest.Builder req = HttpRequest.newBuilder()
                     .uri(URI.create(orchestratorUrl + "/api/v1/proxy/state"))
                     .timeout(Duration.ofSeconds(4))
+                    .header("x-ferriscraft-version", version)
                     .GET();
             if (apiToken != null) {
                 req.header("Authorization", "Bearer " + apiToken);
@@ -214,7 +236,7 @@ public final class FerrisCraftVelocityPlugin {
                     String name = obj.get("name").getAsString();
                     String address = obj.get("address").getAsString();
                     desired.put(name, address);
-                    upsertServer(name, address);
+                    upsertServer(name, address, isLobby(obj));
                 }
             }
 
@@ -251,7 +273,8 @@ public final class FerrisCraftVelocityPlugin {
             switch (type) {
                 case "server_upsert" -> upsertServer(
                         obj.get("name").getAsString(),
-                        obj.get("address").getAsString()
+                        obj.get("address").getAsString(),
+                        isLobby(obj)
                 );
                 case "server_remove" -> removeServer(obj.get("name").getAsString());
                 case "transfer_player" -> executeTransfer(
@@ -267,9 +290,18 @@ public final class FerrisCraftVelocityPlugin {
         }
     }
 
-    private void upsertServer(String name, String rawAddress) {
+    private static boolean isLobby(JsonObject obj) {
+        return obj.has("kind") && !obj.get("kind").isJsonNull() && "lobby".equals(obj.get("kind").getAsString());
+    }
+
+    private void upsertServer(String name, String rawAddress, boolean lobby) {
         if (name == null || name.isBlank() || rawAddress == null || !rawAddress.contains(":")) {
             return;
+        }
+        if (lobby) {
+            lobbyInstances.add(name);
+        } else {
+            lobbyInstances.remove(name);
         }
         int idx = rawAddress.lastIndexOf(':');
         String host = rawAddress.substring(0, idx);
@@ -299,6 +331,7 @@ public final class FerrisCraftVelocityPlugin {
 
     private void removeServer(String name) {
         managedServers.remove(name);
+        lobbyInstances.remove(name);
         proxy.getServer(name).ifPresent(reg -> {
             proxy.unregisterServer(reg.getServerInfo());
             logger.info("Serveur désenregistré de Velocity: {}", name);
