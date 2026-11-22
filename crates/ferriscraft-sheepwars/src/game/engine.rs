@@ -15,6 +15,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 
 use super::display::lives_line;
 use super::effects::Effects;
+use super::fall_guard::FallGuards;
 use super::flight::{
     EYE_HEIGHT, Flight, LANDING_GRACE_TICKS, MAX_CONCURRENT_FLIGHTS, MAX_FLIGHT_TICKS,
     arms_on_impact, can_launch, chase_detonates, chase_velocity, flight_velocity, fuse_label,
@@ -78,7 +79,7 @@ struct State {
     effects: Effects,
     sheep_kinds: HashMap<i32, SheepKind>,
     last_sheep_damager: HashMap<i32, PlayerId>,
-    fall_protected_until: HashMap<PlayerId, u64>,
+    fall_guards: FallGuards,
     hud: Hud,
     bar: BossBar,
     ticks: u64,
@@ -116,7 +117,7 @@ impl Game {
                 effects: Effects::new(),
                 sheep_kinds: HashMap::new(),
                 last_sheep_damager: HashMap::new(),
-                fall_protected_until: HashMap::new(),
+                fall_guards: FallGuards::new(),
                 hud,
                 bar,
                 ticks: 0,
@@ -317,10 +318,7 @@ impl Game {
 
     pub fn is_fall_protected(&self, uuid: Uuid) -> bool {
         let state = self.lock();
-        state
-            .fall_protected_until
-            .get(&player_id(uuid))
-            .is_some_and(|until| state.ticks <= *until)
+        state.fall_guards.protects(player_id(uuid), state.ticks)
     }
 
     pub fn blocks_hit(&self, attacker: &Player, victim: &Player) -> bool {
@@ -450,8 +448,8 @@ impl Game {
         {
             let mut state = self.lock();
             if rider_attached {
-                let deadline = state.ticks + u64::from(MAX_FLIGHT_TICKS) + 40;
-                state.fall_protected_until.insert(id, deadline);
+                let now = state.ticks;
+                state.fall_guards.board(id, now);
             }
             state.sheep_kinds.insert(sheep.entity_id, kind);
             state.flights.push(Airborne {
@@ -476,6 +474,7 @@ impl Game {
         self.advance_armed().await;
         self.advance_healings().await;
         self.advance_effects().await;
+        self.advance_fall_guards().await;
         self.refresh();
         self.check_phase_changed();
     }
@@ -494,7 +493,7 @@ impl Game {
         state.effects = Effects::new();
         state.sheep_kinds.clear();
         state.last_sheep_damager.clear();
-        state.fall_protected_until.clear();
+        state.fall_guards.clear();
         state.hud.close();
         state.bar.remove();
     }
@@ -676,7 +675,7 @@ impl Game {
         state.effects = Effects::new();
         state.sheep_kinds.clear();
         state.last_sheep_damager.clear();
-        state.fall_protected_until.clear();
+        state.fall_guards.clear();
         for player in state.players.values() {
             for team in TeamId::ALL {
                 state.hud.remove_player(team, &player.name);
@@ -719,7 +718,7 @@ impl Game {
     }
 
     async fn advance_flights(&self) {
-        let (flights, players_with_teams, player_map, current_ticks, void_fall_y) = {
+        let (flights, players_with_teams, player_map, void_fall_y) = {
             let mut state = self.lock();
             if state.flights.is_empty() {
                 return;
@@ -730,13 +729,11 @@ impl Game {
                 .filter_map(|(id, team)| state.players.get(&id).cloned().map(|p| (p, team)))
                 .collect();
             let player_map = state.players.clone();
-            let current_ticks = state.ticks;
             let void_fall_y = state.session.layout().settings().void_fall_y;
             (
                 std::mem::take(&mut state.flights),
                 players_with_teams,
                 player_map,
-                current_ticks,
                 void_fall_y,
             )
         };
@@ -746,7 +743,6 @@ impl Game {
         let mut new_armed = Vec::new();
         let mut new_healings = Vec::new();
         let mut removed_ids = Vec::new();
-        let mut fall_updates: Vec<(PlayerId, u64)> = Vec::new();
 
         for mut airborne in flights {
             let entity_id = airborne.entity.entity_id;
@@ -798,7 +794,6 @@ impl Game {
                     Ok(rider_state) if !rider_state.dead => {
                         if rider_state.sneaking && airborne.flight.age >= LANDING_GRACE_TICKS {
                             airborne.rider_attached = false;
-                            fall_updates.push((airborne.flight.thrower, current_ticks + 40));
                         } else {
                             let rider_pos = vec3(rider_state.player.position);
                             let dx = pos.x - rider_pos.x;
@@ -824,7 +819,6 @@ impl Game {
                                 3.2,
                             );
                             rider.movement.set_velocity(vector(pull));
-                            fall_updates.push((airborne.flight.thrower, current_ticks + 60));
                         }
                     }
                     _ => {
@@ -904,9 +898,6 @@ impl Game {
                         remaining_ticks: fuse_ticks(airborne.flight.kind),
                     });
                 } else {
-                    if airborne.flight.kind == SheepKind::Boarding && airborne.rider_attached {
-                        fall_updates.push((airborne.flight.thrower, current_ticks + 60));
-                    }
                     if self.claim_sheep(entity_id) {
                         children.extend(
                             self.land_at(
@@ -935,12 +926,6 @@ impl Game {
         for id in removed_ids {
             state.sheep_kinds.remove(&id);
             state.last_sheep_damager.remove(&id);
-        }
-        state
-            .fall_protected_until
-            .retain(|_, until| *until >= current_ticks);
-        for (id, deadline) in fall_updates {
-            state.fall_protected_until.insert(id, deadline);
         }
         new_armed.retain(|armed| state.sheep_kinds.contains_key(&armed.entity.entity_id));
         new_healings.retain(|totem| state.sheep_kinds.contains_key(&totem.entity.entity_id));
@@ -1164,6 +1149,36 @@ impl Game {
         }
         next_healings.retain(|totem| state.sheep_kinds.contains_key(&totem.entity.entity_id));
         state.healings.extend(next_healings);
+    }
+
+    async fn advance_fall_guards(&self) {
+        let (guarded, riding, now) = {
+            let mut state = self.lock();
+            let now = state.ticks;
+            state.fall_guards.prune(now);
+            let guarded: Vec<(PlayerId, Player)> = state
+                .fall_guards
+                .airborne()
+                .into_iter()
+                .filter_map(|id| state.players.get(&id).cloned().map(|player| (id, player)))
+                .collect();
+            let riding: Vec<PlayerId> = state
+                .flights
+                .iter()
+                .filter(|airborne| airborne.rider_attached)
+                .map(|airborne| airborne.flight.thrower)
+                .collect();
+            (guarded, riding, now)
+        };
+        for (id, player) in guarded {
+            let Ok(snapshot) = player.get_state().await else {
+                continue;
+            };
+            let grounded = snapshot.on_ground && !riding.contains(&id);
+            self.lock()
+                .fall_guards
+                .observe(id, now, grounded, snapshot.dead);
+        }
     }
 
     async fn advance_effects(&self) {
