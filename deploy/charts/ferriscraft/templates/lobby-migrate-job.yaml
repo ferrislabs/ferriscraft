@@ -1,0 +1,48 @@
+{{- if .Values.lobby.storage.existingDatabaseSecret }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "ferriscraft.fullname" . }}-lobby-migrate
+  labels:
+    {{- include "ferriscraft.labels" . | nindent 4 }}
+    app.kubernetes.io/component: lobby-migrate
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: 6
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels:
+        {{- include "ferriscraft.labels" . | nindent 8 }}
+        app.kubernetes.io/component: lobby-migrate
+    spec:
+      restartPolicy: Never
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: migrate
+          image: {{ include "ferriscraft.image" (dict "global" .Values.global "repository" .Values.lobby.pluginImage.repository "tag" .Values.lobby.pluginImage.tag) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          command: ["/usr/local/bin/ferriscraft-lobby-migrate"]
+          env:
+            - name: RUST_LOG
+              value: info
+            - name: LOBBY_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.lobby.storage.existingDatabaseSecret }}
+                  key: {{ .Values.lobby.storage.databaseUriKey }}
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+{{- end }}

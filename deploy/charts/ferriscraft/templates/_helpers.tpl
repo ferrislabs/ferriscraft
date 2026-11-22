@@ -10,6 +10,9 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 
 {{- define "ferriscraft.image" -}}
 {{- $tag := .tag | default .global.imageTag -}}
+{{- if and .global.immutableTags (or (not $tag) (eq $tag "latest")) -}}
+{{- fail "global.immutableTags: imageTag doit être un sha ou une version, jamais vide ni latest" -}}
+{{- end -}}
 {{- printf "%s/%s:%s" .global.imageRegistry .repository $tag -}}
 {{- end -}}
 
