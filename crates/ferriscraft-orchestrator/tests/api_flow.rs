@@ -6,7 +6,7 @@ use ferriscraft_orchestrator::engine::{FleetEngine, FleetPolicy};
 use ferriscraft_protocol::{
     FleetStatusSnapshot, HeartbeatRequest, JoinQueueRequest, JoinQueueResponse, LeaveQueueRequest,
     LeaveReason, PlayerQueueState, PlayerQueueStatus, ProxyStateSnapshot, QueueJoinStatus,
-    SendToLobbyRequest, ServerPhase, TransferAckRequest,
+    SendToLobbyRequest, ServerPhase, SpectateRequest, TransferAckRequest,
 };
 use futures_util::StreamExt;
 use tokio::net::TcpListener;
@@ -27,7 +27,8 @@ async fn spawn_test_server(token: Option<&str>) -> String {
         ending_timeout: Duration::from_secs(60),
         heartbeat_timeout: Duration::from_secs(30),
     };
-    let state = AppState::new(FleetEngine::new(policy), token.map(str::to_owned));
+    let state = AppState::new(FleetEngine::new(policy), token.map(str::to_owned))
+        .with_version(Some("orch-1".to_owned()));
     let app = build_router(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -79,6 +80,7 @@ async fn end_to_end_queue_matchmaking_sse_and_auth() {
             player_count: 0,
             max_players: 8,
             player_uuids: Vec::new(),
+            version: Some("abc1234".to_owned()),
         })
         .send()
         .await
@@ -198,4 +200,29 @@ async fn end_to_end_queue_matchmaking_sse_and_auth() {
         .unwrap();
     assert_eq!(status.ready_servers, 1);
     assert_eq!(status.max_replicas, 4);
+    assert_eq!(status.orchestrator_version.as_deref(), Some("orch-1"));
+    assert_eq!(status.servers[0].version.as_deref(), Some("abc1234"));
+
+    let spectator = Uuid::new_v4();
+    let spectate = client
+        .post(format!("{base}/api/v1/servers/sheepwars-1/spectate"))
+        .bearer_auth("secret-token")
+        .json(&SpectateRequest {
+            player_uuid: spectator,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(spectate.status(), reqwest::StatusCode::ACCEPTED);
+
+    let unknown = client
+        .post(format!("{base}/api/v1/servers/nope/spectate"))
+        .bearer_auth("secret-token")
+        .json(&SpectateRequest {
+            player_uuid: spectator,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), reqwest::StatusCode::NOT_FOUND);
 }

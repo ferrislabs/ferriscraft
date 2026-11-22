@@ -179,6 +179,7 @@ impl Game {
             player_count,
             max_players,
             player_uuids,
+            version: self.config.version.clone(),
         }
     }
 

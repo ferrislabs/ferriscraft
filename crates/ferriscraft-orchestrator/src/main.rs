@@ -31,7 +31,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let engine = FleetEngine::new(policy);
-    let state = AppState::new(engine, config.api_token.clone());
+    let state =
+        AppState::new(engine, config.api_token.clone()).with_version(config.version.clone());
 
     let reconciler_state = state.clone();
     let reconciler_config = config.clone();

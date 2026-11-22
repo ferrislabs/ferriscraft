@@ -398,6 +398,7 @@ fn sheepwars_full_lifecycle_orchestrator_countdown_combat_and_ephemeral_end() {
             respawn: RespawnRule::Lives(1),
         },
         end_delay_ticks: 6,
+        version: None,
     };
 
     let plugin_task = runtime.spawn(rspigot_plugin::run_with(

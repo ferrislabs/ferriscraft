@@ -25,8 +25,9 @@ use crate::menus::{
     decode_gadgets_click, decode_games_click, decode_options_click,
 };
 use crate::npcs::{CaptainTurn, NpcClickTarget, NpcDirector};
-use crate::orchestrator::{OrchestratorClient, ToggleQueueOutcome};
+use crate::orchestrator::{OrchestratorClient, OrchestratorClientError, ToggleQueueOutcome};
 use crate::prefs::PrefsStore;
+use crate::servers_menu::decode_servers_slot;
 
 const MAX_TASK_TITLE: u32 = 120;
 const MAX_TASK_DESC: u32 = 2000;
@@ -63,6 +64,7 @@ struct SharedState {
     chat: ChatSystem,
     npcs: Arc<NpcDirector>,
     orchestrator: Option<Arc<OrchestratorClient>>,
+    lobby_version: Option<String>,
     sheepwars_queue: RwLock<HashSet<Uuid>>,
     portal_last_blast: RwLock<HashMap<Uuid, Instant>>,
     last_steps: RwLock<HashMap<Uuid, Vector>>,
@@ -100,6 +102,7 @@ impl FerrisCraftLobby {
                 chat: ChatSystem::default(),
                 npcs,
                 orchestrator,
+                lobby_version: crate::config::lobby_version(),
                 sheepwars_queue: RwLock::new(HashSet::new()),
                 portal_last_blast: RwLock::new(HashMap::new()),
                 last_steps: RwLock::new(HashMap::new()),
@@ -853,6 +856,25 @@ impl FerrisCraftLobby {
             return;
         }
 
+        if let Some(ids) = self
+            .state
+            .menus
+            .servers_menu_server_ids(player.uuid, clicked_inv)
+        {
+            if let Some(index) = decode_servers_slot(slot, ids.len()) {
+                player
+                    .sound
+                    .play(SoundCue::new(Sound::UiButtonClick).volume(0.7));
+                player.inventory.close();
+                let lobby = self.clone();
+                let server_id = ids[index].clone();
+                tokio::spawn(async move {
+                    lobby.spectate_server(&player, &server_id).await;
+                });
+            }
+            return;
+        }
+
         if self
             .state
             .menus
@@ -880,6 +902,37 @@ impl FerrisCraftLobby {
                 }
             }
         }
+    }
+
+    async fn spectate_server(&self, player: &Player, server_id: &str) {
+        let Some(client) = &self.state.orchestrator else {
+            player.message.send("§cOrchestrateur non configuré.");
+            return;
+        };
+        match client.spectate(server_id, player.uuid).await {
+            Ok(()) => player
+                .message
+                .send(format!("§aTransfert vers {server_id}…")),
+            Err(OrchestratorClientError::ServerNotFound) => player
+                .message
+                .send(format!("§cServeur {server_id} introuvable.")),
+            Err(OrchestratorClientError::ServerNotJoinable) => player.message.send(format!(
+                "§c{server_id} n'est pas observable pour le moment."
+            )),
+            Err(err) => player
+                .message
+                .send(format!("§cErreur orchestrateur : {err}")),
+        }
+    }
+
+    async fn is_staff(&self, player: &Player) -> bool {
+        let claims = self.state.auth.claims_of(player.uuid);
+        let is_op = player.get_state().await.map(|st| st.op).unwrap_or(false);
+        let has_admin = player.permissions.has("ferriscraft.admin");
+        matches!(
+            Rank::resolve(claims.as_ref(), is_op, has_admin),
+            Rank::Admin | Rank::Dev
+        )
     }
 
     fn show_whoami(&self, player: &Player) {
@@ -2038,6 +2091,42 @@ impl FerrisCraftLobby {
             .sound
             .play(SoundCue::new(Sound::UiButtonClick).volume(0.7));
         if let Err(err) = self.state.menus.open_games(&player).await {
+            ctx.reply(format!("§cImpossible d'ouvrir le menu : {err}"));
+        }
+    }
+
+    #[command("servers")]
+    async fn cmd_servers(&self, ctx: Context) {
+        let player = ctx.sender.clone();
+        if !self.is_staff(&player).await {
+            ctx.reply("§cRéservé au staff.");
+            return;
+        }
+        let Some(client) = &self.state.orchestrator else {
+            ctx.reply("§cOrchestrateur non configuré.");
+            return;
+        };
+        let snapshot = match client.fetch_status().await {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                ctx.reply(format!("§cImpossible de joindre l'orchestrateur : {err}"));
+                return;
+            }
+        };
+        player
+            .sound
+            .play(SoundCue::new(Sound::UiButtonClick).volume(0.7));
+        if let Err(err) = self
+            .state
+            .menus
+            .open_servers(
+                &player.server(),
+                &player,
+                self.state.lobby_version.as_deref(),
+                &snapshot,
+            )
+            .await
+        {
             ctx.reply(format!("§cImpossible d'ouvrir le menu : {err}"));
         }
     }

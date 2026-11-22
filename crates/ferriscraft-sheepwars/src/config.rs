@@ -18,6 +18,7 @@ pub struct SheepWarsConfig {
     pub arena_path: PathBuf,
     pub rules: RoundRules,
     pub end_delay_ticks: u32,
+    pub version: Option<String>,
 }
 
 impl Default for SheepWarsConfig {
@@ -31,6 +32,7 @@ impl Default for SheepWarsConfig {
             arena_path: PathBuf::from(DEFAULT_SETTINGS_FILE),
             rules: RoundRules::default(),
             end_delay_ticks: 20 * 10,
+            version: None,
         }
     }
 }
@@ -89,6 +91,7 @@ impl SheepWarsConfig {
         let end_delay_secs = parse_u32_env("SHEEPWARS_END_DELAY_SECS").unwrap_or(10);
 
         Self {
+            version: non_empty_env("FERRISCRAFT_VERSION"),
             server_id,
             orchestrator_url,
             orchestrator_token,

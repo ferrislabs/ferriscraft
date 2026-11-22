@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use ferriscraft_protocol::{
     FleetStatusSnapshot, JoinQueueRequest, JoinQueueResponse, LeaveQueueRequest,
-    LeaveQueueResponse, LeaveReason, PlayerQueueState, PlayerQueueStatus,
+    LeaveQueueResponse, LeaveReason, PlayerQueueState, PlayerQueueStatus, SpectateRequest,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -14,6 +14,10 @@ pub enum OrchestratorClientError {
     Transport(#[from] reqwest::Error),
     #[error("réponse orchestrateur HTTP {0}")]
     HttpStatus(u16),
+    #[error("serveur introuvable")]
+    ServerNotFound,
+    #[error("serveur non joignable pour le moment")]
+    ServerNotJoinable,
 }
 
 pub struct OrchestratorClient {
@@ -124,6 +128,26 @@ impl OrchestratorClient {
             return Err(OrchestratorClientError::HttpStatus(resp.status().as_u16()));
         }
         Ok(())
+    }
+
+    pub async fn spectate(
+        &self,
+        server_id: &str,
+        player_uuid: Uuid,
+    ) -> Result<(), OrchestratorClientError> {
+        let req = self
+            .apply_auth(self.http.post(format!(
+                "{}/api/v1/servers/{server_id}/spectate",
+                self.base_url
+            )))
+            .json(&SpectateRequest { player_uuid });
+        let resp = req.send().await?;
+        match resp.status().as_u16() {
+            404 => Err(OrchestratorClientError::ServerNotFound),
+            409 => Err(OrchestratorClientError::ServerNotJoinable),
+            code if !resp.status().is_success() => Err(OrchestratorClientError::HttpStatus(code)),
+            _ => Ok(()),
+        }
     }
 
     pub fn cached_snapshot(&self) -> Option<FleetStatusSnapshot> {

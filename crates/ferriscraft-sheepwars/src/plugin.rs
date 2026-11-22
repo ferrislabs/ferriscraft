@@ -15,7 +15,7 @@ use crate::orchestrator::SheepWarsOrchestratorClient;
 
 const ADMIN_PERMISSION: &str = "sheepwars.admin";
 const TICK: Duration = Duration::from_millis(50);
-const ACTIONS: [&str; 5] = ["join", "leave", "hub", "forcestart", "stop"];
+const ACTIONS: [&str; 6] = ["join", "leave", "hub", "version", "forcestart", "stop"];
 const EXPLOSION_YIELD: f32 = 0.0;
 
 struct ArenaGuard {
@@ -132,6 +132,7 @@ impl SheepWarsPlugin {
                 player_count: 0,
                 max_players: u32::try_from(self.config.rules.max_players).unwrap_or(u32::MAX),
                 player_uuids: Vec::new(),
+                version: self.config.version.clone(),
             };
             let _ = orch.send_heartbeat(&starting).await;
         }
@@ -257,6 +258,11 @@ impl SheepWarsPlugin {
             "join" => game.join(player).await,
             "leave" => game.quit(player).await,
             "hub" => game.send_player_hub(player).await,
+            "version" => ctx.reply(format!(
+                "§dSheepWars §8» §7serveur §f{} §8• §7plugin §f{}",
+                self.config.server_id,
+                self.config.version.as_deref().unwrap_or("dev")
+            )),
             "forcestart" | "stop" if !admin => ctx.reply("§cVous ne pouvez pas faire ça."),
             "forcestart" => {
                 if let Err(error) = game.force_start().await {

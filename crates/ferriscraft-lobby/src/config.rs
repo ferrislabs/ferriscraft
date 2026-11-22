@@ -59,6 +59,10 @@ fn non_empty_env(name: &str) -> Option<String> {
         .filter(|val| !val.is_empty())
 }
 
+pub fn lobby_version() -> Option<String> {
+    non_empty_env("FERRISCRAFT_VERSION")
+}
+
 impl EnvConfig {
     pub fn from_env() -> Self {
         let ferriskey_base_url = non_empty_env("FERRISKEY_URL")
