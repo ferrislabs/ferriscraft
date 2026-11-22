@@ -15,6 +15,12 @@ secrets:
 
   existingFerrisKeySecret: ""
 
+progression:
+  # Secret de connexion Postgres créé par CloudNativePG (ex. ferriscraft-db-app).
+  # Vide : progression en mémoire, perdue au redémarrage (dev / k3d uniquement).
+  existingDatabaseSecret: ""
+  databaseUriKey: uri
+
 velocity:
   replicas: 1
   image:
