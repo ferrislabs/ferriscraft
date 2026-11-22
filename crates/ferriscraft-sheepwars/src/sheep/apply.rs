@@ -2,9 +2,9 @@ use std::time::Duration;
 
 use futures_util::future::join_all;
 use rspigot_plugin::{
-    BlockPos, BlockState, BlockType, DyeColor, Effect, EffectType, Entity, EntityType, Error,
-    Explosion, Material, Particle, ParticleBurst, Player, PlayerState, Position, Sound, SoundCue,
-    Vector, World,
+    Attribute, BlockPos, BlockState, BlockType, DyeColor, Effect, EffectType, Entity, EntityType,
+    Error, Explosion, Material, Particle, ParticleBurst, Player, PlayerState, Position, Sound,
+    SoundCue, Vector, World,
 };
 
 use super::catalog::{self, WoolColor};
@@ -178,6 +178,11 @@ pub async fn apply(
                 entity.flags.set_invulnerable(false);
                 entity.name.set(catalog::display_name(kind));
                 entity.name.set_visible(true);
+                if kind == SheepKind::Fragment {
+                    entity
+                        .attributes
+                        .set(Attribute::Scale, catalog::FRAGMENT_SCALE);
+                }
                 entity.set_velocity(vector(velocity));
                 spawned.push((kind, entity, velocity));
             }

@@ -65,11 +65,18 @@ pub const DARKNESS_BLINDNESS_AMPLIFIER: u8 = 0;
 pub const SPLIT_COUNT: u32 = 4;
 pub const SPLIT_HORIZONTAL_SPEED: f64 = 0.85;
 pub const SPLIT_VERTICAL_SPEED: f64 = 0.75;
-pub const SPLIT_CHILD: SheepKind = SheepKind::Explosive;
+pub const SPLIT_CHILD: SheepKind = SheepKind::Fragment;
 pub const SPLIT_PARENT_POWER: f32 = 2.5;
 pub const SPLIT_PARENT_DAMAGE: f32 = 6.0;
 pub const SPLIT_PARENT_DAMAGE_RADIUS: f64 = 4.0;
 pub const SPLIT_PARENT_BREAKS_BLOCKS: bool = true;
+
+pub const FRAGMENT_POWER: f32 = 2.5;
+pub const FRAGMENT_BREAKS_BLOCKS: bool = true;
+pub const FRAGMENT_DAMAGE: f32 = 6.0;
+pub const FRAGMENT_DAMAGE_RADIUS: f64 = 4.0;
+pub const FRAGMENT_SCALE: f64 = 0.5;
+pub const FRAGMENT_LANDING_GRACE_TICKS: u32 = 8;
 
 pub const WARP_RADIUS: f64 = 8.0;
 pub const WARP_PUSH: f64 = 2.0;
@@ -115,6 +122,7 @@ pub const fn display_name(kind: SheepKind) -> &'static str {
         SheepKind::Seeker => "§aMouton chercheur",
         SheepKind::Torpedo => "§3Mouton torpilleur",
         SheepKind::Explosive => "§cMouton explosif",
+        SheepKind::Fragment => "§7Fragment",
         SheepKind::Splitting => "§7Mouton à fragmentation",
         SheepKind::Darkness => "§8Mouton ténébreux",
         SheepKind::Frozen => "§bMouton glacé",
@@ -133,6 +141,7 @@ pub const fn wool_color(kind: SheepKind) -> WoolColor {
         SheepKind::Seeker => WoolColor::Green,
         SheepKind::Torpedo => WoolColor::Cyan,
         SheepKind::Explosive => WoolColor::Red,
+        SheepKind::Fragment => WoolColor::Gray,
         SheepKind::Splitting => WoolColor::Gray,
         SheepKind::Darkness => WoolColor::Black,
         SheepKind::Frozen => WoolColor::LightBlue,
@@ -160,6 +169,7 @@ pub const fn drop_weight(kind: SheepKind) -> u32 {
         SheepKind::Splitting | SheepKind::Darkness | SheepKind::Lightning => 8,
         SheepKind::Warp | SheepKind::Quake => 6,
         SheepKind::Intergalactic => 3,
+        SheepKind::Fragment => 0,
     }
 }
 
@@ -251,6 +261,7 @@ mod tests {
             TORPEDO_DAMAGE,
             SEEKER_DAMAGE,
             SPLIT_PARENT_DAMAGE,
+            FRAGMENT_DAMAGE,
         ] {
             assert!(points <= crate::domain::MAX_NON_LETHAL);
         }
