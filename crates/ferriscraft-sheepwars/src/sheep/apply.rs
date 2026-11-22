@@ -64,7 +64,18 @@ pub async fn apply(
                 duration_ticks,
                 amplifier,
             } => {
-                for (player, _) in matching_players(&live_players, center, radius, team) {
+                let targets: Vec<&Player> = matching_players(&live_players, center, radius, team)
+                    .map(|(player, _)| player)
+                    .collect();
+                tracing::info!(
+                    ?effect,
+                    ?team,
+                    radius,
+                    candidates = live_players.len(),
+                    targets = targets.len(),
+                    "effet de mouton appliqué"
+                );
+                for player in targets {
                     player
                         .effects
                         .add(Effect::new(effect_type(effect), duration_ticks, amplifier));
