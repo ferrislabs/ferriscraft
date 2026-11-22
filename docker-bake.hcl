@@ -29,6 +29,9 @@ group "default" {
 target "_common" {
   dockerfile = "Dockerfile"
   context    = "."
+  args = {
+    FERRISCRAFT_VERSION = EXTRA_TAG != "" ? EXTRA_TAG : IMAGE_TAG
+  }
 }
 
 target "orchestrator" {

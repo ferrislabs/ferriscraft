@@ -14,6 +14,8 @@ use uuid::Uuid;
 pub enum EngineError {
     #[error("serveur inconnu : {0}")]
     UnknownServer(String),
+    #[error("serveur non joignable : {0}")]
+    NotJoinable(String),
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +64,7 @@ struct ManagedServer {
     phase_since: Instant,
     empty_since: Option<Instant>,
     outdated: bool,
+    version: Option<String>,
     registered_on_proxy: bool,
 }
 
@@ -137,6 +140,9 @@ impl ManagedServer {
             max_players: self.max_players,
             ready: self.ready_for_proxy(),
             heartbeat_age_secs,
+            age_secs: now.saturating_duration_since(self.created_at).as_secs(),
+            version: self.version.clone(),
+            outdated: self.outdated,
         }
     }
 }
@@ -278,6 +284,7 @@ impl FleetEngine {
                 phase_since: now,
                 empty_since: None,
                 outdated: false,
+                version: None,
                 registered_on_proxy: false,
             });
     }
@@ -310,6 +317,7 @@ impl FleetEngine {
                 phase_since: now,
                 empty_since: None,
                 outdated: false,
+                version: None,
                 registered_on_proxy: false,
             });
 
@@ -406,6 +414,7 @@ impl FleetEngine {
                 phase_since: now,
                 empty_since: None,
                 outdated: false,
+                version: None,
                 registered_on_proxy: false,
             });
 
@@ -415,6 +424,9 @@ impl FleetEngine {
         }
         let phase_changed = entry.set_phase(now, req.phase);
         entry.player_count = req.player_count;
+        if req.version.is_some() {
+            entry.version = req.version;
+        }
         if req.player_count == 0 {
             entry.empty_since.get_or_insert(now);
         } else {
@@ -501,6 +513,50 @@ impl FleetEngine {
             target_server: command.target_server,
             reason,
         }
+    }
+
+    pub fn queue_spectate_transfer(
+        &mut self,
+        now: Instant,
+        server_id: &str,
+        player_uuid: Uuid,
+    ) -> Result<ProxyEvent, EngineError> {
+        let server = self
+            .servers
+            .get(server_id)
+            .ok_or_else(|| EngineError::UnknownServer(server_id.to_owned()))?;
+        if self.deleting.contains(server_id) || !server.ready_for_proxy() {
+            return Err(EngineError::NotJoinable(server_id.to_owned()));
+        }
+        if let Some(idx) = self.queue.iter().position(|e| e.uuid == player_uuid) {
+            self.queue.remove(idx);
+        }
+        if let Some(old_tid) = self.player_transfers.remove(&player_uuid) {
+            self.transfers.remove(&old_tid);
+        }
+        let transfer_id = Uuid::new_v4();
+        let reason = "spectate".to_owned();
+        let command = TransferCommand {
+            transfer_id,
+            player_uuid,
+            target_server: server_id.to_owned(),
+            reason: reason.clone(),
+        };
+        self.transfers.insert(
+            transfer_id,
+            ActiveTransfer {
+                command,
+                created_at: now,
+                is_lobby_return: false,
+            },
+        );
+        self.player_transfers.insert(player_uuid, transfer_id);
+        Ok(ProxyEvent::TransferPlayer {
+            transfer_id,
+            player_uuid,
+            target_server: server_id.to_owned(),
+            reason,
+        })
     }
 
     pub fn ack_transfer(&mut self, transfer_id: Uuid, _success: bool) {
@@ -853,6 +909,7 @@ impl FleetEngine {
             starting_servers,
             queued_players,
             servers,
+            orchestrator_version: None,
         }
     }
 
@@ -1094,6 +1151,7 @@ mod tests {
                 player_count: 4,
                 max_players: 4,
                 player_uuids: Vec::new(),
+                version: None,
             },
         );
 
@@ -1131,6 +1189,7 @@ mod tests {
                 player_count: 4,
                 max_players: 4,
                 player_uuids: Vec::new(),
+                version: None,
             },
         );
         engine.upsert_infra_server(
@@ -1150,6 +1209,7 @@ mod tests {
                 player_count: 4,
                 max_players: 4,
                 player_uuids: Vec::new(),
+                version: None,
             },
         );
 
@@ -1186,6 +1246,7 @@ mod tests {
                 player_count: 0,
                 max_players: 4,
                 player_uuids: Vec::new(),
+                version: None,
             },
         );
         assert!(hb_events.iter().any(|e| matches!(
@@ -1246,6 +1307,7 @@ mod tests {
                 player_count: players,
                 max_players: 4,
                 player_uuids,
+                version: None,
             },
         );
     }
@@ -1503,5 +1565,65 @@ mod tests {
             .map(|(_, server)| server)
             .collect();
         assert_eq!(targets, ["sheepwars-2", "sheepwars-2"]);
+    }
+
+    #[test]
+    fn summary_reports_version_age_and_outdated_flag() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        infra(&mut engine, t0, "sheepwars-1");
+        engine.apply_heartbeat(
+            t0,
+            HeartbeatRequest {
+                server_id: "sheepwars-1".to_owned(),
+                address: None,
+                phase: ServerPhase::Waiting,
+                player_count: 0,
+                max_players: 4,
+                player_uuids: Vec::new(),
+                version: Some("abc1234".to_owned()),
+            },
+        );
+        heartbeat(&mut engine, t0, "sheepwars-1", ServerPhase::Waiting, 0);
+        engine.mark_outdated("sheepwars-1");
+        let snap = engine.snapshot(t0 + Duration::from_secs(42));
+        let summary = &snap.servers[0];
+        assert_eq!(summary.version.as_deref(), Some("abc1234"));
+        assert_eq!(summary.age_secs, 42);
+        assert!(summary.outdated);
+    }
+
+    #[test]
+    fn spectate_transfers_the_player_and_takes_them_out_of_the_queue() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        infra(&mut engine, t0, "sheepwars-1");
+        heartbeat(&mut engine, t0, "sheepwars-1", ServerPhase::InGame, 2);
+        queue(&mut engine, t0, 10);
+        let event = engine
+            .queue_spectate_transfer(t0, "sheepwars-1", Uuid::from_u128(10))
+            .unwrap();
+        assert!(matches!(
+            event,
+            ProxyEvent::TransferPlayer { ref target_server, ref reason, .. }
+                if target_server == "sheepwars-1" && reason == "spectate"
+        ));
+        assert!(engine.snapshot(t0).queued_players.is_empty());
+    }
+
+    #[test]
+    fn spectate_rejects_unknown_and_ending_servers() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        assert!(matches!(
+            engine.queue_spectate_transfer(t0, "nope", Uuid::from_u128(1)),
+            Err(EngineError::UnknownServer(_))
+        ));
+        infra(&mut engine, t0, "sheepwars-1");
+        heartbeat(&mut engine, t0, "sheepwars-1", ServerPhase::Ending, 1);
+        assert!(matches!(
+            engine.queue_spectate_transfer(t0, "sheepwars-1", Uuid::from_u128(1)),
+            Err(EngineError::NotJoinable(_))
+        ));
     }
 }

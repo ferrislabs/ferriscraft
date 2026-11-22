@@ -38,6 +38,12 @@ pub struct ServerSummary {
     pub max_players: u32,
     pub ready: bool,
     pub heartbeat_age_secs: u64,
+    #[serde(default)]
+    pub age_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub outdated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +56,8 @@ pub struct HeartbeatRequest {
     pub max_players: u32,
     #[serde(default)]
     pub player_uuids: Vec<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,6 +152,8 @@ pub struct FleetStatusSnapshot {
     pub starting_servers: usize,
     pub queued_players: Vec<QueuedPlayerSummary>,
     pub servers: Vec<ServerSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator_version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,6 +213,11 @@ pub struct ProxyDisconnectRequest {
 pub struct SendToLobbyRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpectateRequest {
+    pub player_uuid: Uuid,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -396,6 +411,23 @@ mod tests {
         assert!(json.contains("\"lobby_trail\":\"trail_emerald\""), "{json}");
         let back: PlayerProfile = serde_json::from_str(&json).unwrap();
         assert_eq!(back, profile);
+    }
+
+    #[test]
+    fn heartbeat_from_an_older_server_has_no_version() {
+        let json = r#"{"server_id":"sw-1","phase":"waiting","player_count":0,"max_players":16}"#;
+        let heartbeat: HeartbeatRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(heartbeat.version, None);
+    }
+
+    #[test]
+    fn server_summary_from_an_older_orchestrator_parses() {
+        let json = r#"{"server_id":"sw-1","address":"10.0.0.1:25565","phase":"in_game","player_count":2,"max_players":16,"ready":true,"heartbeat_age_secs":1}"#;
+        let summary: ServerSummary = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            (summary.version, summary.outdated, summary.age_secs),
+            (None, false, 0)
+        );
     }
 
     #[test]

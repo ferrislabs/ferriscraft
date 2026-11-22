@@ -11,7 +11,7 @@ use axum::{Json, Router};
 use ferriscraft_protocol::{
     FleetStatusSnapshot, HeartbeatRequest, JoinQueueRequest, JoinQueueResponse, LeaveQueueRequest,
     LeaveQueueResponse, PhaseUpdateRequest, PlayerQueueStatus, ProxyDisconnectRequest, ProxyEvent,
-    ProxyStateSnapshot, SendToLobbyRequest, TransferAckRequest,
+    ProxyStateSnapshot, SendToLobbyRequest, SpectateRequest, TransferAckRequest,
 };
 use futures_util::stream::{self, Stream};
 use serde_json::json;
@@ -25,6 +25,7 @@ pub struct AppState {
     pub engine: Arc<Mutex<FleetEngine>>,
     pub proxy_tx: broadcast::Sender<ProxyEvent>,
     pub api_token: Option<String>,
+    pub version: Option<String>,
 }
 
 impl AppState {
@@ -34,7 +35,14 @@ impl AppState {
             engine: Arc::new(Mutex::new(engine)),
             proxy_tx,
             api_token,
+            version: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_version(mut self, version: Option<String>) -> Self {
+        self.version = version;
+        self
     }
 
     pub fn emit_proxy_events(&self, events: Vec<ProxyEvent>) {
@@ -48,6 +56,7 @@ pub enum ApiError {
     Unauthorized,
     NotFound(String),
     BadRequest(String),
+    Conflict(String),
 }
 
 impl IntoResponse for ApiError {
@@ -59,6 +68,7 @@ impl IntoResponse for ApiError {
             ),
             Self::NotFound(m) => (StatusCode::NOT_FOUND, m),
             Self::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
+            Self::Conflict(m) => (StatusCode::CONFLICT, m),
         };
         (status, Json(json!({ "error": msg }))).into_response()
     }
@@ -68,6 +78,7 @@ impl From<EngineError> for ApiError {
     fn from(value: EngineError) -> Self {
         match value {
             EngineError::UnknownServer(id) => Self::NotFound(format!("serveur inconnu : {id}")),
+            EngineError::NotJoinable(id) => Self::Conflict(format!("serveur non joignable : {id}")),
         }
     }
 }
@@ -100,6 +111,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/servers", get(list_servers))
         .route("/api/v1/servers/heartbeat", post(server_heartbeat))
         .route("/api/v1/servers/{server_id}/phase", post(update_phase))
+        .route(
+            "/api/v1/servers/{server_id}/spectate",
+            post(spectate_server),
+        )
         .route(
             "/api/v1/players/{uuid}/send-lobby",
             post(send_player_to_lobby),
@@ -141,10 +156,11 @@ async fn get_status(
     headers: HeaderMap,
 ) -> Result<Json<FleetStatusSnapshot>, ApiError> {
     check_auth(&headers, state.api_token.as_deref())?;
-    let snap = {
+    let mut snap = {
         let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
         engine.snapshot(Instant::now())
     };
+    snap.orchestrator_version.clone_from(&state.version);
     Ok(Json(snap))
 }
 
@@ -251,6 +267,21 @@ async fn update_phase(
     };
     state.emit_proxy_events(events);
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn spectate_server(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(server_id): Path<String>,
+    Json(req): Json<SpectateRequest>,
+) -> Result<StatusCode, ApiError> {
+    check_auth(&headers, state.api_token.as_deref())?;
+    let event = {
+        let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
+        engine.queue_spectate_transfer(Instant::now(), &server_id, req.player_uuid)?
+    };
+    state.emit_proxy_events(vec![event]);
+    Ok(StatusCode::ACCEPTED)
 }
 
 async fn send_player_to_lobby(

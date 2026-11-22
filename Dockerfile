@@ -80,6 +80,8 @@ COPY --from=orchestrator-builder /app/target/release/ferriscraft-map-sync /usr/l
 
 USER ferriscraft
 EXPOSE 8080
+ARG FERRISCRAFT_VERSION=dev
+ENV FERRISCRAFT_VERSION=${FERRISCRAFT_VERSION}
 ENTRYPOINT ["/usr/local/bin/ferriscraft-orchestrator"]
 
 # ==============================================================================
@@ -136,6 +138,8 @@ COPY server-sheepwars/bukkit.yml server-sheepwars/permissions.yml server-sheepwa
 COPY --chmod=0755 deploy/docker/rspigot-entrypoint.sh /usr/local/bin/rspigot-entrypoint.sh
 
 EXPOSE 25565 25580 25581
+ARG FERRISCRAFT_VERSION=dev
+ENV FERRISCRAFT_VERSION=${FERRISCRAFT_VERSION}
 ENTRYPOINT ["/usr/local/bin/rspigot-entrypoint.sh"]
 
 # ==============================================================================
@@ -176,6 +180,8 @@ FROM distroless-runtime AS lobby
 
 COPY --from=plugins-builder /usr/local/bin/ferriscraft-lobby /usr/local/bin/ferriscraft-lobby
 COPY --chown=65532:65532 lobby.json /app/lobby.json
+ARG FERRISCRAFT_VERSION=dev
+ENV FERRISCRAFT_VERSION=${FERRISCRAFT_VERSION}
 ENTRYPOINT ["/usr/local/bin/ferriscraft-lobby"]
 
 FROM chef AS sheepwars-cook
@@ -198,6 +204,8 @@ RUN --mount=type=cache,id=ferriscraft-cargo-registry-plugins,sharing=locked,targ
 FROM distroless-runtime AS sheepwars
 
 COPY --from=sheepwars-builder /opt/ferrislabs/ferriscraft/target/release/ferriscraft-sheepwars /usr/local/bin/ferriscraft-sheepwars
+ARG FERRISCRAFT_VERSION=dev
+ENV FERRISCRAFT_VERSION=${FERRISCRAFT_VERSION}
 ENTRYPOINT ["/usr/local/bin/ferriscraft-sheepwars"]
 
 # ==============================================================================
@@ -232,4 +240,6 @@ COPY --from=velocity-builder /build/target/ferriscraft-velocity.jar /app/plugins
 COPY --chmod=0755 deploy/docker/velocity-entrypoint.sh /usr/local/bin/velocity-entrypoint.sh
 
 EXPOSE 25565
+ARG FERRISCRAFT_VERSION=dev
+ENV FERRISCRAFT_VERSION=${FERRISCRAFT_VERSION}
 ENTRYPOINT ["/usr/local/bin/velocity-entrypoint.sh"]

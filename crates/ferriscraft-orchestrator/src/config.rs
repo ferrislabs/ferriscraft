@@ -58,6 +58,7 @@ pub struct OrchestratorConfig {
     pub s3: Option<S3Config>,
     pub s3_cache_ttl: Duration,
     pub fixed_map: Option<String>,
+    pub version: Option<String>,
 }
 
 fn non_empty_env(name: &str) -> Option<String> {
@@ -193,6 +194,7 @@ impl OrchestratorConfig {
             s3: S3Config::from_env()?,
             s3_cache_ttl: Duration::from_secs(parse_u64_env("S3_CACHE_TTL_SECS", 30).max(1)),
             fixed_map: non_empty_env("SHEEPWARS_MAP"),
+            version: non_empty_env("FERRISCRAFT_VERSION"),
         })
     }
 }

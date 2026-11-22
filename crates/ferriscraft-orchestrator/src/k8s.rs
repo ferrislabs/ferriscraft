@@ -489,6 +489,7 @@ mod tests {
             s3: None,
             s3_cache_ttl: Duration::from_secs(30),
             fixed_map: None,
+            version: None,
         }
     }
 
