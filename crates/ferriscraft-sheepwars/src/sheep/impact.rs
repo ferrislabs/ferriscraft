@@ -48,6 +48,10 @@ pub enum ParticleKind {
     Heart,
     Portal,
     LargeSmoke,
+    TeamDust(TeamId),
+    EndRod,
+    Firework,
+    Totem,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

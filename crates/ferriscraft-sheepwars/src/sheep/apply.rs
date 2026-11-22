@@ -2,9 +2,9 @@ use std::time::Duration;
 
 use futures_util::future::join_all;
 use rspigot_plugin::{
-    Attribute, BlockPos, BlockState, BlockType, DyeColor, Effect, EffectType, Entity, EntityType,
-    Error, Explosion, Material, Particle, ParticleBurst, Player, PlayerState, Position, Sound,
-    SoundCue, Vector, World,
+    Attribute, BlockPos, BlockState, BlockType, Color, DyeColor, Effect, EffectType, Entity,
+    EntityType, Error, Explosion, Material, Particle, ParticleBurst, Player, PlayerState, Position,
+    Sound, SoundCue, Vector, World,
 };
 
 use super::catalog::{self, WoolColor};
@@ -529,6 +529,13 @@ const fn block_pos(c: Cell) -> BlockPos {
     }
 }
 
+const fn team_color(team: TeamId) -> Color {
+    match team {
+        TeamId::Red => Color::rgb(255, 70, 70),
+        TeamId::Blue => Color::rgb(70, 110, 255),
+    }
+}
+
 const fn particle(kind: ParticleKind) -> Particle {
     match kind {
         ParticleKind::Explosion => Particle::Explosion,
@@ -538,6 +545,13 @@ const fn particle(kind: ParticleKind) -> Particle {
         ParticleKind::Heart => Particle::Heart,
         ParticleKind::Portal => Particle::Portal,
         ParticleKind::LargeSmoke => Particle::LargeSmoke,
+        ParticleKind::TeamDust(team) => Particle::Dust {
+            color: team_color(team),
+            scale: 1.2,
+        },
+        ParticleKind::EndRod => Particle::EndRod,
+        ParticleKind::Firework => Particle::Firework,
+        ParticleKind::Totem => Particle::TotemOfUndying,
     }
 }
 

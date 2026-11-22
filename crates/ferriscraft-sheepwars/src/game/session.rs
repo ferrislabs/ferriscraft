@@ -381,10 +381,13 @@ impl Session {
                 }
             }
             RoundEvent::SheepDue(team) => intents.extend(self.sheep_for(team)),
-            RoundEvent::Won(team) => intents.push(Intent::Title {
-                text: "§6Victoire !".to_owned(),
-                subtitle: format!("Équipe {}{}", team_prefix(team), team_name(team)),
-            }),
+            RoundEvent::Won(team) => {
+                intents.push(Intent::Title {
+                    text: "§6Victoire !".to_owned(),
+                    subtitle: format!("Équipe {}{}", team_prefix(team), team_name(team)),
+                });
+                intents.push(Intent::Celebrate { team });
+            }
             RoundEvent::Draw => intents.push(Intent::Title {
                 text: "§6Égalité".to_owned(),
                 subtitle: "Personne ne gagne".to_owned(),
@@ -604,6 +607,14 @@ mod tests {
         let intents = session.die(A);
         assert!(intents.contains(&Intent::Spectate { player: A }));
         assert_eq!(session.respawn_point(A), session.layout().lobby());
+    }
+
+    #[test]
+    fn a_win_also_celebrates_for_the_winning_team() {
+        let mut session = started();
+        session.die(A);
+        let intents = session.die(A);
+        assert!(intents.contains(&Intent::Celebrate { team: TeamId::Blue }));
     }
 
     #[test]

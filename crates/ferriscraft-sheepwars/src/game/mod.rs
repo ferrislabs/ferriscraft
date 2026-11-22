@@ -1,3 +1,4 @@
+mod cosmetics;
 mod display;
 mod effects;
 mod engine;
