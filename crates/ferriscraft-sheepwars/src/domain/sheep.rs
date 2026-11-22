@@ -13,6 +13,7 @@ pub enum SheepKind {
     Quake,
     Warp,
     Intergalactic,
+    Fragment,
 }
 
 impl SheepKind {
