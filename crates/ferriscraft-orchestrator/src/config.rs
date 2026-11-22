@@ -60,6 +60,7 @@ pub struct OrchestratorConfig {
     pub fixed_map: Option<String>,
     pub version: Option<String>,
     pub use_crd: bool,
+    pub progression_database_url: Option<String>,
 }
 
 fn non_empty_env(name: &str) -> Option<String> {
@@ -198,6 +199,7 @@ impl OrchestratorConfig {
             version: non_empty_env("FERRISCRAFT_VERSION"),
             use_crd: non_empty_env("SHEEPWARS_CRD_ENABLED")
                 .is_some_and(|v| v.eq_ignore_ascii_case("true") || v == "1"),
+            progression_database_url: non_empty_env("PROGRESSION_DATABASE_URL"),
         })
     }
 }

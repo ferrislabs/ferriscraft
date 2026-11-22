@@ -2,7 +2,10 @@ use ferriscraft_orchestrator::api::{AppState, build_router};
 use ferriscraft_orchestrator::config::{BackendMode, OrchestratorConfig};
 use ferriscraft_orchestrator::engine::{FleetEngine, FleetPolicy};
 use ferriscraft_orchestrator::k8s::run_k8s_reconcile_loop;
+use ferriscraft_orchestrator::progression::{ProgressionService, ProgressionStore};
 use ferriscraft_orchestrator::static_backend::run_static_reconcile_loop;
+use ferriscraft_progression::MemoryProgressionRepository;
+use ferriscraft_progression_pg::PgProgressionRepository;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -31,8 +34,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let engine = FleetEngine::new(policy);
-    let state =
-        AppState::new(engine, config.api_token.clone()).with_version(config.version.clone());
+    let store = match config.progression_database_url.as_deref() {
+        Some(url) => match PgProgressionRepository::connect(url).await {
+            Ok(repo) => ProgressionStore::Postgres(repo),
+            Err(err) => {
+                tracing::error!(error = %err, "connexion à la base de progression impossible");
+                std::process::exit(1);
+            }
+        },
+        None => {
+            tracing::warn!("progression en mémoire, perdue au redémarrage");
+            ProgressionStore::Memory(MemoryProgressionRepository::default())
+        }
+    };
+    let state = AppState::new(engine, config.api_token.clone())
+        .with_version(config.version.clone())
+        .with_progression(ProgressionService::new(store));
 
     let reconciler_state = state.clone();
     let reconciler_config = config.clone();
