@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -206,4 +208,213 @@ pub struct SendToLobbyRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PhaseUpdateRequest {
     pub phase: ServerPhase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GameKind {
+    SheepWars,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchOutcome {
+    Win,
+    Loss,
+    Draw,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlayerRank {
+    Admin,
+    Mod,
+    Dev,
+    Vip,
+    Member,
+    Guest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatchParticipant {
+    pub uuid: Uuid,
+    pub name: String,
+    pub outcome: MatchOutcome,
+    /// Played until the end of the round or until eliminated.
+    pub completed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatchReport {
+    pub match_id: Uuid,
+    pub game: GameKind,
+    pub server_id: String,
+    pub forced_start: bool,
+    pub duration_secs: u32,
+    pub participants: Vec<MatchParticipant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LevelProgress {
+    pub level: u32,
+    pub xp_into_level: u64,
+    pub xp_for_next: u64,
+    pub total_xp: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlayerReward {
+    pub uuid: Uuid,
+    pub xp: u64,
+    pub coins: u64,
+    pub game: LevelProgress,
+    pub game_level_up: bool,
+    pub network: LevelProgress,
+    pub network_level_up: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatchReportAck {
+    pub match_id: Uuid,
+    pub counted: bool,
+    pub duplicate: bool,
+    pub rewards: Vec<PlayerReward>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CosmeticSlot {
+    LobbyGadget,
+    LobbyTrail,
+    SheepTrail,
+    VictoryEffect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CosmeticId {
+    GadgetFeatherDash,
+    GadgetFireworkRocket,
+    GadgetWindCharge,
+    GadgetSheepCannon,
+    GadgetVortexWand,
+    GadgetEnderGrapple,
+    TrailFlame,
+    TrailHeart,
+    TrailMagic,
+    TrailEmerald,
+    SheepTrailFlame,
+    SheepTrailHearts,
+    SheepTrailNotes,
+    SheepTrailRainbow,
+    VictoryFireworks,
+    VictoryLightning,
+    /// Added by a newer version: ignored.
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GameStats {
+    pub game: GameKind,
+    pub progress: LevelProgress,
+    pub played: u32,
+    pub wins: u32,
+    pub losses: u32,
+    pub draws: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlayerProfile {
+    pub uuid: Uuid,
+    pub name: String,
+    pub rank: PlayerRank,
+    pub coins: u64,
+    pub network: LevelProgress,
+    pub games: Vec<GameStats>,
+    pub unlocked: Vec<CosmeticId>,
+    pub equipped: BTreeMap<CosmeticSlot, CosmeticId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlayerIdentityUpdate {
+    pub name: String,
+    pub rank: PlayerRank,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PurchaseRequest {
+    pub cosmetic: CosmeticId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EquipRequest {
+    pub slot: CosmeticSlot,
+    pub cosmetic: Option<CosmeticId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminCoinGrant {
+    pub amount: u64,
+    pub admin: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_cosmetic_from_newer_version_deserializes_as_unknown() {
+        let id: CosmeticId = serde_json::from_str("\"pet_dragon\"").unwrap();
+        assert_eq!(id, CosmeticId::Unknown);
+    }
+
+    #[test]
+    fn cosmetic_ids_use_snake_case_on_the_wire() {
+        let json = serde_json::to_string(&CosmeticId::SheepTrailHearts).unwrap();
+        assert_eq!(json, "\"sheep_trail_hearts\"");
+    }
+
+    #[test]
+    fn profile_round_trips_with_equipped_map() {
+        let profile = PlayerProfile {
+            uuid: Uuid::nil(),
+            name: "Steve".into(),
+            rank: PlayerRank::Vip,
+            coins: 120,
+            network: LevelProgress {
+                level: 1,
+                xp_into_level: 150,
+                xp_for_next: 1000,
+                total_xp: 150,
+            },
+            games: vec![],
+            unlocked: vec![CosmeticId::TrailEmerald],
+            equipped: BTreeMap::from([(CosmeticSlot::LobbyTrail, CosmeticId::TrailEmerald)]),
+        };
+        let json = serde_json::to_string(&profile).unwrap();
+        assert!(json.contains("\"lobby_trail\":\"trail_emerald\""), "{json}");
+        let back: PlayerProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, profile);
+    }
+
+    #[test]
+    fn match_report_uses_snake_case_enums() {
+        let report = MatchReport {
+            match_id: Uuid::nil(),
+            game: GameKind::SheepWars,
+            server_id: "sheepwars-1".into(),
+            forced_start: false,
+            duration_secs: 300,
+            participants: vec![MatchParticipant {
+                uuid: Uuid::nil(),
+                name: "Alex".into(),
+                outcome: MatchOutcome::Draw,
+                completed: true,
+            }],
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"game\":\"sheep_wars\""), "{json}");
+        assert!(json.contains("\"outcome\":\"draw\""), "{json}");
+    }
 }

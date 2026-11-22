@@ -16,6 +16,7 @@ rspigot-domain = { path = "/opt/minecraft/dev/rspigot/crates/rspigot-domain" }
 rspigot-nbt = { path = "/opt/minecraft/dev/rspigot/crates/rspigot-nbt" }
 rspigot-plugins = { path = "/opt/minecraft/dev/rspigot/crates/rspigot-plugins" }
 
+ferriscraft-progression = { path = "crates/ferriscraft-progression" }
 ferriscraft-protocol = { path = "crates/ferriscraft-protocol" }
 
 axum = "0.8"
@@ -26,6 +27,7 @@ dotenvy = "0.15"
 futures-util = "0.3"
 k8s-openapi = { version = "0.24", features = ["v1_31"] }
 kube = { version = "0.98", default-features = false, features = ["client", "runtime", "rustls-tls"] }
+proptest = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
