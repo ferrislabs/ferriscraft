@@ -391,7 +391,7 @@ async fn join_queue(
             Some(seq) => engine.join_queue_with_seq(now, req, seq),
             None => engine.join_queue(now, req),
         };
-        let actions = engine.tick(now);
+        let events = engine.dispatch(now);
         let snap = engine.snapshot(now);
         let post_status = engine.player_status(now, player_uuid);
         let mut updated = resp;
@@ -405,7 +405,7 @@ async fn join_queue(
         } else if let Some(pos) = post_status.position {
             updated.position = pos;
         }
-        (updated, actions.proxy_events)
+        (updated, events)
     };
     state.flush_queue().await?;
     state.emit_proxy_events(events);
@@ -449,8 +449,7 @@ async fn server_heartbeat(
         let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         let mut events = engine.apply_heartbeat(now, req);
-        let actions = engine.tick(now);
-        events.extend(actions.proxy_events);
+        events.extend(engine.dispatch(now));
         events
     };
     state.flush_queue_logged().await;
@@ -485,8 +484,7 @@ async fn update_phase(
         let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         let mut events = engine.update_server_phase(now, &server_id, req.phase)?;
-        let actions = engine.tick(now);
-        events.extend(actions.proxy_events);
+        events.extend(engine.dispatch(now));
         events
     };
     state.flush_queue_logged().await;

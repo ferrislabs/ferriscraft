@@ -978,7 +978,27 @@ impl FleetEngine {
     }
 
     pub fn tick(&mut self, now: Instant) -> TickActions {
-        let mut actions = TickActions::default();
+        let mut actions = TickActions {
+            proxy_events: self.dispatch(now),
+            ..TickActions::default()
+        };
+
+        let (to_create, to_delete) = self.plan_fleet_actions(now);
+        actions.servers_to_create = to_create;
+        for deletion in to_delete {
+            if let Some(ev) = self.mark_deleting(now, &deletion.server_id) {
+                actions.proxy_events.push(ev);
+            }
+            actions.servers_to_delete.push(deletion);
+        }
+
+        actions
+    }
+
+    /// Expires transfers and dispatches queued players without planning the fleet.
+    /// Only the reconciler executes deletions, so only it may call [`Self::tick`].
+    pub fn dispatch(&mut self, now: Instant) -> Vec<ProxyEvent> {
+        let mut events = Vec::new();
 
         // 1. Expire timed-out transfers so stuck entries never block players indefinitely.
         let expired: Vec<(Uuid, Uuid)> = self
@@ -1011,28 +1031,14 @@ impl FleetEngine {
             if let Some(lobby) = self.lobbies.remove(&id)
                 && lobby.registered_on_proxy
             {
-                actions
-                    .proxy_events
-                    .push(ProxyEvent::ServerRemove { name: lobby.id });
+                events.push(ProxyEvent::ServerRemove { name: lobby.id });
             }
         }
 
         // 2. Dispatch queued players onto available SheepWars servers.
-        actions
-            .proxy_events
-            .extend(self.dispatch_queued_players(now));
+        events.extend(self.dispatch_queued_players(now));
 
-        // 3. Plan scaling actions (create up to k max, delete Ending/stuck/excess idle servers).
-        let (to_create, to_delete) = self.plan_fleet_actions(now);
-        actions.servers_to_create = to_create;
-        for deletion in to_delete {
-            if let Some(ev) = self.mark_deleting(now, &deletion.server_id) {
-                actions.proxy_events.push(ev);
-            }
-            actions.servers_to_delete.push(deletion);
-        }
-
-        actions
+        events
     }
 
     fn dispatch_queued_players(&mut self, now: Instant) -> Vec<ProxyEvent> {
@@ -1951,6 +1957,21 @@ mod tests {
         heartbeat(&mut engine, t0, "sheepwars-1", ServerPhase::Ending, 0);
         assert_eq!(deleted(&engine.tick(t0)).len(), 1);
         assert!(deleted(&engine.tick(t0 + Duration::from_secs(1))).is_empty());
+    }
+
+    #[test]
+    fn dispatch_between_ticks_leaves_reaping_to_the_reconciler() {
+        let mut engine = FleetEngine::new(test_policy());
+        let t0 = Instant::now();
+        engine.register_creating_server(t0, "sheepwars-stuck".to_owned(), None);
+        let timed_out = t0 + Duration::from_secs(120);
+
+        engine.dispatch(timed_out);
+
+        assert_eq!(
+            deleted(&engine.tick(timed_out)),
+            vec![("sheepwars-stuck", DeletionReason::StartingTimeout)]
+        );
     }
 
     fn waiting(engine: &mut FleetEngine, now: Instant, id: &str) {
