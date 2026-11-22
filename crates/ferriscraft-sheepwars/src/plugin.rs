@@ -503,6 +503,10 @@ impl SheepWarsPlugin {
         event.cancel();
     }
 
+    async fn on_player_sign_open(&self, event: &mut PlayerSignOpen) {
+        event.cancel();
+    }
+
     async fn on_block_place(&self, event: &mut BlockPlace) {
         event.cancel();
     }
