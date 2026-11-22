@@ -87,7 +87,9 @@ COPY --from=orchestrator-builder /app/target/release/ferriscraft-migrate /usr/lo
 USER ferriscraft
 EXPOSE 8080
 ARG FERRISCRAFT_VERSION=dev
-ENV FERRISCRAFT_VERSION=${FERRISCRAFT_VERSION}
+ARG RSPIGOT_REF=local
+ENV FERRISCRAFT_VERSION=${FERRISCRAFT_VERSION} \
+    RSPIGOT_REF=${RSPIGOT_REF}
 ENTRYPOINT ["/usr/local/bin/ferriscraft-orchestrator"]
 
 # ==============================================================================
@@ -145,7 +147,9 @@ COPY --chmod=0755 deploy/docker/rspigot-entrypoint.sh /usr/local/bin/rspigot-ent
 
 EXPOSE 25565 25580 25581
 ARG FERRISCRAFT_VERSION=dev
-ENV FERRISCRAFT_VERSION=${FERRISCRAFT_VERSION}
+ARG RSPIGOT_REF=local
+ENV FERRISCRAFT_VERSION=${FERRISCRAFT_VERSION} \
+    RSPIGOT_REF=${RSPIGOT_REF}
 ENTRYPOINT ["/usr/local/bin/rspigot-entrypoint.sh"]
 
 # ==============================================================================
@@ -187,7 +191,9 @@ FROM distroless-runtime AS lobby
 COPY --from=plugins-builder /usr/local/bin/ferriscraft-lobby /usr/local/bin/ferriscraft-lobby
 COPY --chown=65532:65532 lobby.json /app/lobby.json
 ARG FERRISCRAFT_VERSION=dev
-ENV FERRISCRAFT_VERSION=${FERRISCRAFT_VERSION}
+ARG RSPIGOT_REF=local
+ENV FERRISCRAFT_VERSION=${FERRISCRAFT_VERSION} \
+    RSPIGOT_REF=${RSPIGOT_REF}
 ENTRYPOINT ["/usr/local/bin/ferriscraft-lobby"]
 
 FROM chef AS sheepwars-cook
@@ -211,7 +217,9 @@ FROM distroless-runtime AS sheepwars
 
 COPY --from=sheepwars-builder /opt/ferrislabs/ferriscraft/target/release/ferriscraft-sheepwars /usr/local/bin/ferriscraft-sheepwars
 ARG FERRISCRAFT_VERSION=dev
-ENV FERRISCRAFT_VERSION=${FERRISCRAFT_VERSION}
+ARG RSPIGOT_REF=local
+ENV FERRISCRAFT_VERSION=${FERRISCRAFT_VERSION} \
+    RSPIGOT_REF=${RSPIGOT_REF}
 ENTRYPOINT ["/usr/local/bin/ferriscraft-sheepwars"]
 
 # ==============================================================================
@@ -247,5 +255,7 @@ COPY --chmod=0755 deploy/docker/velocity-entrypoint.sh /usr/local/bin/velocity-e
 
 EXPOSE 25565
 ARG FERRISCRAFT_VERSION=dev
-ENV FERRISCRAFT_VERSION=${FERRISCRAFT_VERSION}
+ARG RSPIGOT_REF=local
+ENV FERRISCRAFT_VERSION=${FERRISCRAFT_VERSION} \
+    RSPIGOT_REF=${RSPIGOT_REF}
 ENTRYPOINT ["/usr/local/bin/velocity-entrypoint.sh"]
