@@ -1,0 +1,95 @@
+{{- if and .Values.orchestrator.towerwars.enabled .Values.orchestrator.towerwars.crd.enabled }}
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: '-1'
+    helm.sh/resource-policy: keep
+  name: towerwarsservers.ferriscraft.io
+spec:
+  group: ferriscraft.io
+  names:
+    categories: []
+    kind: TowerWarsServer
+    plural: towerwarsservers
+    shortNames:
+    - tws
+    singular: towerwarsserver
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.players
+      name: Players
+      type: integer
+    - jsonPath: .status.version
+      name: Version
+      type: string
+    - jsonPath: .status.outdated
+      name: Outdated
+      type: boolean
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for TowerWarsServerSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              map:
+                nullable: true
+                type: string
+              templateHash:
+                type: string
+            required:
+            - templateHash
+            type: object
+          status:
+            nullable: true
+            properties:
+              maxPlayers:
+                format: uint32
+                minimum: 0.0
+                type: integer
+              outdated:
+                type: boolean
+              phase:
+                enum:
+                - starting
+                - waiting
+                - countdown
+                - in_game
+                - ending
+                type: string
+              phaseSince:
+                type: string
+              players:
+                format: uint32
+                minimum: 0.0
+                type: integer
+              ready:
+                type: boolean
+              version:
+                nullable: true
+                type: string
+            required:
+            - maxPlayers
+            - outdated
+            - phase
+            - phaseSince
+            - players
+            - ready
+            type: object
+        required:
+        - spec
+        title: TowerWarsServer
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+{{- end }}

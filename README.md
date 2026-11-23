@@ -9,12 +9,13 @@ Workspace Rust des plugins **FerrisCraft** ciblant `rspigot` (`/opt/minecraft/de
 | **Velocity 4.3.1** | Proxy d'entrée (`online-mode = true`, forwarding HMAC-SHA256 `modern`) | **`0.0.0.0:25565`** | — | `./proxy/` |
 | **`rspigot` Lobby** | Hub principal + plugin `ferriscraft-lobby` | `127.0.0.1:25566` | `127.0.0.1:25580` | `./server/` |
 | **`rspigot` SheepWars** | Serveur mini-jeu SheepWars | `127.0.0.1:25567` | `127.0.0.1:25581` | `./server-sheepwars/` |
+| **`rspigot` TowerWars** | Serveur mini-jeu TowerWars | `127.0.0.1:25568` | `127.0.0.1:25582` | `./server-towerwars/` |
 
 - Les joueurs se connectent toujours sur **`localhost:25565`** (Velocity).
 - Cliquer sur le plot **SheepWars** (ou dans la **Boussole** / `/sheepwars`) vérifie si `127.0.0.1:25567` est démarré :
   - **S'il tourne** : transfert automatique vers `sheepwars` via Velocity (`sheepwars.localhost:25565` → `forced-hosts`).
   - **S'il est éteint** : inscription propre dans la file d'attente locale du Lobby sans déconnecter le joueur.
-- Les commandes proxy natives `/server sheepwars` et `/server lobby` fonctionnent également en jeu.
+- Les commandes proxy natives `/server sheepwars`, `/server towerwars` et `/server lobby` fonctionnent également en jeu.
 
 ---
 
@@ -84,6 +85,22 @@ RSPIGOT_URL=http://127.0.0.1:25581 RSPIGOT_PLUGIN_NAME=ferriscraft-sheepwars car
 ```
 
 *(Optionnel : ajouter `ORCHESTRATOR_URL=http://127.0.0.1:8080` et `SERVER_ID=sheepwars-1` si l'orchestrateur local tourne ; sinon le plugin enchaîne les manches sur place. En jeu : `/sheepwars join|leave|hub` et admin `/sheepwars forcestart|stop`.)*
+
+### Terminal 6 — Serveur `rspigot` TowerWars (`:25568`, gRPC `:25582`)
+
+```bash
+/opt/minecraft/dev/rspigot/target/release/rspigot --world-dir ./server-towerwars
+```
+
+### Terminal 7 — Plugin `ferriscraft-towerwars`
+
+```bash
+RSPIGOT_URL=http://127.0.0.1:25582 RSPIGOT_PLUGIN_NAME=ferriscraft-towerwars cargo run --release -p ferriscraft-towerwars
+```
+
+*(Optionnel : ajouter `ORCHESTRATOR_URL=http://127.0.0.1:8080` et `SERVER_ID=towerwars-1` si l'orchestrateur local tourne. En jeu : `/towerwars join|leave|hub` et admin `/towerwars forcestart|stop`, réservés à `op` ou à la permission `towerwars.admin`.)*
+
+Variables du plugin : `TOWERWARS_MODE` (`solo` ou `teams`), `TOWERWARS_MIN_PLAYERS` (1), `TOWERWARS_MAX_PLAYERS` (6), `TOWERWARS_COUNTDOWN_SECS`, `TOWERWARS_EPHEMERAL`, `TOWERWARS_SEED`, `TOWERWARS_MAP_PATH`. Sans `TOWERWARS_MAP_PATH`, le plugin construit sa carte intégrée dans un monde vide au démarrage : aucun `world.zip` ni map S3 n'est nécessaire.
 
 ---
 
@@ -171,6 +188,20 @@ Téléverser une nouvelle map (vers `k3d-ferriscraft` via port-forward automatiq
 # ou explicitement :
 ./deploy/scripts/upload-map.sh ma-map /chemin/world.zip /chemin/arena.json
 ```
+
+### TowerWars sur Kubernetes
+
+TowerWars est désactivé par défaut (`orchestrator.towerwars.enabled=false`) : le chart ne rend alors rien de plus qu'avant. `values-k3d.yaml` l'active pour les tests locaux. La taille de partie (1 à 4) est choisie au lobby : la file est groupée par taille et `queueMinPlayers` est ignoré pour TowerWars. Il a sa propre file, sa propre flotte (`TOWERWARS_*`) et son CRD `towerwarsservers.ferriscraft.io` (`kubectl get tws`, activé par `orchestrator.towerwars.crd.enabled`).
+
+```bash
+K3D_CLUSTER=capitainerie IMAGE_TAG=dev ./deploy/scripts/build-images.sh towerwars
+helm upgrade --install ferriscraft ./deploy/charts/ferriscraft \
+  --namespace ferriscraft --create-namespace \
+  -f ./deploy/charts/ferriscraft/values-k3d.yaml \
+  --set orchestrator.towerwars.maxReplicas=4
+```
+
+Voir [`docs/TOWERWARS_PLUGIN_CONTRACT.md`](./docs/TOWERWARS_PLUGIN_CONTRACT.md) pour le contrat du sidecar `ferriscraft-towerwars`, et [`docs/adr/0011-un-moteur-de-flotte-par-jeu.md`](./docs/adr/0011-un-moteur-de-flotte-par-jeu.md) pour l'architecture.
 
 Voir [`docs/SHEEPWARS_PLUGIN_CONTRACT.md`](./docs/SHEEPWARS_PLUGIN_CONTRACT.md) pour les variables d'environnement et le contrat du sidecar `ferriscraft-sheepwars`.
 

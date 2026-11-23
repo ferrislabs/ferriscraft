@@ -27,7 +27,7 @@ function "image_tags" {
 }
 
 group "default" {
-  targets = ["orchestrator", "velocity", "rspigot", "lobby", "sheepwars"]
+  targets = ["orchestrator", "velocity", "rspigot", "lobby", "sheepwars", "towerwars"]
 }
 
 target "_common" {
@@ -76,4 +76,13 @@ target "sheepwars" {
     rspigot-src = RSPIGOT_DIR
   }
   tags = image_tags("ferriscraft-sheepwars-plugin")
+}
+
+target "towerwars" {
+  inherits = ["_common"]
+  target   = "towerwars"
+  contexts = {
+    rspigot-src = RSPIGOT_DIR
+  }
+  tags = image_tags("ferriscraft-towerwars-plugin")
 }

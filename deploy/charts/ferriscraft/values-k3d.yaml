@@ -16,6 +16,12 @@ orchestrator:
     maxReplicas: 5
     standbyServers: 1
     idleTtlSecs: 60
+  towerwars:
+    enabled: true
+    minReplicas: 0
+    maxReplicas: 2
+    standbyServers: 1
+    idleTtlSecs: 60
 
 lobby:
   replicas: 1

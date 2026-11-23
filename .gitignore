@@ -37,3 +37,15 @@
 /server-sheepwars/spigot.yml
 /server-sheepwars/world/
 /server-sheepwars/world_rspigot_*/
+
+# Fichiers runtime du serveur rspigot TowerWars (config exemple dans server-towerwars/spigot.yml.example)
+/server-towerwars/logs/
+/server-towerwars/crash-reports/
+/server-towerwars/ops.json
+/server-towerwars/whitelist.json
+/server-towerwars/banned-players.json
+/server-towerwars/banned-ips.json
+/server-towerwars/usercache.json
+/server-towerwars/spigot.yml
+/server-towerwars/world/
+/server-towerwars/world_rspigot_*/

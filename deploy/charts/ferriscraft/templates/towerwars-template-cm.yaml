@@ -1,0 +1,108 @@
+{{- if .Values.orchestrator.towerwars.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ferriscraft.fullname" . }}-towerwars-template
+  labels:
+    {{- include "ferriscraft.labels" . | nindent 4 }}
+    app.kubernetes.io/component: orchestrator
+data:
+  pod-template.yaml: |
+    metadata:
+      labels:
+        app.kubernetes.io/name: ferriscraft
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: towerwars
+    spec:
+      restartPolicy: Never
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.towerwars.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.towerwars.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: rspigot
+          image: {{ include "ferriscraft.image" (dict "global" .Values.global "repository" .Values.towerwars.rspigotImage.repository "tag" .Values.towerwars.rspigotImage.tag) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          env:
+            - name: RSPIGOT_MODE
+              value: "towerwars"
+            - name: SERVER_PORT
+              value: {{ .Values.towerwars.port | quote }}
+            - name: PLUGIN_GRPC_BIND
+              value: {{ printf "127.0.0.1:%d" (int .Values.towerwars.grpcPort) | quote }}
+            - name: TOWERWARS_MAX_PLAYERS
+              value: {{ .Values.orchestrator.towerwars.maxPlayers | quote }}
+          ports:
+            - name: minecraft
+              containerPort: {{ .Values.towerwars.port }}
+              protocol: TCP
+            - name: grpc-plugin
+              containerPort: {{ .Values.towerwars.grpcPort }}
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.towerwars.port }}
+            initialDelaySeconds: 2
+            periodSeconds: 2
+          livenessProbe:
+            tcpSocket:
+              port: {{ .Values.towerwars.port }}
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          {{- with .Values.towerwars.resources.rspigot }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: forwarding-secret
+              mountPath: /etc/ferriscraft/forwarding
+              readOnly: true
+            - name: world-data
+              mountPath: /data
+        {{- if .Values.towerwars.pluginSidecar.enabled }}
+        - name: towerwars-plugin
+          {{- if kindIs "string" .Values.towerwars.pluginSidecar.image }}
+          image: {{ .Values.towerwars.pluginSidecar.image }}
+          {{- else }}
+          image: {{ include "ferriscraft.image" (dict "global" .Values.global "repository" .Values.towerwars.pluginSidecar.image.repository "tag" .Values.towerwars.pluginSidecar.image.tag) }}
+          {{- end }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          env:
+            - name: RSPIGOT_URL
+              value: {{ printf "http://127.0.0.1:%d" (int .Values.towerwars.grpcPort) | quote }}
+            - name: RSPIGOT_PLUGIN_NAME
+              value: "ferriscraft-towerwars"
+            - name: TOWERWARS_EPHEMERAL
+              value: "true"
+            - name: TOWERWARS_MODE
+              value: {{ .Values.orchestrator.towerwars.mode | quote }}
+            {{- if (include "ferriscraft.orchestratorTokenSecretName" .) }}
+            - name: ORCHESTRATOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ferriscraft.orchestratorTokenSecretName" . }}
+                  key: token
+            {{- end }}
+            {{- with .Values.towerwars.pluginSidecar.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.towerwars.pluginSidecar.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        {{- end }}
+      volumes:
+        - name: forwarding-secret
+          secret:
+            secretName: {{ include "ferriscraft.forwardingSecretName" . }}
+        - name: world-data
+          emptyDir: {}
+{{- end }}

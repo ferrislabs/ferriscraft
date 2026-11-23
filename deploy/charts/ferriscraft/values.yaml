@@ -73,6 +73,28 @@ orchestrator:
     crd:
       enabled: false
     reconcileIntervalMs: 1000
+  towerwars:
+    # Désactivé par défaut : aucun Pod, CRD ni variable TOWERWARS_* tant que false.
+    # Ordre de déploiement (ADR 0011) : tous les clients (lobby, proxy) en version N, puis true.
+    enabled: false
+    minReplicas: 0
+    maxReplicas: 3
+    standbyServers: 1
+    maxPlayers: 6
+    # ignoré pour TowerWars (taille choisie au lobby)
+    queueMinPlayers: 4
+    mode: solo
+    # Vide : carte intégrée du plugin (monde vide généré au démarrage).
+    map: ""
+    idleTtlSecs: 180
+    startingTimeoutSecs: 120
+    emptyGraceSecs: 30
+    endingTimeoutSecs: 60
+    heartbeatTimeoutSecs: 30
+    # Serveurs TowerWars en objets TowerWarsServer (docs/adr/0011).
+    # L'AppProject ArgoCD doit autoriser CustomResourceDefinition avant d'activer.
+    crd:
+      enabled: false
   resources:
     requests:
       cpu: 100m
@@ -147,6 +169,36 @@ sheepwars:
     enabled: true
     image:
       repository: ferriscraft-sheepwars-plugin
+      tag: ""
+    extraEnv: []
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+  nodeSelector: {}
+  tolerations: []
+
+towerwars:
+  rspigotImage:
+    repository: ferriscraft-rspigot
+    tag: ""
+  port: 25565
+  grpcPort: 25582
+  resources:
+    rspigot:
+      requests:
+        cpu: 500m
+        memory: 768Mi
+      limits:
+        cpu: "2"
+        memory: 1536Mi
+  pluginSidecar:
+    enabled: true
+    image:
+      repository: ferriscraft-towerwars-plugin
       tag: ""
     extraEnv: []
     resources:
