@@ -1,8 +1,8 @@
 use std::convert::Infallible;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -13,27 +13,30 @@ use ferriscraft_progression::{
     EquipError, MemoryProgressionRepository, ProgressionStoreError, Unlock, UnlockError,
 };
 use ferriscraft_protocol::{
-    AdminCoinGrant, DrainResponse, EquipRequest, FleetStatusSnapshot, HeartbeatRequest,
-    JoinQueueRequest, JoinQueueResponse, LeaveQueueRequest, LeaveQueueResponse, MatchReport,
-    MatchReportAck, PROXY_VERSION_HEADER, PhaseUpdateRequest, PlayerIdentityUpdate, PlayerProfile,
-    PlayerQueueStatus, ProxyDisconnectRequest, ProxyEvent, ProxyStateSnapshot, PurchaseRequest,
-    SendToLobbyRequest, SpectateRequest, TransferAckRequest,
+    AdminCoinGrant, DrainResponse, EquipRequest, FleetStatusSnapshot, GameKind, HeartbeatRequest,
+    HeartbeatResponse, JoinQueueRequest, JoinQueueResponse, LeaveQueueRequest, LeaveQueueResponse,
+    MatchReport, MatchReportAck, PROXY_VERSION_HEADER, PhaseUpdateRequest, PlayerIdentityUpdate,
+    PlayerProfile, PlayerQueueStatus, ProxyDisconnectRequest, ProxyEvent, ProxyStateSnapshot,
+    PurchaseRequest, SendToLobbyRequest, SpectateRequest, TransferAckRequest,
 };
 use futures_util::stream::{self, Stream};
+use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::engine::{EngineError, FleetEngine};
+use crate::games::{GameError, Games};
 use crate::lobby::DrainError;
 use crate::progression::{ProgressionError, ProgressionService, ProgressionStore};
 use crate::queue::{
-    NewQueueEntry, QueueRepository, QueueStore, QueueStoreError, persist as persist_mutation,
+    NewQueueEntry, QueueRepository, QueueStore, QueueStoreError, normalize_match_size,
+    persist as persist_mutation,
 };
 
 #[derive(Clone)]
 pub struct AppState {
-    pub engine: Arc<Mutex<FleetEngine>>,
+    pub games: Arc<Mutex<Games>>,
     pub proxy_tx: broadcast::Sender<ProxyEvent>,
     pub api_token: Option<String>,
     pub version: Option<String>,
@@ -45,9 +48,13 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(engine: FleetEngine, api_token: Option<String>) -> Self {
+        Self::from_games(Games::new(engine), api_token)
+    }
+
+    pub fn from_games(games: Games, api_token: Option<String>) -> Self {
         let (proxy_tx, _) = broadcast::channel(512);
         Self {
-            engine: Arc::new(Mutex::new(engine)),
+            games: Arc::new(Mutex::new(games)),
             proxy_tx,
             api_token,
             version: None,
@@ -61,6 +68,16 @@ impl AppState {
     }
 
     #[must_use]
+    pub fn with_game_engine(self, engine: FleetEngine) -> Self {
+        self.lock_games().insert_engine(engine);
+        self
+    }
+
+    pub fn lock_games(&self) -> MutexGuard<'_, Games> {
+        self.games.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[must_use]
     pub fn with_queue(mut self, queue: QueueStore) -> Self {
         self.queue = queue;
         self
@@ -69,20 +86,13 @@ impl AppState {
     pub async fn flush_queue(&self) -> Result<(), QueueStoreError> {
         let _serialized = self.persist_lock.lock().await;
         loop {
-            let batch = self
-                .engine
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take_mutations();
+            let batch = self.lock_games().take_mutations();
             if batch.is_empty() {
                 return Ok(());
             }
             for (done, mutation) in batch.iter().enumerate() {
                 if let Err(err) = persist_mutation(&self.queue, mutation).await {
-                    self.engine
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .restore_mutations(batch[done..].to_vec());
+                    self.lock_games().restore_mutations(batch[done..].to_vec());
                     return Err(err);
                 }
             }
@@ -246,6 +256,15 @@ impl From<DrainError> for ApiError {
     }
 }
 
+impl From<GameError> for ApiError {
+    fn from(value: GameError) -> Self {
+        match value {
+            GameError::Inactive(_) => Self::BadRequest(value.to_string()),
+            GameError::Engine(err) => err.into(),
+        }
+    }
+}
+
 impl From<EngineError> for ApiError {
     fn from(value: EngineError) -> Self {
         match value {
@@ -316,10 +335,7 @@ async fn healthz() -> impl IntoResponse {
 }
 
 async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
-    let snap = {
-        let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
-        engine.snapshot(Instant::now())
-    };
+    let snap = state.lock_games().snapshot(Instant::now());
     (
         StatusCode::OK,
         Json(json!({
@@ -335,10 +351,7 @@ async fn get_status(
     headers: HeaderMap,
 ) -> Result<Json<FleetStatusSnapshot>, ApiError> {
     check_auth(&headers, state.api_token.as_deref())?;
-    let mut snap = {
-        let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
-        engine.snapshot(Instant::now())
-    };
+    let mut snap = state.lock_games().snapshot(Instant::now());
     snap.orchestrator_version.clone_from(&state.version);
     snap.proxy_version = state
         .proxy_version
@@ -365,10 +378,7 @@ async fn join_queue(
         return Err(ApiError::BadRequest("player_name vide".to_owned()));
     }
     let player_uuid = req.player_uuid;
-    let needs_insert = {
-        let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
-        engine.needs_enqueue(player_uuid)
-    };
+    let needs_insert = state.lock_games().needs_enqueue(req.game, player_uuid)?;
     let seq = if needs_insert {
         Some(
             state
@@ -378,35 +388,15 @@ async fn join_queue(
                     name: &req.player_name,
                     joined_at: Utc::now(),
                     seq: None,
+                    game: req.game,
+                    match_size: normalize_match_size(req.game, req.match_size),
                 })
                 .await?,
         )
     } else {
         None
     };
-    let (resp, events) = {
-        let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
-        let now = Instant::now();
-        let resp = match seq {
-            Some(seq) => engine.join_queue_with_seq(now, req, seq),
-            None => engine.join_queue(now, req),
-        };
-        let events = engine.dispatch(now);
-        let snap = engine.snapshot(now);
-        let post_status = engine.player_status(now, player_uuid);
-        let mut updated = resp;
-        updated.total_queued = post_status.total_queued;
-        updated.ready_servers = snap.ready_servers;
-        updated.active_servers = snap.ready_servers + snap.in_game_servers + snap.starting_servers;
-        if let Some(target) = post_status.target_server {
-            updated.status = ferriscraft_protocol::QueueJoinStatus::Transferring;
-            updated.position = 0;
-            updated.target_server = Some(target);
-        } else if let Some(pos) = post_status.position {
-            updated.position = pos;
-        }
-        (updated, events)
-    };
+    let (resp, events) = state.lock_games().join(Instant::now(), req, seq)?;
     state.flush_queue().await?;
     state.emit_proxy_events(events);
     Ok(Json(resp))
@@ -418,24 +408,29 @@ async fn leave_queue(
     Json(req): Json<LeaveQueueRequest>,
 ) -> Result<Json<LeaveQueueResponse>, ApiError> {
     check_auth(&headers, state.api_token.as_deref())?;
-    let resp = {
-        let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
-        engine.leave_queue(req.player_uuid, req.reason)
-    };
+    let resp = state
+        .lock_games()
+        .leave_queue(req.game, req.player_uuid, req.reason)?;
     state.flush_queue().await?;
     Ok(Json(resp))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GameQuery {
+    #[serde(default)]
+    game: GameKind,
 }
 
 async fn player_status(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(uuid): Path<Uuid>,
+    Query(query): Query<GameQuery>,
 ) -> Result<Json<PlayerQueueStatus>, ApiError> {
     check_auth(&headers, state.api_token.as_deref())?;
-    let status = {
-        let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
-        engine.player_status(Instant::now(), uuid)
-    };
+    let status = state
+        .lock_games()
+        .player_status(Instant::now(), uuid, query.game)?;
     Ok(Json(status))
 }
 
@@ -443,18 +438,23 @@ async fn server_heartbeat(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<HeartbeatRequest>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Response, ApiError> {
     check_auth(&headers, state.api_token.as_deref())?;
-    let events = {
-        let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
-        let now = Instant::now();
-        let mut events = engine.apply_heartbeat(now, req);
-        events.extend(engine.dispatch(now));
-        events
+    let server_id = req.server_id.clone();
+    let (events, expected_players) = {
+        let mut games = state.lock_games();
+        let events = games.apply_heartbeat(Instant::now(), req)?;
+        (events, games.expected_players(&server_id))
     };
     state.flush_queue_logged().await;
     state.emit_proxy_events(events);
-    Ok(StatusCode::NO_CONTENT)
+    Ok(match expected_players {
+        Some(expected) => Json(HeartbeatResponse {
+            expected_players: Some(expected),
+        })
+        .into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    })
 }
 
 async fn drain_server(
@@ -463,10 +463,7 @@ async fn drain_server(
     Path(server_id): Path<String>,
 ) -> Result<Json<DrainResponse>, ApiError> {
     check_auth(&headers, state.api_token.as_deref())?;
-    let result = {
-        let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
-        engine.drain_lobby(Instant::now(), &server_id)?
-    };
+    let result = state.lock_games().drain_lobby(Instant::now(), &server_id)?;
     state.emit_proxy_events(result.events);
     Ok(Json(DrainResponse {
         remaining_players: result.remaining_players,
@@ -480,13 +477,9 @@ async fn update_phase(
     Json(req): Json<PhaseUpdateRequest>,
 ) -> Result<StatusCode, ApiError> {
     check_auth(&headers, state.api_token.as_deref())?;
-    let events = {
-        let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
-        let now = Instant::now();
-        let mut events = engine.update_server_phase(now, &server_id, req.phase)?;
-        events.extend(engine.dispatch(now));
-        events
-    };
+    let events = state
+        .lock_games()
+        .update_server_phase(Instant::now(), &server_id, req.phase)?;
     state.flush_queue_logged().await;
     state.emit_proxy_events(events);
     Ok(StatusCode::NO_CONTENT)
@@ -499,10 +492,10 @@ async fn spectate_server(
     Json(req): Json<SpectateRequest>,
 ) -> Result<StatusCode, ApiError> {
     check_auth(&headers, state.api_token.as_deref())?;
-    let event = {
-        let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
-        engine.queue_spectate_transfer(Instant::now(), &server_id, req.player_uuid)?
-    };
+    let event =
+        state
+            .lock_games()
+            .queue_spectate_transfer(Instant::now(), &server_id, req.player_uuid)?;
     state.flush_queue_logged().await;
     state.emit_proxy_events(vec![event]);
     Ok(StatusCode::ACCEPTED)
@@ -515,10 +508,9 @@ async fn send_player_to_lobby(
     Json(req): Json<SendToLobbyRequest>,
 ) -> Result<StatusCode, ApiError> {
     check_auth(&headers, state.api_token.as_deref())?;
-    let event = {
-        let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
-        engine.queue_lobby_transfer(Instant::now(), uuid, req.reason)
-    };
+    let event = state
+        .lock_games()
+        .queue_lobby_transfer(Instant::now(), uuid, req.reason);
     state.flush_queue_logged().await;
     state.emit_proxy_events(vec![event]);
     Ok(StatusCode::ACCEPTED)
@@ -530,10 +522,7 @@ async fn proxy_state(
 ) -> Result<Json<ProxyStateSnapshot>, ApiError> {
     check_auth(&headers, state.api_token.as_deref())?;
     state.record_proxy_version(&headers);
-    let snap = {
-        let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
-        engine.proxy_snapshot()
-    };
+    let snap = state.lock_games().proxy_snapshot();
     Ok(Json(snap))
 }
 
@@ -576,10 +565,9 @@ async fn ack_transfer(
     if !req.success {
         tracing::warn!(%transfer_id, message = ?req.message, "Transfert Velocity échoué");
     }
-    {
-        let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
-        engine.ack_transfer(Instant::now(), transfer_id, req.success);
-    }
+    state
+        .lock_games()
+        .ack_transfer(Instant::now(), transfer_id, req.success);
     state.flush_queue_logged().await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -590,13 +578,7 @@ async fn proxy_player_disconnected(
     Json(req): Json<ProxyDisconnectRequest>,
 ) -> Result<Json<LeaveQueueResponse>, ApiError> {
     check_auth(&headers, state.api_token.as_deref())?;
-    let resp = {
-        let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
-        engine.leave_queue(
-            req.player_uuid,
-            ferriscraft_protocol::LeaveReason::ProxyDisconnect,
-        )
-    };
+    let resp = state.lock_games().disconnect(req.player_uuid);
     state.flush_queue().await?;
     Ok(Json(resp))
 }
@@ -607,10 +589,7 @@ async fn report_match(
     Json(report): Json<MatchReport>,
 ) -> Result<Json<MatchReportAck>, ApiError> {
     check_auth(&headers, state.api_token.as_deref())?;
-    let seen = {
-        let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
-        engine.seen_players(&report.server_id)
-    };
+    let seen = state.lock_games().seen_players(&report.server_id);
     let ack = state.progression.report_match(&report, &seen).await?;
     Ok(Json(ack))
 }

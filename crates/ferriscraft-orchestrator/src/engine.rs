@@ -2,18 +2,26 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use ferriscraft_protocol::{
-    FleetStatusSnapshot, HeartbeatRequest, JoinQueueRequest, JoinQueueResponse, LeaveQueueResponse,
-    LeaveReason, PlayerQueueState, PlayerQueueStatus, ProxyEvent, ProxyServerEntry,
-    ProxyStateSnapshot, QueueJoinStatus, QueuedPlayerSummary, ServerKind, ServerPhase,
-    ServerSummary, TransferCommand,
+    FleetStatusSnapshot, GameKind, HeartbeatRequest, JoinQueueRequest, JoinQueueResponse,
+    LeaveQueueResponse, LeaveReason, PlayerQueueState, PlayerQueueStatus, ProxyEvent,
+    ProxyServerEntry, ProxyStateSnapshot, QueueJoinStatus, QueuedPlayerSummary, ServerKind,
+    ServerPhase, ServerSummary, TransferCommand,
 };
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::lobby::{DrainError, DrainResult, LobbyInstance, LobbyState};
-use crate::queue::{FIRST_SEQ, QueueEntryState, QueueMutation, QueueRecord};
+use crate::queue::{FIRST_SEQ, QueueEntryState, QueueMutation, QueueRecord, normalize_match_size};
 
 const SPECTATE_TTL: Duration = Duration::from_secs(60);
+const SEQ_LANE_WIDTH: u64 = 1 << 30;
+
+const fn seq_lane_offset(game: GameKind) -> u64 {
+    match game {
+        GameKind::SheepWars => 0,
+        GameKind::TowerWars => SEQ_LANE_WIDTH,
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -25,6 +33,7 @@ pub enum EngineError {
 
 #[derive(Debug, Clone)]
 pub struct FleetPolicy {
+    pub game: GameKind,
     pub lobby_server_name: String,
     pub queue_min_players: usize,
     pub max_players_per_server: u32,
@@ -45,6 +54,7 @@ struct QueuedPlayer {
     name: String,
     joined_at: Instant,
     state: QueueEntryState,
+    match_size: u8,
 }
 
 impl QueuedPlayer {
@@ -82,6 +92,7 @@ struct ManagedServer {
     seen_players: HashSet<Uuid>,
     last_players: Vec<Uuid>,
     arrived: HashMap<Uuid, (u64, String)>,
+    expected_players: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,7 +150,7 @@ impl ManagedServer {
             && self.phase != ServerPhase::Ending
     }
 
-    fn summary(&self, now: Instant) -> ServerSummary {
+    fn summary(&self, now: Instant, kind: ServerKind) -> ServerSummary {
         let heartbeat_age_secs = self
             .last_heartbeat
             .map_or_else(
@@ -159,7 +170,7 @@ impl ManagedServer {
             age_secs: now.saturating_duration_since(self.created_at).as_secs(),
             version: self.version.clone(),
             outdated: self.outdated,
-            kind: ServerKind::SheepWars,
+            kind,
             draining: false,
         }
     }
@@ -234,7 +245,10 @@ impl FleetEngine {
 
     pub fn restore_queue(&mut self, now: Instant, records: Vec<QueueRecord>) {
         let wall_now = chrono::Utc::now();
-        for record in records {
+        for record in records
+            .into_iter()
+            .filter(|record| record.game == self.policy.game)
+        {
             let waited = (wall_now - record.joined_at).to_std().unwrap_or_default();
             let joined_at = now.checked_sub(waited).unwrap_or(now);
             if let QueueEntryState::Dispatched {
@@ -242,7 +256,7 @@ impl FleetEngine {
                 transfer_id,
             } = &record.state
             {
-                let reason = "sheepwars_matchmaking".to_owned();
+                let reason = self.matchmaking_reason();
                 self.transfers.insert(
                     *transfer_id,
                     ActiveTransfer {
@@ -267,13 +281,33 @@ impl FleetEngine {
                     name: record.name,
                     joined_at,
                     state: record.state,
+                    match_size: normalize_match_size(self.policy.game, record.match_size),
                 },
             );
         }
     }
 
     pub fn needs_enqueue(&self, player_uuid: Uuid) -> bool {
-        !self.has_matchmaking_transfer(player_uuid) && self.entry_seq(player_uuid).is_none()
+        !self.holds_player(player_uuid)
+    }
+
+    pub fn holds_player(&self, player_uuid: Uuid) -> bool {
+        self.has_matchmaking_transfer(player_uuid) || self.entry_seq(player_uuid).is_some()
+    }
+
+    pub fn has_server(&self, server_id: &str) -> bool {
+        self.servers.contains_key(server_id)
+    }
+
+    pub fn release_player(&mut self, player_uuid: Uuid) {
+        self.remove_entry(player_uuid);
+        if let Some(old_tid) = self.player_transfers.remove(&player_uuid) {
+            self.transfers.remove(&old_tid);
+        }
+    }
+
+    fn matchmaking_reason(&self) -> String {
+        format!("{}_matchmaking", self.policy.game.slug())
     }
 
     pub fn join_queue(&mut self, now: Instant, req: JoinQueueRequest) -> JoinQueueResponse {
@@ -286,6 +320,8 @@ impl FleetEngine {
                 seq,
                 player_uuid: entry.uuid,
                 name: entry.name.clone(),
+                game: self.policy.game,
+                match_size: entry.match_size,
             });
         }
         resp
@@ -297,6 +333,7 @@ impl FleetEngine {
         req: JoinQueueRequest,
         seq: u64,
     ) -> JoinQueueResponse {
+        let min_players = self.min_players_for(req.player_uuid, req.match_size);
         if let Some(transfer_id) = self.player_transfers.get(&req.player_uuid)
             && let Some(active) = self.transfers.get(transfer_id)
             && !active.is_lobby_return
@@ -305,11 +342,17 @@ impl FleetEngine {
                 QueueJoinStatus::Transferring,
                 0,
                 Some(active.command.target_server.clone()),
+                min_players,
             );
         }
 
         if let Some(pos) = self.queue_position(req.player_uuid) {
-            return self.build_join_response(QueueJoinStatus::AlreadyQueued, pos, None);
+            return self.build_join_response(
+                QueueJoinStatus::AlreadyQueued,
+                pos,
+                None,
+                min_players,
+            );
         }
 
         let player_uuid = req.player_uuid;
@@ -320,12 +363,13 @@ impl FleetEngine {
                 name: req.player_name,
                 joined_at: now,
                 state: QueueEntryState::Waiting,
+                match_size: normalize_match_size(self.policy.game, req.match_size),
             },
         );
         let pos = self
             .queue_position(player_uuid)
             .unwrap_or_else(|| self.waiting_len());
-        self.build_join_response(QueueJoinStatus::Queued, pos, None)
+        self.build_join_response(QueueJoinStatus::Queued, pos, None, min_players)
     }
 
     pub fn leave_queue(&mut self, player_uuid: Uuid, reason: LeaveReason) -> LeaveQueueResponse {
@@ -363,7 +407,7 @@ impl FleetEngine {
                 state: PlayerQueueState::Transferring,
                 position: None,
                 total_queued: self.waiting_len(),
-                min_players: self.policy.queue_min_players,
+                min_players: self.min_players_for(player_uuid, 0),
                 target_server: Some(active.command.target_server.clone()),
                 spectate_server,
             };
@@ -374,7 +418,7 @@ impl FleetEngine {
                 state: PlayerQueueState::Queued,
                 position: Some(pos),
                 total_queued: self.waiting_len(),
-                min_players: self.policy.queue_min_players,
+                min_players: self.min_players_for(player_uuid, 0),
                 target_server: None,
                 spectate_server,
             }
@@ -383,7 +427,7 @@ impl FleetEngine {
                 state: PlayerQueueState::NotQueued,
                 position: None,
                 total_queued: self.waiting_len(),
-                min_players: self.policy.queue_min_players,
+                min_players: self.min_players_for(player_uuid, 0),
                 target_server: None,
                 spectate_server,
             }
@@ -419,6 +463,7 @@ impl FleetEngine {
                 seen_players: HashSet::new(),
                 last_players: Vec::new(),
                 arrived: HashMap::new(),
+                expected_players: None,
             });
     }
 
@@ -434,6 +479,7 @@ impl FleetEngine {
         if failed_or_terminating {
             self.requeue_lost_players(&server_id);
         }
+        let kind = self.policy.game.server_kind();
         let mut events = Vec::new();
         let entry = self
             .servers
@@ -458,6 +504,7 @@ impl FleetEngine {
                 seen_players: HashSet::new(),
                 last_players: Vec::new(),
                 arrived: HashMap::new(),
+                expected_players: None,
             });
 
         if pod_name.is_some() {
@@ -480,7 +527,7 @@ impl FleetEngine {
             }
         }
 
-        Self::sync_proxy_registration(entry, addr_changed, &mut events);
+        Self::sync_proxy_registration(entry, kind, addr_changed, &mut events);
         events
     }
 
@@ -564,6 +611,7 @@ impl FleetEngine {
         if req.kind == ServerKind::Lobby {
             return self.apply_lobby_heartbeat(now, req);
         }
+        let kind = self.policy.game.server_kind();
         let mut events = Vec::new();
         let max_players = req.max_players.max(1);
         let entry = self
@@ -589,6 +637,7 @@ impl FleetEngine {
                 seen_players: HashSet::new(),
                 last_players: Vec::new(),
                 arrived: HashMap::new(),
+                expected_players: None,
             });
 
         let addr_changed = req.address.is_some() && entry.address != req.address;
@@ -630,12 +679,20 @@ impl FleetEngine {
             }
         }
 
+        let pending = self
+            .pending_transfer_counts()
+            .get(&req.server_id)
+            .copied()
+            .unwrap_or(0);
         if let Some(server) = self.servers.get_mut(&req.server_id) {
+            if req.phase == ServerPhase::Waiting && req.player_count == 0 && pending == 0 {
+                server.expected_players = None;
+            }
             for (uuid, (seq, player)) in arrivals {
                 server.arrived.insert(uuid, (seq, player.name));
             }
             server.last_players = req.player_uuids;
-            Self::sync_proxy_registration(server, addr_changed || phase_changed, &mut events);
+            Self::sync_proxy_registration(server, kind, addr_changed || phase_changed, &mut events);
         }
         events
     }
@@ -842,6 +899,13 @@ impl FleetEngine {
             return;
         }
         let joined_at = server.last_heartbeat.unwrap_or(server.created_at);
+        let match_size = normalize_match_size(
+            self.policy.game,
+            server
+                .expected_players
+                .take()
+                .map_or(0, |size| u8::try_from(size).unwrap_or(0)),
+        );
         let mut players: Vec<(u64, Uuid, String)> = std::mem::take(&mut server.last_players)
             .into_iter()
             .map(|uuid| match server.arrived.get(&uuid) {
@@ -854,12 +918,13 @@ impl FleetEngine {
             return;
         }
         players.sort_by_key(|(seq, _, _)| *seq);
+        let lane_origin = FIRST_SEQ - seq_lane_offset(self.policy.game);
         let base = self
             .queue
             .keys()
             .next()
             .copied()
-            .unwrap_or(FIRST_SEQ)
+            .map_or(lane_origin, |head| head.min(lane_origin))
             .saturating_sub(players.len() as u64);
         for (offset, (_, uuid, name)) in players.into_iter().enumerate() {
             let seq = base + offset as u64;
@@ -867,6 +932,8 @@ impl FleetEngine {
                 seq,
                 player_uuid: uuid,
                 name: name.clone(),
+                game: self.policy.game,
+                match_size,
             });
             self.queue.insert(
                 seq,
@@ -875,6 +942,7 @@ impl FleetEngine {
                     name,
                     joined_at,
                     state: QueueEntryState::Waiting,
+                    match_size,
                 },
             );
         }
@@ -886,6 +954,7 @@ impl FleetEngine {
         server_id: &str,
         phase: ServerPhase,
     ) -> Result<Vec<ProxyEvent>, EngineError> {
+        let kind = self.policy.game.server_kind();
         let Some(server) = self.servers.get_mut(server_id) else {
             return Err(EngineError::UnknownServer(server_id.to_owned()));
         };
@@ -893,7 +962,7 @@ impl FleetEngine {
         let changed = server.set_phase(now, phase);
         server.has_plugin_heartbeat = true;
         server.last_heartbeat = Some(now);
-        Self::sync_proxy_registration(server, changed, &mut events);
+        Self::sync_proxy_registration(server, kind, changed, &mut events);
         Ok(events)
     }
 
@@ -903,10 +972,7 @@ impl FleetEngine {
         player_uuid: Uuid,
         reason: Option<String>,
     ) -> ProxyEvent {
-        self.remove_entry(player_uuid);
-        if let Some(old_tid) = self.player_transfers.remove(&player_uuid) {
-            self.transfers.remove(&old_tid);
-        }
+        self.release_player(player_uuid);
 
         let target_server = self.lobby_target();
         let reason = reason.unwrap_or_else(|| "retour au hub".to_owned());
@@ -926,10 +992,7 @@ impl FleetEngine {
         if self.deleting.contains_key(server_id) || !server.ready_for_proxy() {
             return Err(EngineError::NotJoinable(server_id.to_owned()));
         }
-        self.remove_entry(player_uuid);
-        if let Some(old_tid) = self.player_transfers.remove(&player_uuid) {
-            self.transfers.remove(&old_tid);
-        }
+        self.release_player(player_uuid);
         self.spectating
             .insert(player_uuid, (server_id.to_owned(), now + SPECTATE_TTL));
         let transfer_id = Uuid::new_v4();
@@ -1053,7 +1116,6 @@ impl FleetEngine {
             }
         }
 
-        // 2. Dispatch queued players onto available SheepWars servers.
         events.extend(self.dispatch_queued_players(now));
 
         events
@@ -1063,6 +1125,10 @@ impl FleetEngine {
         let mut events = Vec::new();
         if self.waiting_len() == 0 {
             return events;
+        }
+
+        if self.policy.game == GameKind::TowerWars {
+            return self.dispatch_match_groups(now);
         }
 
         loop {
@@ -1132,51 +1198,114 @@ impl FleetEngine {
                 .map(|(seq, _)| *seq)
                 .collect();
             for seq in seqs {
-                let Some(player) = self.queue.get_mut(&seq) else {
-                    continue;
-                };
-                let player_uuid = player.uuid;
-                let transfer_id = Uuid::new_v4();
-                player.state = QueueEntryState::Dispatched {
-                    server_id: target_server.clone(),
-                    transfer_id,
-                };
-                self.mutations.push(QueueMutation::SetState {
-                    player_uuid,
-                    state: QueueEntryState::Dispatched {
-                        server_id: target_server.clone(),
-                        transfer_id,
-                    },
-                });
-                if let Some(old_tid) = self.player_transfers.remove(&player_uuid) {
-                    self.transfers.remove(&old_tid);
-                }
-                let reason = "sheepwars_matchmaking".to_owned();
-                let command = TransferCommand {
-                    transfer_id,
-                    player_uuid,
-                    target_server: target_server.clone(),
-                    reason: reason.clone(),
-                };
-                self.transfers.insert(
-                    transfer_id,
-                    ActiveTransfer {
-                        command,
-                        created_at: now,
-                        is_lobby_return: false,
-                        acked: false,
-                    },
-                );
-                self.player_transfers.insert(player_uuid, transfer_id);
-                events.push(ProxyEvent::TransferPlayer {
-                    transfer_id,
-                    player_uuid,
-                    target_server: target_server.clone(),
-                    reason,
-                });
+                self.dispatch_entry(now, seq, &target_server, &mut events);
             }
         }
 
+        events
+    }
+
+    fn dispatch_entry(
+        &mut self,
+        now: Instant,
+        seq: u64,
+        target_server: &str,
+        events: &mut Vec<ProxyEvent>,
+    ) {
+        let Some(player) = self.queue.get_mut(&seq) else {
+            return;
+        };
+        let player_uuid = player.uuid;
+        let transfer_id = Uuid::new_v4();
+        player.state = QueueEntryState::Dispatched {
+            server_id: target_server.to_owned(),
+            transfer_id,
+        };
+        self.mutations.push(QueueMutation::SetState {
+            player_uuid,
+            state: QueueEntryState::Dispatched {
+                server_id: target_server.to_owned(),
+                transfer_id,
+            },
+        });
+        if let Some(old_tid) = self.player_transfers.remove(&player_uuid) {
+            self.transfers.remove(&old_tid);
+        }
+        let reason = self.matchmaking_reason();
+        let command = TransferCommand {
+            transfer_id,
+            player_uuid,
+            target_server: target_server.to_owned(),
+            reason: reason.clone(),
+        };
+        self.transfers.insert(
+            transfer_id,
+            ActiveTransfer {
+                command,
+                created_at: now,
+                is_lobby_return: false,
+                acked: false,
+            },
+        );
+        self.player_transfers.insert(player_uuid, transfer_id);
+        events.push(ProxyEvent::TransferPlayer {
+            transfer_id,
+            player_uuid,
+            target_server: target_server.to_owned(),
+            reason,
+        });
+    }
+
+    fn waiting_by_match_size(&self) -> BTreeMap<u8, Vec<u64>> {
+        let mut groups: BTreeMap<u8, Vec<u64>> = BTreeMap::new();
+        for (seq, entry) in &self.queue {
+            if entry.is_waiting() {
+                groups
+                    .entry(entry.match_size.max(1))
+                    .or_default()
+                    .push(*seq);
+            }
+        }
+        groups
+    }
+
+    fn dispatch_match_groups(&mut self, now: Instant) -> Vec<ProxyEvent> {
+        let mut events = Vec::new();
+        while let Some((size, seqs)) = self
+            .waiting_by_match_size()
+            .into_iter()
+            .filter(|(size, seqs)| seqs.len() >= usize::from(*size))
+            .min_by_key(|(_, seqs)| seqs[0])
+        {
+            let pending_by_server = self.pending_transfer_counts();
+            let Some(target_server) = self
+                .servers
+                .values()
+                .filter(|s| {
+                    !self.deleting.contains_key(&s.server_id)
+                        && s.ready_for_proxy()
+                        && s.phase.accepts_players()
+                        && s.player_count == 0
+                        && s.expected_players.is_none()
+                        && pending_by_server.get(&s.server_id).copied().unwrap_or(0) == 0
+                })
+                .min_by(|a, b| {
+                    a.outdated
+                        .cmp(&b.outdated)
+                        .then_with(|| a.server_id.cmp(&b.server_id))
+                })
+                .map(|s| s.server_id.clone())
+            else {
+                break;
+            };
+
+            for seq in seqs.into_iter().take(usize::from(size)) {
+                self.dispatch_entry(now, seq, &target_server, &mut events);
+            }
+            if let Some(server) = self.servers.get_mut(&target_server) {
+                server.expected_players = Some(u32::from(size));
+            }
+        }
         events
     }
 
@@ -1270,6 +1399,12 @@ impl FleetEngine {
 
         let needed_for_queue = if self.waiting_len() == 0 {
             0
+        } else if self.policy.game == GameKind::TowerWars {
+            self.waiting_by_match_size()
+                .iter()
+                .map(|(size, seqs)| seqs.len().div_ceil(usize::from(*size)))
+                .sum::<usize>()
+                .max(1)
         } else {
             self.waiting_len()
                 .div_ceil(self.policy.max_players_per_server as usize)
@@ -1356,7 +1491,7 @@ impl FleetEngine {
                 ServerPhase::InGame => in_game_servers += 1,
                 ServerPhase::Ending => {}
             }
-            servers.push(s.summary(now));
+            servers.push(s.summary(now, self.policy.game.server_kind()));
         }
 
         let queued_players = self
@@ -1387,6 +1522,7 @@ impl FleetEngine {
             orchestrator_version: None,
             lobbies: self.lobbies.values().map(|l| l.summary(now)).collect(),
             proxy_version: None,
+            games: Vec::new(),
         }
     }
 
@@ -1400,7 +1536,7 @@ impl FleetEngine {
                     name: s.server_id.clone(),
                     address: addr.clone(),
                     phase: s.phase,
-                    kind: ServerKind::SheepWars,
+                    kind: self.policy.game.server_kind(),
                 })
             })
             .chain(
@@ -1434,6 +1570,7 @@ impl FleetEngine {
 
     fn sync_proxy_registration(
         server: &mut ManagedServer,
+        kind: ServerKind,
         force_upsert: bool,
         events: &mut Vec<ProxyEvent>,
     ) {
@@ -1445,7 +1582,7 @@ impl FleetEngine {
                     name: server.server_id.clone(),
                     address: addr.clone(),
                     phase: server.phase,
-                    kind: ServerKind::SheepWars,
+                    kind,
                 });
             }
         } else if !should_register && server.registered_on_proxy {
@@ -1469,6 +1606,29 @@ impl FleetEngine {
             .values()
             .filter(|entry| entry.is_waiting())
             .count()
+    }
+
+    fn min_players_for(&self, uuid: Uuid, raw_match_size: u8) -> usize {
+        match self.policy.game {
+            GameKind::TowerWars => {
+                let size = self
+                    .queue
+                    .values()
+                    .find(|entry| entry.uuid == uuid)
+                    .map_or_else(
+                        || normalize_match_size(GameKind::TowerWars, raw_match_size),
+                        |entry| entry.match_size,
+                    );
+                usize::from(size)
+            }
+            GameKind::SheepWars => self.policy.queue_min_players,
+        }
+    }
+
+    pub fn expected_players(&self, server_id: &str) -> Option<u32> {
+        self.servers
+            .get(server_id)
+            .and_then(|server| server.expected_players)
     }
 
     fn next_seq(&self) -> u64 {
@@ -1519,6 +1679,7 @@ impl FleetEngine {
         status: QueueJoinStatus,
         position: usize,
         target_server: Option<String>,
+        min_players: usize,
     ) -> JoinQueueResponse {
         let ready_servers = self
             .servers
@@ -1539,7 +1700,7 @@ impl FleetEngine {
             status,
             position,
             total_queued: self.waiting_len(),
-            min_players: self.policy.queue_min_players,
+            min_players,
             target_server,
             ready_servers,
             active_servers,
@@ -1554,6 +1715,7 @@ mod tests {
 
     fn test_policy() -> FleetPolicy {
         FleetPolicy {
+            game: GameKind::SheepWars,
             lobby_server_name: "lobby".to_owned(),
             queue_min_players: 2,
             max_players_per_server: 4,
@@ -1588,6 +1750,8 @@ mod tests {
             JoinQueueRequest {
                 player_uuid: p1,
                 player_name: "Alice".to_owned(),
+                game: GameKind::SheepWars,
+                match_size: 0,
             },
         );
         assert_eq!(r1.status, QueueJoinStatus::Queued);
@@ -1602,6 +1766,8 @@ mod tests {
             JoinQueueRequest {
                 player_uuid: p2,
                 player_name: "Bob".to_owned(),
+                game: GameKind::SheepWars,
+                match_size: 0,
             },
         );
 
@@ -1643,6 +1809,8 @@ mod tests {
             JoinQueueRequest {
                 player_uuid: p1,
                 player_name: "Alice".to_owned(),
+                game: GameKind::SheepWars,
+                match_size: 0,
             },
         );
         engine.join_queue(
@@ -1650,6 +1818,8 @@ mod tests {
             JoinQueueRequest {
                 player_uuid: p2,
                 player_name: "Bob".to_owned(),
+                game: GameKind::SheepWars,
+                match_size: 0,
             },
         );
         engine.tick(t0);
@@ -1708,6 +1878,8 @@ mod tests {
             JoinQueueRequest {
                 player_uuid: p1,
                 player_name: "Alice".to_owned(),
+                game: GameKind::SheepWars,
+                match_size: 0,
             },
         );
         let tick2 = engine.tick(t0);
@@ -2088,6 +2260,8 @@ mod tests {
                 JoinQueueRequest {
                     player_uuid: Uuid::from_u128(n),
                     player_name: format!("p{n}"),
+                    game: GameKind::SheepWars,
+                    match_size: 0,
                 },
             );
         }
@@ -2115,6 +2289,8 @@ mod tests {
             JoinQueueRequest {
                 player_uuid: Uuid::from_u128(10),
                 player_name: "p10".to_owned(),
+                game: GameKind::SheepWars,
+                match_size: 0,
             },
         );
         let actions = engine.tick(t0);
@@ -2146,6 +2322,8 @@ mod tests {
             JoinQueueRequest {
                 player_uuid: Uuid::from_u128(n),
                 player_name: format!("p{n}"),
+                game: GameKind::SheepWars,
+                match_size: 0,
             },
         );
     }
@@ -2729,6 +2907,8 @@ mod tests {
                 server_id: server.to_owned(),
                 transfer_id: Uuid::from_u128(n + 1000),
             },
+            game: GameKind::SheepWars,
+            match_size: 0,
         }
     }
 
@@ -2744,6 +2924,8 @@ mod tests {
                 name: format!("p{seq}"),
                 joined_at: chrono::Utc::now(),
                 state: QueueEntryState::Waiting,
+                game: GameKind::SheepWars,
+                match_size: 0,
             })
             .collect();
         engine.restore_queue(t0, records);
@@ -2800,6 +2982,8 @@ mod tests {
                     name: "p11".to_owned(),
                     joined_at: chrono::Utc::now(),
                     state: QueueEntryState::Waiting,
+                    game: GameKind::SheepWars,
+                    match_size: 0,
                 },
             ],
         );
@@ -2946,5 +3130,250 @@ mod tests {
             ProxyEvent::ServerRemove { name } if name == "lobby-a"
         )));
         assert!(engine.pick_lobby().is_none());
+    }
+
+    fn tower_engine() -> FleetEngine {
+        FleetEngine::new(FleetPolicy {
+            game: GameKind::TowerWars,
+            queue_min_players: 4,
+            max_players_per_server: 12,
+            max_replicas: 5,
+            ..test_policy()
+        })
+    }
+
+    fn tower_heartbeat(
+        engine: &mut FleetEngine,
+        now: Instant,
+        id: &str,
+        phase: ServerPhase,
+        players: &[u128],
+    ) {
+        engine.apply_heartbeat(
+            now,
+            HeartbeatRequest {
+                server_id: id.to_owned(),
+                address: Some("10.0.0.10:25565".to_owned()),
+                phase,
+                player_count: players.len() as u32,
+                max_players: 12,
+                player_uuids: players.iter().map(|n| uid(*n)).collect(),
+                version: None,
+                kind: ServerKind::TowerWars,
+            },
+        );
+    }
+
+    fn tower_join(engine: &mut FleetEngine, now: Instant, n: u128, match_size: u8) {
+        engine.join_queue(
+            now,
+            JoinQueueRequest {
+                player_uuid: uid(n),
+                player_name: format!("p{n}"),
+                game: GameKind::TowerWars,
+                match_size,
+            },
+        );
+    }
+
+    #[test]
+    fn match_size_is_normalized_for_towerwars_and_ignored_for_sheepwars() {
+        let mut engine = tower_engine();
+        let t0 = Instant::now();
+        for (n, raw) in [(1, 0), (2, 9), (3, 3)] {
+            tower_join(&mut engine, t0, n, raw);
+        }
+        let sizes: Vec<u8> = engine
+            .take_mutations()
+            .into_iter()
+            .map(|m| match m {
+                QueueMutation::Insert { match_size, .. } => match_size,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(sizes, [1, 1, 3]);
+
+        let mut sheep = FleetEngine::new(test_policy());
+        queue(&mut sheep, t0, 1);
+        assert!(matches!(
+            sheep.take_mutations()[0],
+            QueueMutation::Insert { match_size: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn a_solo_player_starts_alone_immediately_and_the_server_expects_one() {
+        let mut engine = tower_engine();
+        let t0 = Instant::now();
+        tower_heartbeat(&mut engine, t0, "towerwars-1", ServerPhase::Waiting, &[]);
+        tower_join(&mut engine, t0, 10, 1);
+        let actions = engine.tick(t0);
+        assert_eq!(transfer_targets(&actions), [(uid(10), "towerwars-1")]);
+        assert_eq!(engine.expected_players("towerwars-1"), Some(1));
+    }
+
+    #[test]
+    fn a_duo_waits_for_two_players_then_leaves_together() {
+        let mut engine = tower_engine();
+        let t0 = Instant::now();
+        tower_heartbeat(&mut engine, t0, "towerwars-1", ServerPhase::Waiting, &[]);
+        tower_join(&mut engine, t0, 10, 2);
+        assert!(transfer_targets(&engine.tick(t0)).is_empty());
+        assert_eq!(engine.expected_players("towerwars-1"), None);
+        assert_eq!(engine.player_status(t0, uid(10)).min_players, 2);
+
+        tower_join(&mut engine, t0, 11, 2);
+        let actions = engine.tick(t0);
+        assert_eq!(
+            transfer_targets(&actions),
+            [(uid(10), "towerwars-1"), (uid(11), "towerwars-1")]
+        );
+        assert_eq!(engine.expected_players("towerwars-1"), Some(2));
+    }
+
+    #[test]
+    fn different_sizes_never_mix_and_groups_leave_in_fifo_order() {
+        let mut engine = tower_engine();
+        let t0 = Instant::now();
+        tower_heartbeat(&mut engine, t0, "towerwars-1", ServerPhase::Waiting, &[]);
+        tower_heartbeat(&mut engine, t0, "towerwars-2", ServerPhase::Waiting, &[]);
+        tower_join(&mut engine, t0, 10, 3);
+        tower_join(&mut engine, t0, 11, 2);
+        tower_join(&mut engine, t0, 12, 2);
+        tower_join(&mut engine, t0, 13, 3);
+        let actions = engine.tick(t0);
+        assert_eq!(
+            transfer_targets(&actions),
+            [(uid(11), "towerwars-1"), (uid(12), "towerwars-1")]
+        );
+        assert_eq!(engine.expected_players("towerwars-2"), None);
+        assert_eq!(queued(&engine, t0), [uid(10), uid(13)]);
+
+        tower_join(&mut engine, t0, 14, 3);
+        let actions = engine.tick(t0);
+        assert_eq!(
+            transfer_targets(&actions),
+            [
+                (uid(10), "towerwars-2"),
+                (uid(13), "towerwars-2"),
+                (uid(14), "towerwars-2")
+            ]
+        );
+        assert_eq!(engine.expected_players("towerwars-2"), Some(3));
+    }
+
+    #[test]
+    fn the_s_oldest_of_a_group_leave_and_the_rest_keep_waiting() {
+        let mut engine = tower_engine();
+        let t0 = Instant::now();
+        tower_heartbeat(&mut engine, t0, "towerwars-1", ServerPhase::Waiting, &[]);
+        for n in 10..13 {
+            tower_join(&mut engine, t0, n, 2);
+        }
+        let actions = engine.tick(t0);
+        assert_eq!(
+            transfer_targets(&actions),
+            [(uid(10), "towerwars-1"), (uid(11), "towerwars-1")]
+        );
+        assert_eq!(queued(&engine, t0), [uid(12)]);
+    }
+
+    #[test]
+    fn a_non_empty_or_already_assigned_server_is_never_backfilled() {
+        let mut engine = tower_engine();
+        let t0 = Instant::now();
+        tower_heartbeat(&mut engine, t0, "towerwars-1", ServerPhase::Waiting, &[]);
+        tower_join(&mut engine, t0, 10, 2);
+        tower_join(&mut engine, t0, 11, 2);
+        engine.tick(t0);
+        tower_heartbeat(&mut engine, t0, "towerwars-1", ServerPhase::Waiting, &[10]);
+        tower_join(&mut engine, t0, 12, 1);
+        assert!(transfer_targets(&engine.tick(t0)).is_empty());
+        assert_eq!(queued(&engine, t0), [uid(12)]);
+
+        tower_heartbeat(&mut engine, t0, "towerwars-2", ServerPhase::Waiting, &[]);
+        assert_eq!(
+            transfer_targets(&engine.tick(t0)),
+            [(uid(12), "towerwars-2")]
+        );
+    }
+
+    #[test]
+    fn expected_players_is_cleared_once_the_server_is_empty_and_waiting_again() {
+        let mut engine = tower_engine();
+        let t0 = Instant::now();
+        tower_heartbeat(&mut engine, t0, "towerwars-1", ServerPhase::Waiting, &[]);
+        tower_join(&mut engine, t0, 10, 1);
+        engine.tick(t0);
+        tower_heartbeat(&mut engine, t0, "towerwars-1", ServerPhase::Waiting, &[]);
+        assert_eq!(engine.expected_players("towerwars-1"), Some(1));
+        tower_heartbeat(&mut engine, t0, "towerwars-1", ServerPhase::Waiting, &[10]);
+        assert_eq!(engine.expected_players("towerwars-1"), Some(1));
+        tower_heartbeat(&mut engine, t0, "towerwars-1", ServerPhase::InGame, &[10]);
+        assert_eq!(engine.expected_players("towerwars-1"), Some(1));
+        tower_heartbeat(&mut engine, t0, "towerwars-1", ServerPhase::Waiting, &[]);
+        assert_eq!(engine.expected_players("towerwars-1"), None);
+        assert_eq!(engine.expected_players("unknown"), None);
+    }
+
+    #[test]
+    fn expected_players_is_cleared_when_every_transfer_fails() {
+        let mut engine = tower_engine();
+        let t0 = Instant::now();
+        tower_heartbeat(&mut engine, t0, "towerwars-1", ServerPhase::Waiting, &[]);
+        tower_join(&mut engine, t0, 10, 1);
+        let actions = engine.tick(t0);
+        let (_, transfer_id) = transfer_ids(&actions)[0];
+        engine.ack_transfer(t0, transfer_id, false);
+        tower_heartbeat(&mut engine, t0, "towerwars-1", ServerPhase::Waiting, &[]);
+        assert_eq!(engine.expected_players("towerwars-1"), None);
+        assert_eq!(
+            transfer_targets(&engine.tick(t0)),
+            [(uid(10), "towerwars-1")]
+        );
+    }
+
+    #[test]
+    fn a_server_that_goes_away_forgets_its_expected_size() {
+        let mut engine = tower_engine();
+        let t0 = Instant::now();
+        tower_heartbeat(&mut engine, t0, "towerwars-1", ServerPhase::Waiting, &[]);
+        tower_join(&mut engine, t0, 10, 1);
+        engine.tick(t0);
+        engine.remove_server("towerwars-1");
+        assert_eq!(engine.expected_players("towerwars-1"), None);
+    }
+
+    #[test]
+    fn restored_towerwars_entries_without_a_size_count_as_solo() {
+        let mut engine = tower_engine();
+        let t0 = Instant::now();
+        engine.restore_queue(
+            t0,
+            vec![QueueRecord {
+                seq: 5,
+                player_uuid: uid(10),
+                name: "p10".to_owned(),
+                joined_at: chrono::Utc::now(),
+                state: QueueEntryState::Waiting,
+                game: GameKind::TowerWars,
+                match_size: 0,
+            }],
+        );
+        tower_heartbeat(&mut engine, t0, "towerwars-1", ServerPhase::Waiting, &[]);
+        assert_eq!(
+            transfer_targets(&engine.tick(t0)),
+            [(uid(10), "towerwars-1")]
+        );
+    }
+
+    #[test]
+    fn towerwars_needs_one_server_per_pending_match() {
+        let mut engine = tower_engine();
+        let t0 = Instant::now();
+        for n in 10..14 {
+            tower_join(&mut engine, t0, n, 1);
+        }
+        assert_eq!(engine.tick(t0).servers_to_create, 4);
     }
 }

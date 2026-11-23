@@ -5,17 +5,18 @@ use ferriscraft_orchestrator::api::{AppState, build_router};
 use ferriscraft_orchestrator::engine::FleetPolicy;
 use ferriscraft_orchestrator::queue::{
     FIRST_SEQ, MemoryQueueRepository, NewQueueEntry, QueueEntryState, QueueRepository, QueueStore,
-    restore_engine,
+    restore_engine, restore_games,
 };
 use ferriscraft_protocol::{
-    HeartbeatRequest, JoinQueueRequest, PlayerQueueState, PlayerQueueStatus, ProxyStateSnapshot,
-    ServerPhase, TransferAckRequest,
+    GameKind, HeartbeatRequest, JoinQueueRequest, PlayerQueueState, PlayerQueueStatus,
+    ProxyStateSnapshot, ServerPhase, TransferAckRequest,
 };
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
 fn policy() -> FleetPolicy {
     FleetPolicy {
+        game: GameKind::SheepWars,
         lobby_server_name: "lobby".to_owned(),
         queue_min_players: 2,
         max_players_per_server: 8,
@@ -28,6 +29,13 @@ fn policy() -> FleetPolicy {
         empty_grace: Duration::from_secs(30),
         ending_timeout: Duration::from_secs(60),
         heartbeat_timeout: Duration::from_secs(30),
+    }
+}
+
+fn tower_policy() -> FleetPolicy {
+    FleetPolicy {
+        game: GameKind::TowerWars,
+        ..policy()
     }
 }
 
@@ -44,6 +52,8 @@ async fn contract<R: QueueRepository>(repo: R) {
             name: "Alice",
             joined_at: Utc::now(),
             seq: None,
+            game: GameKind::SheepWars,
+            match_size: 0,
         })
         .await
         .unwrap();
@@ -53,6 +63,8 @@ async fn contract<R: QueueRepository>(repo: R) {
             name: "Bob",
             joined_at: Utc::now(),
             seq: None,
+            game: GameKind::SheepWars,
+            match_size: 0,
         })
         .await
         .unwrap();
@@ -65,6 +77,8 @@ async fn contract<R: QueueRepository>(repo: R) {
             name: "Alice2",
             joined_at: Utc::now(),
             seq: None,
+            game: GameKind::SheepWars,
+            match_size: 0,
         })
         .await
         .unwrap();
@@ -76,6 +90,8 @@ async fn contract<R: QueueRepository>(repo: R) {
             name: "Carol",
             joined_at: Utc::now(),
             seq: Some(a - 1),
+            game: GameKind::SheepWars,
+            match_size: 0,
         })
         .await
         .unwrap();
@@ -129,6 +145,185 @@ async fn contract<R: QueueRepository>(repo: R) {
     assert_eq!(left, [player(3), player(1)]);
 }
 
+async fn boot_games(store: &QueueStore) -> String {
+    let games = restore_games(policy(), vec![tower_policy()], store, Instant::now())
+        .await
+        .unwrap();
+    let state = AppState::from_games(games, None).with_queue(store.clone());
+    let app = build_router(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
+}
+
+async fn join_game(base: &str, n: u128, game: GameKind) {
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/v1/queue/join"))
+        .json(&JoinQueueRequest {
+            player_uuid: player(n),
+            player_name: format!("p{n}"),
+            game,
+            match_size: 0,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+}
+
+async fn status_game(base: &str, n: u128, game: &str) -> PlayerQueueStatus {
+    reqwest::get(format!(
+        "{base}/api/v1/queue/player/{}?game={game}",
+        player(n)
+    ))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap()
+}
+
+async fn game_column_round_trip<R: QueueRepository>(repo: R) {
+    for (n, game) in [
+        (1, GameKind::SheepWars),
+        (2, GameKind::TowerWars),
+        (3, GameKind::TowerWars),
+    ] {
+        repo.insert(NewQueueEntry {
+            player_uuid: player(n),
+            name: "p",
+            joined_at: Utc::now(),
+            seq: None,
+            game,
+            match_size: 0,
+        })
+        .await
+        .unwrap();
+    }
+    let loaded = repo.load_all().await.unwrap();
+    let games: Vec<(Uuid, GameKind)> = loaded.iter().map(|r| (r.player_uuid, r.game)).collect();
+    assert_eq!(
+        games,
+        [
+            (player(1), GameKind::SheepWars),
+            (player(2), GameKind::TowerWars),
+            (player(3), GameKind::TowerWars)
+        ]
+    );
+    repo.insert(NewQueueEntry {
+        player_uuid: player(2),
+        name: "renamed",
+        joined_at: Utc::now(),
+        seq: None,
+        game: GameKind::TowerWars,
+        match_size: 0,
+    })
+    .await
+    .unwrap();
+    let again = repo.load_all().await.unwrap();
+    assert_eq!(again[1].game, GameKind::TowerWars);
+    assert_eq!(again[1].name, "renamed");
+}
+
+async fn match_size_round_trip<R: QueueRepository>(repo: R) {
+    for (n, game, match_size) in [
+        (1, GameKind::SheepWars, 0),
+        (2, GameKind::TowerWars, 1),
+        (3, GameKind::TowerWars, 4),
+    ] {
+        repo.insert(NewQueueEntry {
+            player_uuid: player(n),
+            name: "p",
+            joined_at: Utc::now(),
+            seq: None,
+            game,
+            match_size,
+        })
+        .await
+        .unwrap();
+    }
+    let sizes: Vec<(Uuid, u8)> = repo
+        .load_all()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.player_uuid, r.match_size))
+        .collect();
+    assert_eq!(sizes, [(player(1), 0), (player(2), 1), (player(3), 4)]);
+}
+
+async fn spec_tw_26_each_game_queue_survives_a_restart(store: QueueStore) {
+    let first = boot_games(&store).await;
+    join_game(&first, 1, GameKind::SheepWars).await;
+    join_game(&first, 2, GameKind::TowerWars).await;
+    join_game(&first, 3, GameKind::TowerWars).await;
+    join_game(&first, 2, GameKind::SheepWars).await;
+
+    let second = boot_games(&store).await;
+    let sheep = status_game(&second, 1, "sheep_wars").await;
+    assert_eq!(
+        (sheep.state, sheep.position),
+        (PlayerQueueState::Queued, Some(1))
+    );
+    assert_eq!(sheep.total_queued, 1);
+    let tower_two = status_game(&second, 2, "tower_wars").await;
+    let tower_three = status_game(&second, 3, "tower_wars").await;
+    assert_eq!(tower_two.position, Some(1));
+    assert_eq!(tower_three.position, Some(2));
+    assert_eq!(tower_three.total_queued, 2);
+
+    let sheep_only = boot(&store).await;
+    assert_eq!(
+        status(&sheep_only, 2).await.state,
+        PlayerQueueState::NotQueued
+    );
+    assert_eq!(status(&sheep_only, 1).await.position, Some(1));
+}
+
+async fn match_size_survives_a_restart(store: QueueStore) {
+    let first = boot_games(&store).await;
+    for (n, size) in [(1, 0), (2, 3), (3, 9)] {
+        let resp = reqwest::Client::new()
+            .post(format!("{first}/api/v1/queue/join"))
+            .json(&JoinQueueRequest {
+                player_uuid: player(n),
+                player_name: format!("p{n}"),
+                game: GameKind::TowerWars,
+                match_size: size,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+    }
+    let sizes: Vec<u8> = store
+        .load_all()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.match_size)
+        .collect();
+    assert_eq!(sizes, [1, 3, 1]);
+
+    let second = boot_games(&store).await;
+    assert_eq!(
+        reqwest::get(format!(
+            "{second}/api/v1/queue/player/{}?game=tower_wars",
+            player(2)
+        ))
+        .await
+        .unwrap()
+        .json::<PlayerQueueStatus>()
+        .await
+        .unwrap()
+        .min_players,
+        3
+    );
+}
+
 async fn boot(store: &QueueStore) -> String {
     let engine = restore_engine(policy(), store, Instant::now())
         .await
@@ -149,6 +344,8 @@ async fn join(base: &str, n: u128) {
         .json(&JoinQueueRequest {
             player_uuid: player(n),
             player_name: format!("p{n}"),
+            game: GameKind::SheepWars,
+            match_size: 0,
         })
         .send()
         .await
@@ -317,6 +514,26 @@ async fn memory_plc_14_and_15_dispatched_entries_survive_and_fail_back() {
     plc_14_and_15_dispatched_entries_survive_and_fail_back(QueueStore::default()).await;
 }
 
+#[tokio::test]
+async fn memory_game_column_round_trip() {
+    game_column_round_trip(MemoryQueueRepository::default()).await;
+}
+
+#[tokio::test]
+async fn memory_match_size_round_trip() {
+    match_size_round_trip(MemoryQueueRepository::default()).await;
+}
+
+#[tokio::test]
+async fn memory_match_size_chosen_at_join_survives_a_restart() {
+    match_size_survives_a_restart(QueueStore::default()).await;
+}
+
+#[tokio::test]
+async fn memory_spec_tw_26_each_game_queue_survives_a_restart() {
+    spec_tw_26_each_game_queue_survives_a_restart(QueueStore::default()).await;
+}
+
 #[cfg(feature = "postgres-tests")]
 mod postgres {
     use ferriscraft_orchestrator::queue::PgQueueRepository;
@@ -337,8 +554,82 @@ mod postgres {
             .migrate()
             .await
             .unwrap();
-        let repo = PgQueueRepository::connect(&url).await.unwrap();
+        let pool = sqlx::PgPool::connect(&url).await.unwrap();
+        let repo = PgQueueRepository::from_pool(pool);
         (container, repo)
+    }
+
+    #[tokio::test]
+    async fn postgres_game_column_round_trip() {
+        let (_container, repo) = start().await;
+        game_column_round_trip(repo).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_match_size_round_trip() {
+        let (_container, repo) = start().await;
+        match_size_round_trip(repo).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_match_size_chosen_at_join_survives_a_restart() {
+        let (_container, repo) = start().await;
+        match_size_survives_a_restart(QueueStore::Postgres(repo)).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_migration_is_idempotent_and_old_rows_load_with_size_zero() {
+        let container = Postgres::default().start().await.unwrap();
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+        let progression = PgProgressionRepository::connect(&url).await.unwrap();
+        progression.migrate().await.unwrap();
+        let pool = sqlx::PgPool::connect(&url).await.unwrap();
+        sqlx::query(
+            "INSERT INTO queue_entries (player_uuid, name, game) VALUES ($1, 'old', 'towerwars')",
+        )
+        .bind(player(1))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../ferriscraft-progression-pg/migrations/0004_queue_match_size.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        progression.migrate().await.unwrap();
+        let loaded = PgQueueRepository::from_pool(pool).load_all().await.unwrap();
+        assert_eq!(loaded[0].match_size, 0);
+    }
+
+    #[tokio::test]
+    async fn postgres_spec_tw_26_each_game_queue_survives_a_restart() {
+        let (_container, repo) = start().await;
+        spec_tw_26_each_game_queue_survives_a_restart(QueueStore::Postgres(repo)).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_rows_written_without_a_game_load_as_sheepwars() {
+        let container = Postgres::default().start().await.unwrap();
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+        PgProgressionRepository::connect(&url)
+            .await
+            .unwrap()
+            .migrate()
+            .await
+            .unwrap();
+        let pool = sqlx::PgPool::connect(&url).await.unwrap();
+        sqlx::query("INSERT INTO queue_entries (player_uuid, name) VALUES ($1, 'legacy')")
+            .bind(player(1))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let repo = PgQueueRepository::from_pool(pool);
+        let loaded = repo.load_all().await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].game, GameKind::SheepWars);
     }
 
     #[tokio::test]

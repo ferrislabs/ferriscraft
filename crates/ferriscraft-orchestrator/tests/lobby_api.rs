@@ -3,14 +3,15 @@ use std::time::Duration;
 use ferriscraft_orchestrator::api::{AppState, build_router};
 use ferriscraft_orchestrator::engine::{FleetEngine, FleetPolicy};
 use ferriscraft_protocol::{
-    DrainResponse, FleetStatusSnapshot, HeartbeatRequest, PROXY_VERSION_HEADER, PlayerQueueStatus,
-    ServerKind, ServerPhase, SpectateRequest,
+    DrainResponse, FleetStatusSnapshot, GameKind, HeartbeatRequest, PROXY_VERSION_HEADER,
+    PlayerQueueStatus, ServerKind, ServerPhase, SpectateRequest,
 };
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
 async fn spawn() -> String {
     let policy = FleetPolicy {
+        game: GameKind::SheepWars,
         lobby_server_name: "lobby".to_owned(),
         queue_min_players: 2,
         max_players_per_server: 8,

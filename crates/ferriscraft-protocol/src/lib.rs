@@ -33,6 +33,17 @@ pub enum ServerKind {
     Lobby,
     #[default]
     SheepWars,
+    TowerWars,
+}
+
+impl ServerKind {
+    pub const fn game(self) -> Option<GameKind> {
+        match self {
+            Self::Lobby => None,
+            Self::SheepWars => Some(GameKind::SheepWars),
+            Self::TowerWars => Some(GameKind::TowerWars),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +85,15 @@ pub struct HeartbeatRequest {
     pub version: Option<String>,
 }
 
+/// Corps de réponse du heartbeat quand l'orchestrateur a une consigne pour le serveur
+/// (200). Sans consigne, la réponse reste 204 sans corps.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeartbeatResponse {
+    /// Nombre de joueurs à attendre avant de lancer la partie (TowerWars).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_players: Option<u32>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueueJoinStatus {
@@ -86,6 +106,11 @@ pub enum QueueJoinStatus {
 pub struct JoinQueueRequest {
     pub player_uuid: Uuid,
     pub player_name: String,
+    #[serde(default)]
+    pub game: GameKind,
+    /// Participants voulus dans la partie (1..=4). 0 : défaut du jeu. Ignoré hors TowerWars.
+    #[serde(default)]
+    pub match_size: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +139,8 @@ pub struct LeaveQueueRequest {
     pub player_uuid: Uuid,
     #[serde(default = "default_leave_reason")]
     pub reason: LeaveReason,
+    #[serde(default)]
+    pub game: GameKind,
 }
 
 const fn default_leave_reason() -> LeaveReason {
@@ -156,6 +183,21 @@ pub struct QueuedPlayerSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GameFleetStatus {
+    pub game: GameKind,
+    pub queue_len: usize,
+    pub min_players: usize,
+    pub max_players_per_server: u32,
+    pub min_replicas: usize,
+    pub max_replicas: usize,
+    pub standby_servers: usize,
+    pub ready_servers: usize,
+    pub in_game_servers: usize,
+    pub starting_servers: usize,
+    pub queued_players: Vec<QueuedPlayerSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetStatusSnapshot {
     pub queue_len: usize,
     pub min_players: usize,
@@ -174,6 +216,8 @@ pub struct FleetStatusSnapshot {
     pub lobbies: Vec<ServerSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub games: Vec<GameFleetStatus>,
 }
 
 pub const PROXY_VERSION_HEADER: &str = "x-ferriscraft-version";
@@ -256,10 +300,42 @@ pub struct PhaseUpdateRequest {
     pub phase: ServerPhase,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum GameKind {
+    #[default]
     SheepWars,
+    TowerWars,
+}
+
+impl GameKind {
+    pub const ALL: [Self; 2] = [Self::SheepWars, Self::TowerWars];
+
+    pub const fn server_kind(self) -> ServerKind {
+        match self {
+            Self::SheepWars => ServerKind::SheepWars,
+            Self::TowerWars => ServerKind::TowerWars,
+        }
+    }
+
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::SheepWars => "sheepwars",
+            Self::TowerWars => "towerwars",
+        }
+    }
+
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|game| game.slug() == slug)
+    }
+}
+
+impl From<GameKind> for ServerKind {
+    fn from(game: GameKind) -> Self {
+        game.server_kind()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -507,5 +583,67 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"game\":\"sheep_wars\""), "{json}");
         assert!(json.contains("\"outcome\":\"draw\""), "{json}");
+    }
+
+    #[test]
+    fn spec_tw_26_join_request_without_game_is_sheepwars() {
+        let json = r#"{"player_uuid":"00000000-0000-0000-0000-000000000000","player_name":"Alex"}"#;
+        let join: JoinQueueRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(join.game, GameKind::SheepWars);
+    }
+
+    #[test]
+    fn spec_tw_26_leave_request_without_game_is_sheepwars() {
+        let json = r#"{"player_uuid":"00000000-0000-0000-0000-000000000000"}"#;
+        let leave: LeaveQueueRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(leave.game, GameKind::SheepWars);
+        assert_eq!(leave.reason, LeaveReason::UserToggle);
+    }
+
+    #[test]
+    fn join_request_carries_the_game_on_the_wire() {
+        let join = JoinQueueRequest {
+            player_uuid: Uuid::nil(),
+            player_name: "Alex".into(),
+            game: GameKind::TowerWars,
+            match_size: 3,
+        };
+        let json = serde_json::to_string(&join).unwrap();
+        assert!(json.contains("\"game\":\"tower_wars\""), "{json}");
+        assert!(json.contains("\"match_size\":3"), "{json}");
+        let back: JoinQueueRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, join);
+    }
+
+    #[test]
+    fn join_request_without_match_size_still_parses() {
+        let json = r#"{"player_uuid":"00000000-0000-0000-0000-000000000000","player_name":"Alex"}"#;
+        let join: JoinQueueRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(join.match_size, 0);
+    }
+
+    #[test]
+    fn game_and_server_kind_convert_both_ways() {
+        for game in GameKind::ALL {
+            assert_eq!(ServerKind::from(game).game(), Some(game));
+            assert_eq!(GameKind::from_slug(game.slug()), Some(game));
+        }
+        assert_eq!(ServerKind::Lobby.game(), None);
+        assert_eq!(GameKind::from_slug("lobby"), None);
+        assert_eq!(GameKind::default(), GameKind::SheepWars);
+    }
+
+    #[test]
+    fn heartbeat_of_a_towerwars_server_keeps_its_kind() {
+        let json = r#"{"server_id":"tw-1","kind":"tower_wars","phase":"waiting","player_count":0,"max_players":12}"#;
+        let heartbeat: HeartbeatRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(heartbeat.kind, ServerKind::TowerWars);
+    }
+
+    #[test]
+    fn snapshot_from_an_older_orchestrator_has_no_games() {
+        let json = r#"{"queue_len":0,"min_players":1,"max_players_per_server":16,"min_replicas":1,"max_replicas":5,"standby_servers":1,"ready_servers":0,"in_game_servers":0,"starting_servers":0,"queued_players":[],"servers":[]}"#;
+        let snapshot: FleetStatusSnapshot = serde_json::from_str(json).unwrap();
+        assert!(snapshot.games.is_empty());
     }
 }

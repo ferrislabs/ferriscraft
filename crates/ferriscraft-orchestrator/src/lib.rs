@@ -2,6 +2,8 @@ pub mod api;
 pub mod config;
 pub mod crd;
 pub mod engine;
+pub mod game;
+pub mod games;
 pub mod k8s;
 pub mod lobby;
 pub mod progression;

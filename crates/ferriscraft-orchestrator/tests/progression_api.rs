@@ -23,6 +23,7 @@ struct Harness {
 
 fn policy() -> FleetPolicy {
     FleetPolicy {
+        game: GameKind::SheepWars,
         lobby_server_name: "lobby".to_owned(),
         queue_min_players: 2,
         max_players_per_server: 8,

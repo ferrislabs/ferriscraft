@@ -4,9 +4,9 @@ use std::time::Duration;
 use ferriscraft_orchestrator::api::{AppState, build_router};
 use ferriscraft_orchestrator::engine::{FleetEngine, FleetPolicy};
 use ferriscraft_protocol::{
-    FleetStatusSnapshot, HeartbeatRequest, JoinQueueRequest, JoinQueueResponse, LeaveQueueRequest,
-    LeaveReason, PlayerQueueState, PlayerQueueStatus, ProxyStateSnapshot, QueueJoinStatus,
-    SendToLobbyRequest, ServerPhase, SpectateRequest, TransferAckRequest,
+    FleetStatusSnapshot, GameKind, HeartbeatRequest, JoinQueueRequest, JoinQueueResponse,
+    LeaveQueueRequest, LeaveReason, PlayerQueueState, PlayerQueueStatus, ProxyStateSnapshot,
+    QueueJoinStatus, SendToLobbyRequest, ServerPhase, SpectateRequest, TransferAckRequest,
 };
 use futures_util::StreamExt;
 use tokio::net::TcpListener;
@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 async fn spawn_test_server(token: Option<&str>) -> String {
     let policy = FleetPolicy {
+        game: GameKind::SheepWars,
         lobby_server_name: "lobby".to_owned(),
         queue_min_players: 2,
         max_players_per_server: 8,
@@ -97,6 +98,8 @@ async fn end_to_end_queue_matchmaking_sse_and_auth() {
         .json(&JoinQueueRequest {
             player_uuid: p1,
             player_name: "Alice".to_owned(),
+            game: GameKind::SheepWars,
+            match_size: 0,
         })
         .send()
         .await
@@ -113,6 +116,8 @@ async fn end_to_end_queue_matchmaking_sse_and_auth() {
         .json(&JoinQueueRequest {
             player_uuid: p2,
             player_name: "Bob".to_owned(),
+            game: GameKind::SheepWars,
+            match_size: 0,
         })
         .send()
         .await
@@ -143,6 +148,7 @@ async fn end_to_end_queue_matchmaking_sse_and_auth() {
         .json(&LeaveQueueRequest {
             player_uuid: p1,
             reason: LeaveReason::LobbyQuit,
+            game: GameKind::SheepWars,
         })
         .send()
         .await
