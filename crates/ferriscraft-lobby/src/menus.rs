@@ -8,6 +8,7 @@ use rspigot_plugin::{
 
 use crate::auth::UserClaims;
 use crate::gadgets::LobbyGadget;
+use crate::orchestrator::QueueCounts;
 use crate::prefs::PlayerPrefs;
 use crate::profile::{gadget_usable, unlock_label};
 use crate::progress_menus::{ProgressMenuKind, populate_progress_menu};
@@ -17,6 +18,7 @@ use ferriscraft_protocol::{FleetStatusSnapshot, PlayerProfile};
 
 pub const HOTBAR_GAMES_SLOT: u8 = 0;
 pub const HOTBAR_SHEEPWARS_SLOT: u8 = 1;
+pub const HOTBAR_TOWERWARS_SLOT: u8 = 2;
 pub const HOTBAR_ACCOUNT_SLOT: u8 = 4;
 pub const HOTBAR_GADGETS_MENU_SLOT: u8 = 5;
 pub const HOTBAR_EQUIPPED_GADGET_SLOT: u8 = 6;
@@ -26,10 +28,12 @@ pub const HOTBAR_OPTIONS_SLOT: u8 = 8;
 pub const GAMES_ROWS: u8 = 5;
 pub const OPTIONS_ROWS: u8 = 4;
 pub const GADGETS_ROWS: u8 = 4;
+pub const TOWERWARS_SIZE_ROWS: u8 = 1;
 
 pub const SLOT_SHEEPWARS: u16 = 13;
 pub const SLOT_PITCHOUT: u16 = 20;
 pub const SLOT_FK: u16 = 21;
+pub const SLOT_TOWERWARS: u16 = 22;
 pub const SLOT_PVPSWAP: u16 = 23;
 pub const SLOT_OPEN_PROFILE: u16 = 30;
 pub const SLOT_OPEN_SHOP: u16 = 32;
@@ -63,6 +67,7 @@ pub const GAD_SLOT_BACK: u16 = 31;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GamesMenuAction {
     JoinSheepWars,
+    JoinTowerWars,
     ComingSoon(&'static str),
     OpenGadgets,
     OpenProfile,
@@ -95,6 +100,7 @@ pub fn decode_games_click(slot: i32) -> Option<GamesMenuAction> {
     let slot = u16::try_from(slot).ok()?;
     match slot {
         SLOT_SHEEPWARS => Some(GamesMenuAction::JoinSheepWars),
+        SLOT_TOWERWARS => Some(GamesMenuAction::JoinTowerWars),
         SLOT_PITCHOUT => Some(GamesMenuAction::ComingSoon("Pitchout")),
         SLOT_FK => Some(GamesMenuAction::ComingSoon("Fallen Kingdoms")),
         SLOT_PVPSWAP => Some(GamesMenuAction::ComingSoon("PvP Swap")),
@@ -108,6 +114,79 @@ pub fn decode_games_click(slot: i32) -> Option<GamesMenuAction> {
         SLOT_TP_CASTLE => Some(GamesMenuAction::TeleportPoi("castle")),
         SLOT_OPEN_OPTIONS => Some(GamesMenuAction::OpenOptions),
         _ => None,
+    }
+}
+
+pub struct TowerWarsSizeOption {
+    pub slot: u16,
+    pub size: u8,
+    pub name: &'static str,
+    pub lore: [&'static str; 3],
+}
+
+pub const fn towerwars_size_options() -> [TowerWarsSizeOption; 4] {
+    [
+        TowerWarsSizeOption {
+            slot: 1,
+            size: 1,
+            name: "§b§lSolo",
+            lore: [
+                "§7Démarre immédiatement",
+                "§7Vous jouez sur votre propre voie.",
+                "§a▶ Cliquez pour rejoindre !",
+            ],
+        },
+        TowerWarsSizeOption {
+            slot: 3,
+            size: 2,
+            name: "§b§lDuo",
+            lore: [
+                "§7Partie à 2 joueurs",
+                "§7Chacun joue sur sa propre voie.",
+                "§a▶ Cliquez pour rejoindre !",
+            ],
+        },
+        TowerWarsSizeOption {
+            slot: 5,
+            size: 3,
+            name: "§b§lTrio",
+            lore: [
+                "§7Partie à 3 joueurs",
+                "§7Chacun joue sur sa propre voie.",
+                "§a▶ Cliquez pour rejoindre !",
+            ],
+        },
+        TowerWarsSizeOption {
+            slot: 7,
+            size: 4,
+            name: "§b§lQuatuor",
+            lore: [
+                "§7Partie à 4 joueurs",
+                "§7Chacun joue sur sa propre voie.",
+                "§a▶ Cliquez pour rejoindre !",
+            ],
+        },
+    ]
+}
+
+pub fn decode_towerwars_size_click(slot: i32) -> Option<u8> {
+    let slot = u16::try_from(slot).ok()?;
+    towerwars_size_options()
+        .iter()
+        .find(|o| o.slot == slot)
+        .map(|o| o.size)
+}
+
+pub fn populate_towerwars_size_menu(inv: &CustomInventory) {
+    for option in towerwars_size_options() {
+        inv.set(
+            option.slot,
+            Some(
+                ItemStack::new(Material::WhiteWool, option.size)
+                    .name(option.name)
+                    .lore(option.lore),
+            ),
+        );
     }
 }
 
@@ -155,6 +234,14 @@ pub fn apply_lobby_hotbar(player: &Player, claims: Option<&UserClaims>, prefs: &
         .lore([
             "§7Rejoignez directement la bataille",
             "§7des moutons explosifs et galactiques !",
+        ])
+        .enchant(Enchantment::Unbreaking, 1);
+
+    let towerwars = ItemStack::new(Material::Crossbow, 1)
+        .name("§b§lTowerWars §7(Accès direct)")
+        .lore([
+            "§7Bâtissez vos tours d'archers et repoussez",
+            "§7les vagues envoyées par vos adversaires !",
         ])
         .enchant(Enchantment::Unbreaking, 1);
 
@@ -209,6 +296,10 @@ pub fn apply_lobby_hotbar(player: &Player, claims: Option<&UserClaims>, prefs: &
         Some(sheepwars),
     ));
     player.inventory.set(SlotItem::new(
+        InventorySlot::Hotbar(HOTBAR_TOWERWARS_SLOT),
+        Some(towerwars),
+    ));
+    player.inventory.set(SlotItem::new(
         InventorySlot::Hotbar(HOTBAR_ACCOUNT_SLOT),
         Some(account),
     ));
@@ -249,7 +340,7 @@ pub(crate) fn fill_border(inv: &CustomInventory, rows: u8, accent: Material, neu
     }
 }
 
-pub fn populate_games_menu(inv: &CustomInventory, queued_sheepwars: usize) {
+pub fn populate_games_menu(inv: &CustomInventory, queued: QueueCounts) {
     fill_border(
         inv,
         GAMES_ROWS,
@@ -269,7 +360,25 @@ pub fn populate_games_menu(inv: &CustomInventory, queued_sheepwars: usize) {
                     "§7de moutons explosifs, chercheurs, glacés et".to_owned(),
                     "§7intergalactiques sur un décor destructible !".to_owned(),
                     String::new(),
-                    format!("§7En file / prêts : §d{queued_sheepwars}"),
+                    format!("§7En file / prêts : §d{}", queued.sheepwars),
+                    "§a▶ Cliquez pour rejoindre !".to_owned(),
+                ])
+                .enchant(Enchantment::Unbreaking, 1),
+        ),
+    );
+
+    inv.set(
+        SLOT_TOWERWARS,
+        Some(
+            ItemStack::new(Material::Crossbow, 1)
+                .name("§b§l🏹 TOWERWARS §8• §a§lOUVERT")
+                .lore([
+                    "§8Tower defense en duel".to_owned(),
+                    String::new(),
+                    "§7Posez des tours d'archers, envoyez des vagues".to_owned(),
+                    "§7chez l'adversaire et protégez votre cœur !".to_owned(),
+                    String::new(),
+                    format!("§7En file / prêts : §b{}", queued.towerwars),
                     "§a▶ Cliquez pour rejoindre !".to_owned(),
                 ])
                 .enchant(Enchantment::Unbreaking, 1),
@@ -685,6 +794,7 @@ pub struct MenuManager {
     gadgets_menus: RwLock<HashMap<Uuid, CustomInventory>>,
     servers_menus: RwLock<HashMap<Uuid, (CustomInventory, ServerMenuIds)>>,
     progress_menus: RwLock<HashMap<Uuid, (CustomInventory, ProgressMenuKind)>>,
+    towerwars_size_menus: RwLock<HashMap<Uuid, CustomInventory>>,
 }
 
 impl MenuManager {
@@ -692,7 +802,7 @@ impl MenuManager {
         let inv = server
             .create_inventory(GAMES_ROWS, "§5§lFerrisCraft §8• §fMini-Jeux")
             .await?;
-        populate_games_menu(&inv, 0);
+        populate_games_menu(&inv, QueueCounts::default());
         *self.games_menu.write().unwrap_or_else(|e| e.into_inner()) = Some(inv);
         Ok(())
     }
@@ -704,9 +814,9 @@ impl MenuManager {
             .clone()
     }
 
-    pub fn refresh_games_menu(&self, queued_sheepwars: usize) {
+    pub fn refresh_games_menu(&self, queued: QueueCounts) {
         if let Some(inv) = self.games_menu() {
-            populate_games_menu(&inv, queued_sheepwars);
+            populate_games_menu(&inv, queued);
         }
     }
 
@@ -903,6 +1013,45 @@ impl MenuManager {
             .map(|(_, ids)| ids.clone())
     }
 
+    pub async fn open_towerwars_size(&self, server: &Server, player: &Player) -> Result<(), Error> {
+        self.discard_towerwars_size(player.uuid);
+        let inv = server
+            .create_inventory(TOWERWARS_SIZE_ROWS, "§b§lTowerWars §8• §fTaille de partie")
+            .await?;
+        populate_towerwars_size_menu(&inv);
+        self.towerwars_size_menus
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(player.uuid, inv.clone());
+        player.inventory.open(&inv).await
+    }
+
+    pub fn is_player_towerwars_size_inventory(
+        &self,
+        player_uuid: Uuid,
+        inv_ref: Option<&InventoryRef>,
+    ) -> bool {
+        let Some(custom) = inv_ref.and_then(InventoryRef::custom) else {
+            return false;
+        };
+        self.towerwars_size_menus
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&player_uuid)
+            .is_some_and(|known| known == custom)
+    }
+
+    pub fn discard_towerwars_size(&self, player_uuid: Uuid) {
+        if let Some(removed) = self
+            .towerwars_size_menus
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&player_uuid)
+        {
+            removed.discard();
+        }
+    }
+
     pub fn discard_servers(&self, player_uuid: Uuid) {
         if let Some((removed, _)) = self
             .servers_menus
@@ -997,6 +1146,17 @@ impl MenuManager {
         {
             removed.discard();
         }
+        drop(prg_guard);
+
+        let mut size_guard = self
+            .towerwars_size_menus
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if size_guard.get(&player_uuid) == Some(custom)
+            && let Some(removed) = size_guard.remove(&player_uuid)
+        {
+            removed.discard();
+        }
     }
 
     pub fn discard_options(&self, player_uuid: Uuid) {
@@ -1027,10 +1187,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn towerwars_size_menu_is_one_row_with_wool_at_odd_slots() {
+        assert_eq!(TOWERWARS_SIZE_ROWS, 1);
+        let options = towerwars_size_options();
+        let layout: Vec<(u16, u8)> = options.iter().map(|o| (o.slot, o.size)).collect();
+        assert_eq!(layout, vec![(1, 1), (3, 2), (5, 3), (7, 4)]);
+        assert!(options.iter().all(|o| o.slot < 9));
+    }
+
+    #[test]
+    fn towerwars_size_options_have_french_names_and_lore() {
+        let options = towerwars_size_options();
+        let names: Vec<&str> = options.iter().map(|o| o.name).collect();
+        assert_eq!(
+            names,
+            vec!["§b§lSolo", "§b§lDuo", "§b§lTrio", "§b§lQuatuor"]
+        );
+        assert_eq!(options[0].lore[0], "§7Démarre immédiatement");
+        assert_eq!(options[1].lore[0], "§7Partie à 2 joueurs");
+        assert_eq!(options[3].lore[0], "§7Partie à 4 joueurs");
+        assert!(options.iter().all(|o| o.lore[1].contains("voie")));
+    }
+
+    #[test]
+    fn towerwars_size_click_maps_slot_to_match_size() {
+        assert_eq!(decode_towerwars_size_click(1), Some(1));
+        assert_eq!(decode_towerwars_size_click(3), Some(2));
+        assert_eq!(decode_towerwars_size_click(5), Some(3));
+        assert_eq!(decode_towerwars_size_click(7), Some(4));
+        assert_eq!(decode_towerwars_size_click(0), None);
+        assert_eq!(decode_towerwars_size_click(4), None);
+        assert_eq!(decode_towerwars_size_click(9), None);
+        assert_eq!(decode_towerwars_size_click(-1), None);
+    }
+
+    #[test]
     fn games_options_and_gadgets_slots_decode_to_expected_actions() {
         assert_eq!(
             decode_games_click(i32::from(SLOT_SHEEPWARS)),
             Some(GamesMenuAction::JoinSheepWars)
+        );
+        assert_eq!(
+            decode_games_click(i32::from(SLOT_TOWERWARS)),
+            Some(GamesMenuAction::JoinTowerWars)
         );
         assert_eq!(
             decode_games_click(i32::from(SLOT_OPEN_GADGETS)),

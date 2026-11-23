@@ -87,3 +87,36 @@ async fn empty_store_is_seeded_with_the_bundled_layout() {
     assert_eq!(layout, seed);
     assert_eq!(*repo.saved.lock().expect("lock"), Some(seed));
 }
+
+fn legacy_layout_with_uhc_pedestal() -> LobbyLayout {
+    let mut layout = admin_layout();
+    let slot = layout
+        .pedestals
+        .iter_mut()
+        .find(|p| p.id == "towerwars")
+        .expect("default has towerwars");
+    slot.id = "uhc".to_owned();
+    slot.game_id = "uhc".to_owned();
+    slot.active = false;
+    slot.pose = WaypointPose::new(7.5, 30.0, -70.5, 90.0, 0.0);
+    layout
+}
+
+#[tokio::test]
+async fn stored_layout_without_towerwars_gets_it_in_place_of_the_inactive_uhc_slot() {
+    let repo = Flaky::new(0, Some(legacy_layout_with_uhc_pedestal()));
+    let layout = load_or_seed(&repo, &LobbyLayout::default(), fast(None))
+        .await
+        .expect("loads");
+    let tower = layout
+        .pedestals
+        .iter()
+        .find(|p| p.id == "towerwars")
+        .expect("towerwars pedestal added");
+    assert!(tower.active);
+    assert_eq!(tower.game_id, "towerwars");
+    assert_eq!(tower.pose, WaypointPose::new(7.5, 30.0, -70.5, 90.0, 0.0));
+    assert!(layout.pedestals.iter().all(|p| p.id != "uhc"));
+    assert_eq!(layout.spawn, admin_layout().spawn);
+    assert_eq!(*repo.saved.lock().expect("lock"), Some(layout));
+}
