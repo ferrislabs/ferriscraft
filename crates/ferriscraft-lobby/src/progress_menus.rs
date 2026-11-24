@@ -1,20 +1,22 @@
 use ferriscraft_progression::{Catalog, CatalogEntry};
-use ferriscraft_protocol::{
-    CosmeticId, CosmeticSlot, GameKind, GameStats, LevelProgress, PlayerProfile,
-};
+use ferriscraft_protocol::{CosmeticId, CosmeticSlot, GameKind, GameStats, PlayerProfile};
 use rspigot_plugin::{CustomInventory, Enchantment, ItemStack, Material};
 
+use crate::auth::UserClaims;
 use crate::gadgets::{AuraTrail, LobbyGadget};
-use crate::menus::fill_border;
-use crate::profile::{ShopItemState, shop_item_state, unlock_label};
+use crate::menus::{back_item, close_item, fill_border, player_head};
+use crate::profile::{ShopItemState, rank_label, shop_item_state, unlock_label};
 
-pub const PROFILE_ROWS: u8 = 4;
+pub const PROFILE_ROWS: u8 = 5;
 pub const SHOP_ROWS: u8 = 5;
 
-pub const PROFILE_SLOT_NETWORK: u16 = 13;
-pub const PROFILE_SLOT_GAMES_START: u16 = 20;
-pub const PROFILE_SLOT_SHOP: u16 = 24;
-pub const PROFILE_SLOT_BACK: u16 = 31;
+pub const PROFILE_SLOT_INFO: u16 = 13;
+pub const PROFILE_STATS_SLOTS: [(u16, GameKind); 2] =
+    [(21, GameKind::SheepWars), (23, GameKind::TowerWars)];
+pub const PROFILE_SLOT_SETTINGS: u16 = 29;
+pub const PROFILE_SLOT_FERRISKEY: u16 = 31;
+pub const PROFILE_SLOT_SHOP: u16 = 33;
+pub const PROFILE_SLOT_CLOSE: u16 = 40;
 
 pub const SHOP_SLOT_COINS: u16 = 4;
 pub const SHOP_SLOT_BACK: u16 = 40;
@@ -45,7 +47,7 @@ impl ProgressMenuKind {
 
     pub const fn title(self) -> &'static str {
         match self {
-            Self::Profile => "§6§lFerrisCraft §8• §fProfil",
+            Self::Profile => "§e§lFerrisCraft §8• §fMon profil",
             Self::Shop(_) => "§a§lFerrisCraft §8• §fBoutique",
         }
     }
@@ -53,21 +55,31 @@ impl ProgressMenuKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProfileMenuAction {
+    OpenSettings,
+    FerrisKey,
     OpenShop,
-    BackToGames,
+    Close,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShopMenuAction {
     Page(CosmeticSlot),
     Item(CosmeticId),
-    BackToGames,
+    BackToCollectibles,
+}
+
+pub struct ProfileView<'a> {
+    pub name: &'a str,
+    pub profile: Option<&'a PlayerProfile>,
+    pub claims: Option<&'a UserClaims>,
 }
 
 pub fn decode_profile_click(slot: i32) -> Option<ProfileMenuAction> {
     match u16::try_from(slot).ok()? {
+        PROFILE_SLOT_SETTINGS => Some(ProfileMenuAction::OpenSettings),
+        PROFILE_SLOT_FERRISKEY => Some(ProfileMenuAction::FerrisKey),
         PROFILE_SLOT_SHOP => Some(ProfileMenuAction::OpenShop),
-        PROFILE_SLOT_BACK => Some(ProfileMenuAction::BackToGames),
+        PROFILE_SLOT_CLOSE => Some(ProfileMenuAction::Close),
         _ => None,
     }
 }
@@ -75,7 +87,7 @@ pub fn decode_profile_click(slot: i32) -> Option<ProfileMenuAction> {
 pub fn decode_shop_click(slot: i32, page: CosmeticSlot) -> Option<ShopMenuAction> {
     let slot = u16::try_from(slot).ok()?;
     if slot == SHOP_SLOT_BACK {
-        return Some(ShopMenuAction::BackToGames);
+        return Some(ShopMenuAction::BackToCollectibles);
     }
     if let Some((_, tab)) = SHOP_TAB_SLOTS.iter().find(|(s, _)| *s == slot) {
         return Some(ShopMenuAction::Page(*tab));
@@ -187,7 +199,7 @@ fn clear(inv: &CustomInventory, rows: u8) {
     }
 }
 
-fn populate_unavailable(inv: &CustomInventory, kind: ProgressMenuKind, back: u16) {
+fn populate_shop_unavailable(inv: &CustomInventory, kind: ProgressMenuKind, back: u16) {
     clear(inv, kind.rows());
     inv.set(
         UNAVAILABLE_SLOT,
@@ -200,67 +212,110 @@ fn populate_unavailable(inv: &CustomInventory, kind: ProgressMenuKind, back: u16
                 ]),
         ),
     );
-    inv.set(
-        back,
-        Some(
-            ItemStack::new(Material::Compass, 1)
-                .name("§6§l← Retour au Menu des Jeux")
-                .lore(["§7Revenir à la carte de navigation."]),
-        ),
-    );
+    inv.set(back, Some(back_item("aux collectibles")));
 }
 
-pub fn populate_progress_menu(
-    inv: &CustomInventory,
-    kind: ProgressMenuKind,
-    profile: Option<&PlayerProfile>,
-) {
+pub fn populate_progress_menu(inv: &CustomInventory, kind: ProgressMenuKind, view: &ProfileView) {
     match kind {
-        ProgressMenuKind::Profile => populate_profile_menu(inv, profile),
-        ProgressMenuKind::Shop(page) => populate_shop_menu(inv, page, profile),
+        ProgressMenuKind::Profile => populate_profile_menu(inv, view),
+        ProgressMenuKind::Shop(page) => populate_shop_menu(inv, page, view.profile),
     }
 }
 
-fn network_item(network: &LevelProgress) -> ItemStack {
-    ItemStack::new(Material::Emerald, 1)
-        .name(format!("§6§lLevel réseau §f{}", network.level))
-        .lore([
-            progress_bar(network.xp_into_level, network.xp_for_next),
-            format!(
-                "§7XP : §f{}§7/§f{}",
-                network.xp_into_level, network.xp_for_next
-            ),
-            format!("§7XP totale : §f{}", network.total_xp),
-        ])
-        .enchant(Enchantment::Unbreaking, 1)
+fn ferriskey_line(claims: Option<&UserClaims>) -> String {
+    match claims {
+        Some(user) => format!("§7FerrisKey : §a✔ {}", user.username),
+        None => "§7FerrisKey : §cnon lié".to_owned(),
+    }
 }
 
-fn game_item(stats: &GameStats) -> ItemStack {
-    ItemStack::new(Material::WhiteWool, 1)
-        .name(format!(
-            "§d§l{} §7• Level §f{}",
-            game_label(stats.game),
-            stats.progress.level
-        ))
-        .lore([
-            progress_bar(stats.progress.xp_into_level, stats.progress.xp_for_next),
-            format!(
-                "§7XP : §f{}§7/§f{}",
-                stats.progress.xp_into_level, stats.progress.xp_for_next
-            ),
-            String::new(),
-            format!("§7Parties jouées : §f{}", stats.played),
-            format!("§aVictoires : §f{}", stats.wins),
-            format!("§cDéfaites : §f{}", stats.losses),
-            format!("§eÉgalités : §f{}", stats.draws),
-        ])
+fn info_item(view: &ProfileView) -> ItemStack {
+    let mut lore = Vec::new();
+    match view.profile {
+        Some(profile) => {
+            let network = &profile.network;
+            lore.push(format!("§7Grade : §f{}", rank_label(profile.rank)));
+            lore.push(format!("§7Level réseau : §f{}", network.level));
+            lore.push(progress_bar(network.xp_into_level, network.xp_for_next));
+            lore.push(format!(
+                "§7XP : §f{}§7/§f{} §8(total {})",
+                network.xp_into_level, network.xp_for_next, network.total_xp
+            ));
+            lore.push(format!("§6Coins : §f{}", profile.coins));
+        }
+        None => lore.push("§cProgression indisponible.".to_owned()),
+    }
+    lore.push(ferriskey_line(view.claims));
+    player_head(view.name)
+        .name(format!("§e§l{}", view.name))
+        .lore(lore)
 }
 
-pub fn populate_profile_menu(inv: &CustomInventory, profile: Option<&PlayerProfile>) {
+const fn game_material(game: GameKind) -> Material {
+    match game {
+        GameKind::SheepWars => Material::WhiteWool,
+        GameKind::TowerWars => Material::Crossbow,
+    }
+}
+
+fn win_rate(stats: &GameStats) -> u64 {
+    (u64::from(stats.wins) * 100)
+        .checked_div(u64::from(stats.played))
+        .unwrap_or(0)
+}
+
+fn stats_item(game: GameKind, profile: Option<&PlayerProfile>) -> ItemStack {
+    let base = ItemStack::new(game_material(game), 1);
     let Some(profile) = profile else {
-        populate_unavailable(inv, ProgressMenuKind::Profile, PROFILE_SLOT_BACK);
-        return;
+        return base
+            .name(format!("§7§l{}", game_label(game)))
+            .lore(["§cStatistiques indisponibles."]);
     };
+    let Some(stats) = profile.games.iter().find(|s| s.game == game) else {
+        return base
+            .name(format!("§f§l{} §7• Level §f1", game_label(game)))
+            .lore(["§7Aucune partie jouée."]);
+    };
+    base.name(format!(
+        "§f§l{} §7• Level §f{}",
+        game_label(game),
+        stats.progress.level
+    ))
+    .lore([
+        progress_bar(stats.progress.xp_into_level, stats.progress.xp_for_next),
+        String::new(),
+        format!("§7Parties : §f{}", stats.played),
+        format!("§aVictoires : §f{} §8({}%)", stats.wins, win_rate(stats)),
+        format!("§cDéfaites : §f{}", stats.losses),
+        format!("§eÉgalités : §f{}", stats.draws),
+    ])
+}
+
+fn ferriskey_item(claims: Option<&UserClaims>) -> ItemStack {
+    match claims {
+        Some(user) => ItemStack::new(Material::Emerald, 1)
+            .name("§a§lCompte FerrisKey")
+            .lore([
+                format!("§7Pseudo : §f{}", user.username),
+                format!(
+                    "§7E-mail : §f{}",
+                    user.email.as_deref().unwrap_or("non renseigné")
+                ),
+                String::new(),
+                "§c▶ Cliquez pour délier".to_owned(),
+            ]),
+        None => ItemStack::new(Material::AmethystShard, 1)
+            .name("§e§lCompte FerrisKey")
+            .lore([
+                "§7Non lié. Donne accès aux grades",
+                "§7et à la Capitainerie.",
+                "",
+                "§a▶ Cliquez pour lier",
+            ]),
+    }
+}
+
+pub fn populate_profile_menu(inv: &CustomInventory, view: &ProfileView) {
     clear(inv, PROFILE_ROWS);
     fill_border(
         inv,
@@ -268,43 +323,40 @@ pub fn populate_profile_menu(inv: &CustomInventory, profile: Option<&PlayerProfi
         Material::YellowStainedGlassPane,
         Material::GrayStainedGlassPane,
     );
-    inv.set(PROFILE_SLOT_NETWORK, Some(network_item(&profile.network)));
-    if profile.games.is_empty() {
-        inv.set(
-            PROFILE_SLOT_GAMES_START,
-            Some(
-                ItemStack::new(Material::WhiteWool, 1)
-                    .name("§7Aucune partie comptée")
-                    .lore(["§7Jouez à SheepWars ou TowerWars pour gagner de l'XP !"]),
-            ),
-        );
+    inv.set(PROFILE_SLOT_INFO, Some(info_item(view)));
+    for (slot, game) in PROFILE_STATS_SLOTS {
+        inv.set(slot, Some(stats_item(game, view.profile)));
     }
-    for (offset, stats) in profile.games.iter().enumerate() {
-        let Ok(offset) = u16::try_from(offset) else {
-            break;
-        };
-        inv.set(PROFILE_SLOT_GAMES_START + offset, Some(game_item(stats)));
-    }
+    inv.set(
+        PROFILE_SLOT_SETTINGS,
+        Some(
+            ItemStack::new(Material::Comparator, 1)
+                .name("§6§lParamètres")
+                .lore([
+                    "§7Visibilité, vol, vitesse, sons.",
+                    "",
+                    "§e▶ Cliquez pour ouvrir",
+                ]),
+        ),
+    );
+    inv.set(PROFILE_SLOT_FERRISKEY, Some(ferriskey_item(view.claims)));
+    let coins_line = view.profile.map_or_else(
+        || "§7Coins : §findisponible".to_owned(),
+        |p| format!("§6Coins : §f{}", p.coins),
+    );
     inv.set(
         PROFILE_SLOT_SHOP,
         Some(
             ItemStack::new(Material::GoldIngot, 1)
                 .name("§a§lBoutique")
                 .lore([
-                    format!("§6Coins §f{}", profile.coins),
+                    coins_line,
                     String::new(),
-                    "§e▶ Cliquez pour ouvrir la boutique".to_owned(),
+                    "§e▶ Cliquez pour ouvrir".to_owned(),
                 ]),
         ),
     );
-    inv.set(
-        PROFILE_SLOT_BACK,
-        Some(
-            ItemStack::new(Material::Compass, 1)
-                .name("§6§l← Retour au Menu des Jeux")
-                .lore(["§7Revenir à la carte de navigation."]),
-        ),
-    );
+    inv.set(PROFILE_SLOT_CLOSE, Some(close_item()));
 }
 
 pub fn populate_shop_menu(
@@ -314,7 +366,7 @@ pub fn populate_shop_menu(
 ) {
     let kind = ProgressMenuKind::Shop(page);
     let Some(profile) = profile else {
-        populate_unavailable(inv, kind, SHOP_SLOT_BACK);
+        populate_shop_unavailable(inv, kind, SHOP_SLOT_BACK);
         return;
     };
     clear(inv, SHOP_ROWS);
@@ -349,14 +401,7 @@ pub fn populate_shop_menu(
         }
         inv.set(slot, Some(item));
     }
-    inv.set(
-        SHOP_SLOT_BACK,
-        Some(
-            ItemStack::new(Material::Compass, 1)
-                .name("§6§l← Retour au Menu des Jeux")
-                .lore(["§7Revenir à la carte de navigation."]),
-        ),
-    );
+    inv.set(SHOP_SLOT_BACK, Some(back_item("aux collectibles")));
 }
 
 #[cfg(test)]
@@ -394,7 +439,7 @@ mod tests {
         }
         assert_eq!(
             decode_shop_click(i32::from(SHOP_SLOT_BACK), CosmeticSlot::SheepTrail),
-            Some(ShopMenuAction::BackToGames)
+            Some(ShopMenuAction::BackToCollectibles)
         );
         assert_eq!(decode_shop_click(-1, CosmeticSlot::SheepTrail), None);
         assert_eq!(decode_shop_click(0, CosmeticSlot::SheepTrail), None);
@@ -403,13 +448,24 @@ mod tests {
     #[test]
     fn profile_slots_decode() {
         assert_eq!(
+            decode_profile_click(i32::from(PROFILE_SLOT_SETTINGS)),
+            Some(ProfileMenuAction::OpenSettings)
+        );
+        assert_eq!(
+            decode_profile_click(i32::from(PROFILE_SLOT_FERRISKEY)),
+            Some(ProfileMenuAction::FerrisKey)
+        );
+        assert_eq!(
             decode_profile_click(i32::from(PROFILE_SLOT_SHOP)),
             Some(ProfileMenuAction::OpenShop)
         );
         assert_eq!(
-            decode_profile_click(i32::from(PROFILE_SLOT_BACK)),
-            Some(ProfileMenuAction::BackToGames)
+            decode_profile_click(i32::from(PROFILE_SLOT_CLOSE)),
+            Some(ProfileMenuAction::Close)
         );
+        for (slot, _) in PROFILE_STATS_SLOTS {
+            assert_eq!(decode_profile_click(i32::from(slot)), None);
+        }
         assert_eq!(decode_profile_click(0), None);
     }
 
