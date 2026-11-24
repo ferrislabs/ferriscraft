@@ -129,6 +129,7 @@ impl ChunkGenerator for FlatIsland {
 
 struct TestPlayer {
     id: PlayerId,
+    name: String,
     link: Link,
     log: Vec<ClientEvent>,
     confirmed_cursor: usize,
@@ -324,32 +325,24 @@ fn confirm_teleports(server: &mut Server<Link>, player: &mut TestPlayer) {
     server.deliver();
 }
 
-fn walk_close_to(core: &mut Core, player: &mut TestPlayer, target: Vec3) {
-    loop {
+const ARRIVAL_TICKS: usize = 200;
+const ARRIVAL_RADIUS: f64 = 2.2;
+const STAND_OFFSET: f64 = 1.5;
+
+fn move_close_to(core: &mut Core, player: &mut TestPlayer, target: Vec3) {
+    let spot = Vec3::new(target.x + STAND_OFFSET, target.y, target.z);
+    core.server.handle(Inbound::Console(format!(
+        "tp {} {} {} {}",
+        player.name, spot.x, spot.y, spot.z
+    )));
+    for _ in 0..ARRIVAL_TICKS {
         confirm_teleports(&mut core.server, player);
         let dx = target.x - player.pos.x;
         let dy = target.y - player.pos.y;
         let dz = target.z - player.pos.z;
-        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
-        if dist <= 2.2 {
-            break;
+        if (dx * dx + dy * dy + dz * dz).sqrt() <= ARRIVAL_RADIUS {
+            return;
         }
-        let step = (dist - 1.5).min(6.0) / dist;
-        let next = Vec3::new(
-            player.pos.x + dx * step,
-            player.pos.y + dy * step,
-            player.pos.z + dz * step,
-        );
-        player.pos = next;
-        core.server.handle(Inbound::Input {
-            player: player.id,
-            input: PlayerInput::Move {
-                position: Some(next),
-                rotation: None,
-                on_ground: true,
-            },
-        });
-        core.server.deliver();
         let waiting = core.inbox.len();
         let inbox = core.inbox.clone();
         for msg in inbox.try_iter().take(waiting) {
@@ -357,13 +350,8 @@ fn walk_close_to(core: &mut Core, player: &mut TestPlayer, target: Vec3) {
         }
         core.server.tick();
         std::thread::sleep(Duration::from_millis(15));
-        let waiting = core.inbox.len();
-        let inbox = core.inbox.clone();
-        for msg in inbox.try_iter().take(waiting) {
-            core.handle(msg);
-        }
-        core.server.tick();
     }
+    panic!("player never reached {target:?}, still at {:?}", player.pos);
 }
 
 fn join(server: &mut Server<Link>, name: &str) -> TestPlayer {
@@ -384,6 +372,7 @@ fn join(server: &mut Server<Link>, name: &str) -> TestPlayer {
     server.tick();
     let mut player = TestPlayer {
         id,
+        name: name.to_owned(),
         link,
         log: Vec::new(),
         confirmed_cursor: 0,
@@ -780,14 +769,14 @@ fn lobby_spawns_pedestals_living_npcs_rich_chat_and_per_player_ferriskey_capitai
     let (captain_id, captain_pos) = captain_npc.unwrap();
 
     // 1. Walk to Guard & interact
-    walk_close_to(&mut core, &mut alice, guard_pos);
+    move_close_to(&mut core, &mut alice, guard_pos);
     interact_entity(&mut core.server, &alice, guard_id);
     core.run_until("Guard greets Alice", |_| {
         alice.said("Bienvenue dans la Citadelle FerrisCraft")
     });
 
     // 2. Walk to SheepWars pedestal NPC & click to join queue
-    walk_close_to(&mut core, &mut alice, sheepwars_pos);
+    move_close_to(&mut core, &mut alice, sheepwars_pos);
     interact_entity(&mut core.server, &alice, sheepwars_id);
     core.run_until("Alice joins SheepWars queue", |_| {
         alice.said("file d'attente") && alice.label_has("En file : 1")
@@ -804,7 +793,7 @@ fn lobby_spawns_pedestals_living_npcs_rich_chat_and_per_player_ferriskey_capitai
     });
 
     // 4. Walk to Captain before FerrisKey login -> prompts Device Flow dialog
-    walk_close_to(&mut core, &mut alice, captain_pos);
+    move_close_to(&mut core, &mut alice, captain_pos);
     interact_entity(&mut core.server, &alice, captain_id);
     core.run_until("Alice receives FerrisKey login prompt dialog", |_| {
         alice
@@ -836,7 +825,7 @@ fn lobby_spawns_pedestals_living_npcs_rich_chat_and_per_player_ferriskey_capitai
     let (forgeur_id, forgeur_pos) = forgeur_npc.unwrap();
 
     // 7. Walk to Forgeur workstation & assign task using Alice's personal FerrisKey token
-    walk_close_to(&mut core, &mut alice, forgeur_pos);
+    move_close_to(&mut core, &mut alice, forgeur_pos);
     interact_entity(&mut core.server, &alice, forgeur_id);
     core.run_until("Alice gets Forgeur task dialog", |_| {
         alice
@@ -884,7 +873,7 @@ fn lobby_spawns_pedestals_living_npcs_rich_chat_and_per_player_ferriskey_capitai
     });
 
     // 8. Walk back to Captain & chat over SSE using Alice's personal FerrisKey token
-    walk_close_to(&mut core, &mut alice, captain_pos);
+    move_close_to(&mut core, &mut alice, captain_pos);
     interact_entity(&mut core.server, &alice, captain_id);
     core.run_until("Alice opens private Captain channel", |_| {
         alice.said("Canal privé ouvert sous votre identité FerrisKey")
