@@ -505,7 +505,7 @@ mod tests {
     fn the_tower_menu_offers_upgrade_priority_and_sell_with_refund() {
         let mut game = game();
         let tower = game
-            .place(pid(0), TowerKind::Archer, (2, 1))
+            .place(pid(0), TowerKind::Archer, (2, 4))
             .expect("place");
         let menu = tower_menu(&game, pid(0), tower).expect("menu");
         assert!(fits(&menu));
@@ -550,7 +550,7 @@ mod tests {
     fn a_third_level_tower_offers_both_branches() {
         let mut game = game();
         let tower = game
-            .place(pid(0), TowerKind::Archer, (2, 1))
+            .place(pid(0), TowerKind::Archer, (2, 4))
             .expect("place");
         upgraded_to(&mut game, tower, &[None, None]);
         let menu = tower_menu(&game, pid(0), tower).expect("menu");
@@ -572,7 +572,7 @@ mod tests {
     fn a_max_level_tower_cannot_be_upgraded() {
         let mut game = game();
         let tower = game
-            .place(pid(0), TowerKind::Archer, (2, 1))
+            .place(pid(0), TowerKind::Archer, (2, 4))
             .expect("place");
         upgraded_to(&mut game, tower, &[None, None, Some(Branch::A)]);
         let menu = tower_menu(&game, pid(0), tower).expect("menu");
@@ -594,7 +594,7 @@ mod tests {
     fn the_tower_menu_is_only_for_the_owner() {
         let mut game = game();
         let tower = game
-            .place(pid(0), TowerKind::Archer, (2, 1))
+            .place(pid(0), TowerKind::Archer, (2, 4))
             .expect("place");
         assert!(tower_menu(&game, pid(1), tower).is_none());
         assert!(tower_menu(&game, pid(0), TowerId(99)).is_none());

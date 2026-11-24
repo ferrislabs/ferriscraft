@@ -16,6 +16,8 @@ pub const MAX_BEACONS_PER_TOWER: usize = 2;
 pub const MAX_GOLD_MINES_PER_PLAYER: usize = 4;
 pub const MAX_ARMOR: f32 = 0.9;
 pub const TIER_UNLOCK_TICKS: [u64; 4] = [0, 3_000, 6_600, 10_800];
+pub const MAX_INCOME: u32 = 10_000;
+pub const MAX_MOBS_PER_LANE: usize = 80;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GameMode {

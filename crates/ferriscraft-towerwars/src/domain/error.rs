@@ -40,4 +40,6 @@ pub enum SimError {
     NotEnoughPlayers,
     #[error("répartition des joueurs invalide")]
     InvalidSeating,
+    #[error("toutes les voies adverses sont saturées")]
+    LanesSaturated,
 }

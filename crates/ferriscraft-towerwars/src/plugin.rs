@@ -144,7 +144,8 @@ impl TowerWarsPlugin {
         }
 
         let map = load_map(self.config.map_path.as_deref());
-        let arena = match Arena::create(server, Layout::from_map(&map)).await {
+        let layout = Layout::from_map_with(&map, self.config.decor);
+        let arena = match Arena::create(server, layout).await {
             Ok(arena) => arena,
             Err(error) => {
                 tracing::error!("impossible de créer l'arène TowerWars : {error}");
@@ -184,7 +185,7 @@ impl TowerWarsPlugin {
             return;
         }
         if reused {
-            game.restore_arena();
+            game.restore_arena(self.config.world_prebuilt).await;
         }
         match server.get_players().await {
             Ok(players) => {
@@ -313,6 +314,11 @@ impl TowerWarsPlugin {
 
     async fn on_inventory_click(&self, event: &mut InventoryClick) {
         event.cancel();
+    }
+
+    // rspigot refuse les clics dans un menu verrouillé et ne les transmet qu'aux handlers
+    // en observation (`&InventoryClick`) : un handler `&mut` ne les voit jamais.
+    async fn on_menu_click(&self, event: &InventoryClick) {
         let Some(game) = self.game() else { return };
         let Some(inventory) = event.clicked_inventory() else {
             return;
@@ -341,7 +347,7 @@ impl TowerWarsPlugin {
     async fn on_player_move(&self, event: &PlayerMove) {
         let Some(game) = self.game() else { return };
         let Some(to) = event.to() else { return };
-        if game.is_void(to.position.y) {
+        if game.is_lost(to.position.x, to.position.y, to.position.z) {
             let player = event.player().clone();
             tokio::spawn(async move { game.rescue(&player).await });
         }

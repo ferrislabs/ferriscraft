@@ -1,6 +1,8 @@
 mod aim;
 mod arena;
+mod bot;
 mod engine;
+mod imperial;
 mod intent;
 mod lanes;
 mod menus;
@@ -10,6 +12,8 @@ mod notices;
 mod render;
 mod report;
 mod session;
+mod sounds;
+mod tower_model;
 
 pub use arena::{Arena, ArenaError, Layout, Point};
 pub use engine::{

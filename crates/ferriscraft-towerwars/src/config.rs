@@ -28,6 +28,8 @@ pub struct TowerWarsConfig {
     pub countdown_ticks: u32,
     pub end_delay_ticks: u32,
     pub version: Option<String>,
+    pub decor: bool,
+    pub world_prebuilt: bool,
 }
 
 impl Default for TowerWarsConfig {
@@ -46,6 +48,8 @@ impl Default for TowerWarsConfig {
             countdown_ticks: DEFAULT_COUNTDOWN_SECS * TICKS_PER_SECOND,
             end_delay_ticks: DEFAULT_END_DELAY_SECS * TICKS_PER_SECOND,
             version: None,
+            decor: true,
+            world_prebuilt: false,
         }
     }
 }
@@ -108,6 +112,12 @@ impl TowerWarsConfig {
                     .max(MIN_HEARTBEAT_MS),
             ),
             map_path: get("TOWERWARS_MAP_PATH").map(PathBuf::from),
+            decor: get("TOWERWARS_DECOR")
+                .and_then(|raw| parse_bool(&raw))
+                .unwrap_or(true),
+            world_prebuilt: get("TOWERWARS_WORLD_PREBUILT")
+                .and_then(|raw| parse_bool(&raw))
+                .unwrap_or(false),
             seed: get("TOWERWARS_SEED").and_then(|raw| raw.parse::<u64>().ok()),
             countdown_ticks: secs("TOWERWARS_COUNTDOWN_SECS", DEFAULT_COUNTDOWN_SECS),
             end_delay_ticks: secs("TOWERWARS_END_DELAY_SECS", DEFAULT_END_DELAY_SECS),
@@ -173,6 +183,18 @@ mod tests {
         assert!(!config.ephemeral_pod);
         assert!(config.orchestrator_url.is_none());
         assert!(config.map_path.is_none());
+        assert!(config.decor);
+        assert!(!config.world_prebuilt);
+    }
+
+    #[test]
+    fn a_prebuilt_world_and_a_bare_map_are_read_from_the_environment() {
+        let config = config(&[
+            ("TOWERWARS_WORLD_PREBUILT", "true"),
+            ("TOWERWARS_DECOR", "false"),
+        ]);
+        assert!(config.world_prebuilt);
+        assert!(!config.decor);
     }
 
     #[test]

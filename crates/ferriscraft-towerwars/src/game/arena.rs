@@ -1,27 +1,38 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, PoisonError};
 
-use rspigot_plugin::{BlockPos, BlockType, Error, GameRule, GameRuleSetting, Server, Weather, World};
+use rspigot_plugin::{
+    BlockPos, BlockType, Error, GameRule, GameRuleSetting, Server, Weather, World,
+};
 use thiserror::Error;
 
+use super::imperial::{self, Stadium};
 use crate::domain::{LANE_COUNT, LaneId, Vec3};
 use crate::map::{LaneMap, Map};
 
 const CHUNK_SIZE: i32 = 16;
-const WALL_MARGIN: i32 = 2;
-const WALL_HEIGHT: i32 = 3;
-const PATH_STEP: f32 = 0.25;
+const TRENCH_FLOOR_REACH: i32 = 0;
+const TRENCH_REACH: i32 = 1;
+const RIM_WIDTH: i32 = 2;
+const WALKWAY_MARGIN: i32 = 3;
+const PANEL_LIFT: f64 = 7.0;
+const OUT_OF_BOUNDS_MARGIN: i32 = 4;
 const LOBBY_Y: i32 = 100;
 const LOBBY_RADIUS: i32 = 4;
 const LOBBY_DISTANCE: i32 = 25;
 const VOID_DEPTH: f64 = 40.0;
 const BLOCK_CENTER: f64 = 0.5;
 
-pub const FLOOR_BLOCK: BlockType = BlockType::Stone;
-pub const PATH_BLOCK: BlockType = BlockType::DirtPath;
-pub const BUILD_BLOCK_LIGHT: BlockType = BlockType::SmoothStone;
-pub const BUILD_BLOCK_DARK: BlockType = BlockType::WhiteTerracotta;
-pub const WALL_BLOCK: BlockType = BlockType::Barrier;
+pub const PATH_BLOCK: BlockType = BlockType::PolishedAndesite;
+pub const PATH_EDGE_BLOCK: BlockType = BlockType::Water;
+pub const TRENCH_BED_BLOCK: BlockType = BlockType::Stone;
+pub const SPAWN_BLOCK: BlockType = BlockType::LimeConcrete;
+pub const EXIT_BLOCK: BlockType = BlockType::RedConcrete;
+pub const BUILD_BLOCK_LIGHT: BlockType = BlockType::RedTerracotta;
+pub const BUILD_BLOCK_DARK: BlockType = BlockType::GreenTerracotta;
+pub const PLATEAU_BLOCK: BlockType = BlockType::MossBlock;
+pub const SOIL_BLOCK: BlockType = BlockType::StoneBricks;
+pub const RIM_BLOCK: BlockType = BlockType::ChiseledStoneBricks;
 pub const LOBBY_BLOCK: BlockType = BlockType::SmoothStone;
 
 type Cell = (i32, i32, i32);
@@ -54,36 +65,41 @@ pub struct Layout {
     blocks: BTreeMap<Cell, BlockType>,
     lane_of: BTreeMap<Cell, usize>,
     anchors: [Option<Point>; LANE_COUNT],
+    panels: [Option<Point>; LANE_COUNT],
     lobby: Point,
     void_y: f64,
+    bounds: Option<Extent>,
 }
 
 fn floor_i(value: f32) -> i32 {
     value.floor() as i32
 }
 
-struct Extent {
-    min_x: i32,
-    max_x: i32,
-    min_z: i32,
-    max_z: i32,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Extent {
+    pub min_x: i32,
+    pub max_x: i32,
+    pub min_z: i32,
+    pub max_z: i32,
 }
 
 impl Extent {
+    const EMPTY: Self = Self {
+        min_x: i32::MAX,
+        max_x: i32::MIN,
+        min_z: i32::MAX,
+        max_z: i32::MIN,
+    };
+
     fn of(lane: &LaneMap) -> Self {
-        let mut extent = Self {
-            min_x: i32::MAX,
-            max_x: i32::MIN,
-            min_z: i32::MAX,
-            max_z: i32::MIN,
-        };
+        let mut extent = Self::EMPTY;
         let points = std::iter::once(&lane.spawn_point).chain(lane.waypoints.iter());
         for point in points {
             extent.include(floor_i(point.x), floor_i(point.z));
         }
         for bounds in &lane.build_bounds {
             extent.include(floor_i(bounds.min.x), floor_i(bounds.min.z));
-            extent.include(floor_i(bounds.max.x), floor_i(bounds.max.z));
+            extent.include(floor_i(bounds.max.x - 0.5), floor_i(bounds.max.z - 0.5));
         }
         extent
     }
@@ -94,65 +110,148 @@ impl Extent {
         self.min_z = self.min_z.min(z);
         self.max_z = self.max_z.max(z);
     }
+
+    fn merge(&mut self, other: Self) {
+        self.include(other.min_x, other.min_z);
+        self.include(other.max_x, other.max_z);
+    }
+
+    pub const fn grown(self, by: i32) -> Self {
+        Self {
+            min_x: self.min_x - by,
+            max_x: self.max_x + by,
+            min_z: self.min_z - by,
+            max_z: self.max_z + by,
+        }
+    }
+
+    pub fn ring(&self, x: i32, z: i32) -> i32 {
+        let dx = (self.min_x - x).max(x - self.max_x).max(0);
+        let dz = (self.min_z - z).max(z - self.max_z).max(0);
+        dx.max(dz)
+    }
+
+    pub fn contains(&self, x: i32, z: i32) -> bool {
+        self.ring(x, z) == 0
+    }
+
+    pub fn ring_inner(&self, x: i32, z: i32) -> i32 {
+        (x - self.min_x)
+            .min(self.max_x - x)
+            .min(z - self.min_z)
+            .min(self.max_z - z)
+    }
+}
+
+fn path_cells(lane: &LaneMap) -> Vec<(i32, i32)> {
+    std::iter::once(&lane.spawn_point)
+        .chain(lane.waypoints.iter())
+        .map(|point| (floor_i(point.x), floor_i(point.z)))
+        .collect()
+}
+
+fn distance_to_path(path: &[(i32, i32)], x: i32, z: i32) -> i32 {
+    path.windows(2)
+        .map(|pair| {
+            let (low_x, high_x) = (pair[0].0.min(pair[1].0), pair[0].0.max(pair[1].0));
+            let (low_z, high_z) = (pair[0].1.min(pair[1].1), pair[0].1.max(pair[1].1));
+            let dx = (low_x - x).max(x - high_x).max(0);
+            let dz = (low_z - z).max(z - high_z).max(0);
+            dx.max(dz)
+        })
+        .min()
+        .unwrap_or(i32::MAX)
+}
+
+fn is_buildable(lane: &LaneMap, x: i32, z: i32) -> bool {
+    lane.build_bounds
+        .iter()
+        .any(|bounds| bounds.contains_cell(x, z))
+}
+
+fn trench_y(lane: &LaneMap) -> i32 {
+    floor_i(lane.spawn_point.y) - 1
+}
+
+fn plateau_y(lane: &LaneMap) -> i32 {
+    lane.build_bounds
+        .first()
+        .map_or(trench_y(lane) + 1, |bounds| floor_i(bounds.min.y) - 1)
 }
 
 fn place_lane(blocks: &mut BTreeMap<Cell, BlockType>, lane: &LaneMap) {
     let extent = Extent::of(lane);
-    let floor_y = floor_i(lane.spawn_point.y) - 1;
-    for x in extent.min_x..=extent.max_x {
-        for z in extent.min_z..=extent.max_z {
-            blocks.insert((x, floor_y, z), FLOOR_BLOCK);
-        }
-    }
-    for bounds in &lane.build_bounds {
-        let y = floor_i(bounds.min.y) - 1;
-        for x in floor_i(bounds.min.x)..=floor_i(bounds.max.x) {
-            for z in floor_i(bounds.min.z)..=floor_i(bounds.max.z) {
-                if bounds.contains_cell(x, z) {
-                    let block = if (x + z).rem_euclid(2) == 0 {
-                        BUILD_BLOCK_LIGHT
-                    } else {
-                        BUILD_BLOCK_DARK
-                    };
-                    blocks.insert((x, y, z), block);
+    let path = path_cells(lane);
+    let (trench_y, plateau_y) = (trench_y(lane), plateau_y(lane));
+    let (spawn, exit) = (path[0], path[path.len() - 1]);
+    for x in extent.min_x - RIM_WIDTH..=extent.max_x + RIM_WIDTH {
+        for z in extent.min_z - RIM_WIDTH..=extent.max_z + RIM_WIDTH {
+            if extent.ring(x, z) > 0 {
+                for y in trench_y..=plateau_y {
+                    blocks.insert((x, y, z), SOIL_BLOCK);
                 }
-            }
-        }
-    }
-    let points: Vec<Vec3> = std::iter::once(lane.spawn_point)
-        .chain(lane.waypoints.iter().copied())
-        .collect();
-    for pair in points.windows(2) {
-        let length = pair[0].distance(pair[1]);
-        let steps = (length / PATH_STEP).ceil() as usize;
-        for step in 0..=steps {
-            let at = pair[0].lerp(pair[1], step as f32 / steps.max(1) as f32);
-            blocks.insert(
-                (floor_i(at.x), floor_i(at.y) - 1, floor_i(at.z)),
-                PATH_BLOCK,
-            );
-        }
-    }
-    let (low_x, high_x) = (extent.min_x - WALL_MARGIN, extent.max_x + WALL_MARGIN);
-    let (low_z, high_z) = (extent.min_z - WALL_MARGIN, extent.max_z + WALL_MARGIN);
-    for x in low_x..=high_x {
-        for z in low_z..=high_z {
-            if x != low_x && x != high_x && z != low_z && z != high_z {
+                blocks.insert((x, plateau_y + 1, z), RIM_BLOCK);
                 continue;
             }
-            for height in 0..WALL_HEIGHT {
-                blocks.insert((x, floor_y + 1 + height, z), WALL_BLOCK);
+            let reach = distance_to_path(&path, x, z);
+            if reach <= TRENCH_REACH {
+                let block = if (x, z) == spawn {
+                    SPAWN_BLOCK
+                } else if (x, z) == exit {
+                    EXIT_BLOCK
+                } else if reach <= TRENCH_FLOOR_REACH {
+                    PATH_BLOCK
+                } else {
+                    PATH_EDGE_BLOCK
+                };
+                blocks.insert((x, trench_y, z), block);
+                blocks.insert((x, trench_y - 1, z), TRENCH_BED_BLOCK);
+                continue;
+            }
+            if !is_buildable(lane, x, z) {
+                blocks.insert((x, trench_y, z), SOIL_BLOCK);
+                blocks.insert((x, trench_y + 1, z), PLATEAU_BLOCK);
+                continue;
+            }
+            let surface = if (x + z).rem_euclid(2) == 0 {
+                BUILD_BLOCK_LIGHT
+            } else {
+                BUILD_BLOCK_DARK
+            };
+            blocks.insert((x, plateau_y, z), surface);
+            for y in trench_y..plateau_y {
+                blocks.insert((x, y, z), SOIL_BLOCK);
             }
         }
     }
 }
 
+fn place_stadium(
+    blocks: &mut BTreeMap<Cell, BlockType>,
+    lanes: &[Extent],
+    floor_y: i32,
+    decor: bool,
+) -> Option<Stadium> {
+    let mut inside = *lanes.first()?;
+    for extent in lanes {
+        inside.merge(*extent);
+    }
+    let inside = inside.grown(RIM_WIDTH + WALKWAY_MARGIN);
+    let footprints: Vec<Extent> = lanes.iter().map(|extent| extent.grown(RIM_WIDTH)).collect();
+    Some(imperial::build(blocks, inside, &footprints, floor_y, decor))
+}
+
 impl Layout {
     pub fn from_map(map: &Map) -> Self {
+        Self::from_map_with(map, true)
+    }
+
+    pub fn from_map_with(map: &Map, decor: bool) -> Self {
         let mut blocks = BTreeMap::new();
         let mut lane_of = BTreeMap::new();
         let mut anchors = [None; LANE_COUNT];
-        let mut min_z = i32::MAX;
+        let mut panels = [None; LANE_COUNT];
+        let mut extents = Vec::new();
         let mut anchor_x = 0.0;
         let mut floor_y = i32::MAX;
         for lane in &map.lanes {
@@ -161,13 +260,24 @@ impl Layout {
             for cell in blocks.keys().filter(|cell| !before.contains(*cell)) {
                 lane_of.insert(*cell, usize::from(lane.lane_id));
             }
-            if let Some(slot) = anchors.get_mut(usize::from(lane.lane_id)) {
+            let extent = Extent::of(lane);
+            let index = usize::from(lane.lane_id);
+            if let Some(slot) = anchors.get_mut(index) {
                 *slot = Some(Point::from(lane.spectate_anchor));
             }
-            min_z = min_z.min(Extent::of(lane).min_z - WALL_MARGIN);
+            if let Some(slot) = panels.get_mut(index) {
+                *slot = Some(Point {
+                    x: f64::from(lane.spectate_anchor.x),
+                    y: f64::from(plateau_y(lane)) + 1.0 + PANEL_LIFT,
+                    z: f64::from(extent.min_z - RIM_WIDTH) + BLOCK_CENTER,
+                });
+            }
+            extents.push(extent);
             anchor_x += f64::from(lane.spectate_anchor.x);
-            floor_y = floor_y.min(floor_i(lane.spawn_point.y) - 1);
+            floor_y = floor_y.min(trench_y(lane) + 1);
         }
+        let stadium = place_stadium(&mut blocks, &extents, floor_y, decor);
+        let min_z = stadium.as_ref().map_or(0, |stadium| stadium.outer.min_z);
         let lanes = map.lanes.len().max(1) as f64;
         let center_x = (anchor_x / lanes).floor() as i32;
         let center_z = min_z.saturating_sub(LOBBY_DISTANCE);
@@ -176,16 +286,25 @@ impl Layout {
                 blocks.insert((x, LOBBY_Y, z), LOBBY_BLOCK);
             }
         }
+        let lowest = map.lanes.iter().map(trench_y).min().unwrap_or(floor_y);
         Self {
             blocks,
             lane_of,
             anchors,
+            panels,
             lobby: Point {
                 x: f64::from(center_x) + BLOCK_CENTER,
                 y: f64::from(LOBBY_Y) + 1.0,
                 z: f64::from(center_z) + BLOCK_CENTER,
             },
-            void_y: f64::from(floor_y) - VOID_DEPTH,
+            void_y: f64::from(lowest) - VOID_DEPTH,
+            bounds: stadium.as_ref().map(|stadium| {
+                let mut bounds = stadium.outer.grown(OUT_OF_BOUNDS_MARGIN);
+                let reach = LOBBY_RADIUS + OUT_OF_BOUNDS_MARGIN;
+                bounds.include(center_x - reach, center_z - reach);
+                bounds.include(center_x + reach, center_z + reach);
+                bounds
+            }),
         }
     }
 
@@ -203,34 +322,12 @@ impl Layout {
             .collect()
     }
 
-    pub fn blocks_in_chunk_for(
-        &self,
-        chunk_x: i32,
-        chunk_z: i32,
-        enabled: &[bool; LANE_COUNT],
-    ) -> Vec<(Cell, BlockType)> {
-        self.blocks_in_chunk(chunk_x, chunk_z)
-            .into_iter()
-            .filter(|(cell, _)| self.is_enabled(cell, enabled))
-            .collect()
-    }
-
     pub fn lane_blocks(&self, lane: LaneId) -> Vec<Cell> {
         self.lane_of
             .iter()
             .filter(|(_, owner)| **owner == lane.index())
             .map(|(cell, _)| *cell)
             .collect()
-    }
-
-    pub fn lane_chunks(&self, lane: LaneId) -> BTreeSet<(i32, i32)> {
-        self.lane_blocks(lane).into_iter().map(chunk_of).collect()
-    }
-
-    fn is_enabled(&self, cell: &Cell, enabled: &[bool; LANE_COUNT]) -> bool {
-        self.lane_of
-            .get(cell)
-            .is_none_or(|lane| enabled.get(*lane).copied().unwrap_or(false))
     }
 
     pub fn chunks(&self) -> BTreeSet<(i32, i32)> {
@@ -241,8 +338,17 @@ impl Layout {
         self.anchors.get(lane.index()).copied().flatten()
     }
 
+    pub fn panel(&self, lane: LaneId) -> Option<Point> {
+        self.panels.get(lane.index()).copied().flatten()
+    }
+
     pub const fn lobby(&self) -> Point {
         self.lobby
+    }
+
+    pub fn is_outside(&self, x: f64, z: f64) -> bool {
+        self.bounds
+            .is_some_and(|bounds| !bounds.contains(x.floor() as i32, z.floor() as i32))
     }
 
     pub fn is_void_fall(&self, y: f64) -> bool {
@@ -258,7 +364,7 @@ pub struct Arena {
     pub world: World,
     pub layout: Layout,
     pub reused: bool,
-    enabled: Mutex<[bool; LANE_COUNT]>,
+    placed: Mutex<BTreeSet<(i32, i32)>>,
 }
 
 impl Arena {
@@ -273,50 +379,64 @@ impl Arena {
             world,
             layout,
             reused: true,
-            enabled: Mutex::new([false; LANE_COUNT]),
+            placed: Mutex::new(BTreeSet::new()),
         })
     }
 
-    fn enabled(&self) -> [bool; LANE_COUNT] {
-        *self.enabled.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    pub fn enable_lanes(&self, lanes: &[LaneId]) -> usize {
-        {
-            let mut enabled = self.enabled.lock().unwrap_or_else(PoisonError::into_inner);
-            for lane in lanes {
-                enabled[lane.index()] = true;
+    pub async fn prepare(&self, prebuilt: bool) -> usize {
+        let chunks = self.layout.chunks();
+        for (x, z) in &chunks {
+            let chunk = self.world.chunks.at(*x, *z);
+            chunk.set_force_loaded(true);
+            chunk.load();
+        }
+        if prebuilt {
+            self.placed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend(chunks);
+            return 0;
+        }
+        let mut placed = 0;
+        for (x, z) in chunks {
+            if self
+                .world
+                .chunks
+                .at(x, z)
+                .is_loaded()
+                .await
+                .unwrap_or(false)
+            {
+                placed += self.place_once(x, z);
             }
         }
-        for lane in lanes {
-            for (x, z) in self.layout.lane_chunks(*lane) {
-                let chunk = self.world.chunks.at(x, z);
-                chunk.set_force_loaded(true);
-                chunk.load();
-            }
-        }
-        self.place_all()
+        placed
     }
 
-    pub fn clear_lanes(&self) {
-        let enabled = {
-            let mut flags = self.enabled.lock().unwrap_or_else(PoisonError::into_inner);
-            std::mem::replace(&mut *flags, [false; LANE_COUNT])
-        };
-        for lane in LaneId::ALL.into_iter().filter(|lane| enabled[lane.index()]) {
-            for (x, y, z) in self.layout.lane_blocks(lane) {
-                self.world.block(BlockPos { x, y, z }).set(BlockType::Air);
-            }
-            for (x, z) in self.layout.lane_chunks(lane) {
-                self.world.chunks.at(x, z).set_force_loaded(false);
-            }
+    pub fn place_once(&self, chunk_x: i32, chunk_z: i32) -> usize {
+        let fresh = self
+            .placed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert((chunk_x, chunk_z));
+        if fresh {
+            self.place_chunk(chunk_x, chunk_z)
+        } else {
+            0
         }
     }
 
-    pub fn place_chunk(&self, chunk_x: i32, chunk_z: i32) -> usize {
-        let placed = self
-            .layout
-            .blocks_in_chunk_for(chunk_x, chunk_z, &self.enabled());
+    pub fn pending_chunks(&self) -> usize {
+        let placed = self.placed.lock().unwrap_or_else(PoisonError::into_inner);
+        self.layout
+            .chunks()
+            .iter()
+            .filter(|chunk| !placed.contains(chunk))
+            .count()
+    }
+
+    fn place_chunk(&self, chunk_x: i32, chunk_z: i32) -> usize {
+        let placed = self.layout.blocks_in_chunk(chunk_x, chunk_z);
         for ((x, y, z), kind) in &placed {
             self.world
                 .block(BlockPos {
@@ -327,14 +447,6 @@ impl Arena {
                 .set(*kind);
         }
         placed.len()
-    }
-
-    pub fn place_all(&self) -> usize {
-        self.layout
-            .chunks()
-            .into_iter()
-            .map(|(cx, cz)| self.place_chunk(cx, cz))
-            .sum()
     }
 }
 
@@ -366,10 +478,7 @@ mod tests {
                         }
                         let block = layout.block_at((x, y, z));
                         assert!(
-                            matches!(
-                                block,
-                                Some(BUILD_BLOCK_LIGHT | BUILD_BLOCK_DARK | PATH_BLOCK)
-                            ),
+                            matches!(block, Some(BUILD_BLOCK_LIGHT | BUILD_BLOCK_DARK)),
                             "{x},{y},{z}: {block:?}"
                         );
                     }
@@ -381,46 +490,191 @@ mod tests {
     #[test]
     fn the_surface_alternates_like_a_checkerboard() {
         let (_, layout) = layout();
-        assert_eq!(layout.block_at((2, 63, 1)), Some(BUILD_BLOCK_DARK));
-        assert_eq!(layout.block_at((3, 63, 1)), Some(BUILD_BLOCK_LIGHT));
-        assert_eq!(layout.block_at((2, 63, 2)), Some(BUILD_BLOCK_LIGHT));
+        assert_eq!(layout.block_at((2, 64, 4)), Some(BUILD_BLOCK_LIGHT));
+        assert_eq!(layout.block_at((3, 64, 4)), Some(BUILD_BLOCK_DARK));
+        assert_eq!(layout.block_at((2, 64, 3)), Some(BUILD_BLOCK_DARK));
     }
 
     #[test]
-    fn the_path_is_drawn_under_every_waypoint_and_between_them() {
+    fn the_path_runs_between_walls_two_blocks_high() {
         let (map, layout) = layout();
         for lane_map in &map.lanes {
             let points: Vec<Vec3> = std::iter::once(lane_map.spawn_point)
                 .chain(lane_map.waypoints.iter().copied())
                 .collect();
+            let trench_y = points[0].y.floor() as i32 - 1;
             for point in &points {
-                let cell = (
-                    point.x.floor() as i32,
-                    point.y.floor() as i32 - 1,
-                    point.z.floor() as i32,
+                let cell = (point.x.floor() as i32, trench_y, point.z.floor() as i32);
+                assert!(
+                    matches!(
+                        layout.block_at(cell),
+                        Some(PATH_BLOCK | SPAWN_BLOCK | EXIT_BLOCK)
+                    ),
+                    "{cell:?}"
                 );
-                assert_eq!(layout.block_at(cell), Some(PATH_BLOCK), "{cell:?}");
+                let above = (cell.0, trench_y + 1, cell.2);
+                assert_eq!(layout.block_at(above), None, "{above:?}");
             }
             let mid = points[0].lerp(points[1], 0.5);
-            let cell = (mid.x.floor() as i32, 63, mid.z.floor() as i32);
-            assert_eq!(layout.block_at(cell), Some(PATH_BLOCK));
+            let (x, z) = (mid.x.floor() as i32, mid.z.floor() as i32);
+            assert_eq!(layout.block_at((x, trench_y, z)), Some(PATH_BLOCK));
+            assert_eq!(layout.block_at((x, trench_y, z + 1)), Some(PATH_EDGE_BLOCK));
+            for dz in 2..=4 {
+                assert!(matches!(
+                    layout.block_at((x, trench_y + 2, z + dz)),
+                    Some(BUILD_BLOCK_LIGHT | BUILD_BLOCK_DARK)
+                ));
+            }
         }
     }
 
     #[test]
-    fn barrier_walls_enclose_each_lane_at_head_height() {
+    fn the_entrance_and_the_exit_are_marked() {
         let (map, layout) = layout();
         let lane_map = &map.lanes[0];
-        let extent = Extent::of(lane_map);
-        let (x, z) = (extent.min_x - WALL_MARGIN, extent.min_z + 3);
-        for y in 64..64 + WALL_HEIGHT {
-            assert_eq!(layout.block_at((x, y, z)), Some(WALL_BLOCK));
-        }
-        assert_eq!(layout.block_at((x, 64 + WALL_HEIGHT, z)), None);
+        let spawn = lane_map.spawn_point;
+        let exit = lane_map.waypoints[lane_map.waypoints.len() - 1];
+        let y = spawn.y.floor() as i32 - 1;
         assert_eq!(
-            layout.block_at((extent.min_x + 3, 64, extent.min_z + 3)),
-            None
+            layout.block_at((spawn.x.floor() as i32, y, spawn.z.floor() as i32)),
+            Some(SPAWN_BLOCK)
         );
+        assert_eq!(
+            layout.block_at((exit.x.floor() as i32, y, exit.z.floor() as i32)),
+            Some(EXIT_BLOCK)
+        );
+    }
+
+    fn stadium(map: &Map) -> Extent {
+        let mut all = Extent::of(&map.lanes[0]);
+        for lane_map in &map.lanes {
+            all.merge(Extent::of(lane_map));
+        }
+        all.grown(RIM_WIDTH + WALKWAY_MARGIN)
+    }
+
+    #[test]
+    fn every_lane_has_a_rim_above_its_walls() {
+        let (map, layout) = layout();
+        for lane_map in &map.lanes {
+            let extent = Extent::of(lane_map);
+            let z = extent.min_z + 4;
+            assert_eq!(layout.block_at((extent.min_x - 1, 65, z)), Some(RIM_BLOCK));
+            assert_eq!(layout.block_at((extent.max_x + 2, 65, z)), Some(RIM_BLOCK));
+        }
+    }
+
+    #[test]
+    fn walkways_and_channels_join_the_lanes_without_any_wall_between_them() {
+        let (map, layout) = layout();
+        let first = Extent::of(&map.lanes[0]);
+        let second = Extent::of(&map.lanes[1]);
+        let z = first.min_z + 4;
+        let gap: Vec<Option<BlockType>> = (first.max_x + RIM_WIDTH + 1..second.min_x - RIM_WIDTH)
+            .map(|x| layout.block_at((x, 63, z)))
+            .collect();
+        assert_eq!(gap.len(), 3);
+        assert_eq!(gap[1], Some(imperial::WATER));
+        for side in [gap[0], gap[2]] {
+            assert!(matches!(
+                side,
+                Some(imperial::WALKWAY | imperial::WALKWAY_ACCENT)
+            ));
+        }
+        for x in first.max_x + RIM_WIDTH + 1..second.min_x - RIM_WIDTH {
+            for y in 64..70 {
+                assert_eq!(layout.block_at((x, y, z)), None, "{x},{y}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_water_block_is_enclosed_so_it_never_flows() {
+        let (_, layout) = layout();
+        let solid_or_water = |cell: Cell| layout.block_at(cell).is_some();
+        for ((x, y, z), block) in layout.blocks() {
+            if block != BlockType::Water {
+                continue;
+            }
+            for neighbour in [
+                (x + 1, y, z),
+                (x - 1, y, z),
+                (x, y, z + 1),
+                (x, y, z - 1),
+                (x, y - 1, z),
+            ] {
+                assert!(
+                    solid_or_water(neighbour),
+                    "eau en ({x}, {y}, {z}) ouverte vers {neighbour:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn three_tier_palaces_face_the_arena_behind_a_terrace() {
+        let (map, layout) = layout();
+        let inside = stadium(&map);
+        let z = inside.min_z + 7;
+        assert_eq!(
+            layout.block_at((inside.min_x - 1, 64, z)),
+            Some(imperial::WALKWAY)
+        );
+        let facade = inside.min_x - imperial::TERRACE_ROWS - 1;
+        assert!(layout.block_at((facade, 67, z)).is_some());
+        let ridge_x = inside.min_x - imperial::TERRACE_ROWS - 7;
+        assert_eq!(layout.block_at((ridge_x, 89, z)), Some(imperial::RIDGE));
+    }
+
+    #[test]
+    fn four_corner_towers_rise_above_everything() {
+        let (map, layout) = layout();
+        let inside = stadium(&map);
+        let reach = imperial::TERRACE_ROWS + imperial::PALACE_DEPTH;
+        let corners = [
+            (inside.min_x - reach, inside.min_z - reach),
+            (inside.max_x + 1, inside.max_z + 1),
+        ];
+        for (x0, z0) in corners {
+            let top = (x0..x0 + reach)
+                .flat_map(|x| (z0..z0 + reach).map(move |z| (x, z)))
+                .flat_map(|(x, z)| (64..160).map(move |y| (x, y, z)))
+                .filter(|cell| layout.block_at(*cell) == Some(imperial::RIDGE))
+                .map(|(_, y, _)| y)
+                .max();
+            assert!(top.is_some_and(|y| y > 100), "{top:?}");
+        }
+    }
+
+    #[test]
+    fn leaving_the_stadium_is_detected_but_not_the_lobby() {
+        let (map, layout) = layout();
+        let inside = stadium(&map);
+        let (mid_x, mid_z) = (
+            f64::from(inside.min_x + inside.max_x) / 2.0,
+            f64::from(inside.min_z + inside.max_z) / 2.0,
+        );
+        assert!(!layout.is_outside(mid_x, mid_z));
+        assert!(layout.is_outside(mid_x + 1_000.0, mid_z));
+        let lobby = layout.lobby();
+        assert!(!layout.is_outside(lobby.x, lobby.z));
+    }
+
+    #[test]
+    fn a_covered_bridge_with_a_pavilion_crosses_the_central_plaza() {
+        let (map, layout) = layout();
+        let inside = stadium(&map);
+        let z = (inside.min_z + inside.max_z).div_euclid(2);
+        let deck = 63 + imperial::BRIDGE_LIFT;
+        let ridge = deck + 6 + imperial::BRIDGE_HALF + 1;
+        for x in [inside.min_x, inside.max_x] {
+            assert_eq!(layout.block_at((x, deck, z)), Some(imperial::DECK), "{x}");
+            assert_eq!(layout.block_at((x, ridge, z)), Some(imperial::RIDGE), "{x}");
+        }
+        let middle = (inside.min_x + inside.max_x).div_euclid(2);
+        let spire = (deck..deck + 40)
+            .any(|y| y > ridge + 5 && layout.block_at((middle, y, z)) == Some(imperial::RIDGE));
+        assert!(spire);
     }
 
     #[test]
@@ -455,7 +709,16 @@ mod tests {
         assert!(!layout.is_void_fall(lobby.y));
         for lane_map in &map.lanes {
             let extent = Extent::of(lane_map);
-            assert!(lobby.z < f64::from(extent.min_z - WALL_MARGIN));
+            assert!(
+                lobby.z
+                    < f64::from(
+                        extent.min_z
+                            - RIM_WIDTH
+                            - WALKWAY_MARGIN
+                            - imperial::TERRACE_ROWS
+                            - imperial::PALACE_DEPTH
+                    )
+            );
         }
         assert!(layout.is_void_fall(0.0));
         assert!(!layout.is_void_fall(64.0));
@@ -511,34 +774,22 @@ mod tests {
     }
 
     #[test]
-    fn only_enabled_lanes_contribute_blocks_to_a_chunk() {
-        let (map, layout) = layout();
-        let spawn = map.lanes[0].spawn_point;
-        let (cx, cz) = (
-            (spawn.x.floor() as i32).div_euclid(CHUNK_SIZE),
-            (spawn.z.floor() as i32).div_euclid(CHUNK_SIZE),
-        );
-        let mut enabled = [false; LANE_COUNT];
-        assert!(layout.blocks_in_chunk_for(cx, cz, &enabled).is_empty());
-        enabled[0] = true;
-        let placed = layout.blocks_in_chunk_for(cx, cz, &enabled);
-        assert!(!placed.is_empty());
-        assert!(
-            placed
-                .iter()
-                .all(|(cell, _)| layout.lane_blocks(lane(0)).contains(cell))
-        );
+    fn every_lane_is_built_even_without_a_player() {
+        let (_, layout) = layout();
+        for lane_id in LaneId::ALL {
+            assert!(!layout.lane_blocks(lane_id).is_empty(), "{lane_id:?}");
+        }
     }
 
     #[test]
-    fn lobby_blocks_never_depend_on_enabled_lanes() {
-        let (_, layout) = layout();
-        let lobby = layout.lobby();
-        let (cx, cz) = (
-            (lobby.x.floor() as i32).div_euclid(CHUNK_SIZE),
-            (lobby.z.floor() as i32).div_euclid(CHUNK_SIZE),
-        );
-        let none = [false; LANE_COUNT];
-        assert!(!layout.blocks_in_chunk_for(cx, cz, &none).is_empty());
+    fn a_panel_floats_above_the_rim_of_every_lane() {
+        let (map, layout) = layout();
+        for lane_map in &map.lanes {
+            let panel = layout.panel(lane(lane_map.lane_id)).expect("panel");
+            let extent = Extent::of(lane_map);
+            assert!(panel.y > 70.0);
+            assert!(panel.z < f64::from(extent.min_z));
+            assert!(panel.x > f64::from(extent.min_x) && panel.x < f64::from(extent.max_x));
+        }
     }
 }

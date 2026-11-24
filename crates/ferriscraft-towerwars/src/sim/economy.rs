@@ -1,7 +1,8 @@
 use crate::domain::{
-    Branch, INCOME_CYCLE_TICKS, LaneId, Level, MAX_GOLD_MINES_PER_PLAYER, MobId, MobKind, PlayerId,
-    SEND_STAGGER_TICKS, STOCK_MAX, STOCK_RECHARGE_TICKS, SUDDEN_DEATH_HP_STEP, SimError,
-    TIER_UNLOCK_TICKS, TowerEffect, TowerKind,
+    Branch, INCOME_CYCLE_TICKS, LaneId, Level, MAX_GOLD_MINES_PER_PLAYER, MAX_INCOME,
+    MAX_MOBS_PER_LANE, MobId, MobKind, PlayerId, SEND_STAGGER_TICKS, STOCK_MAX,
+    STOCK_RECHARGE_TICKS, SUDDEN_DEATH_HP_STEP, SimError, TIER_UNLOCK_TICKS, TowerEffect,
+    TowerKind,
 };
 
 use super::event::Event;
@@ -96,35 +97,56 @@ pub(crate) fn send(
         .gold
         .checked_sub(spec.cost * u32::from(count))
         .ok_or(SimError::NotEnoughGold)?;
+    let targets = open_targets(world, sender_lane, count);
+    if targets.is_empty() && has_opponents(world, sender_lane) {
+        return Err(SimError::LanesSaturated);
+    }
     let state = world.players.iter_mut().find(|p| p.id == player);
     if let Some(state) = state {
         state.gold = remaining;
         state.stock.charges[slot] -= count;
-        state.income += spec.income * u32::from(count);
+        state.income = state
+            .income
+            .saturating_add(spec.income * u32::from(count))
+            .min(MAX_INCOME.max(state.income));
     }
     world.emit(Event::MobSent {
         sender: player,
         kind,
         count,
     });
-    queue_spawns(world, sender_lane, player, kind, count);
+    queue_spawns(world, &targets, player, kind, count);
     Ok(())
 }
 
-fn queue_spawns(
-    world: &mut World,
-    sender_lane: LaneId,
-    sender: PlayerId,
-    kind: MobKind,
-    count: u8,
-) {
-    let targets: Vec<LaneId> = world
+fn has_opponents(world: &World, sender_lane: LaneId) -> bool {
+    world
+        .lanes
+        .iter()
+        .any(|lane| !lane.eliminated && !lane.owners.is_empty() && lane.id != sender_lane)
+}
+
+pub(crate) fn crowd(world: &World, lane: LaneId) -> usize {
+    let pending = world
+        .pending
+        .iter()
+        .filter(|spawn| spawn.lane == lane)
+        .count();
+    world.lane(lane).mobs.len() + pending
+}
+
+fn open_targets(world: &World, sender_lane: LaneId, count: u8) -> Vec<LaneId> {
+    world
         .lanes
         .iter()
         .filter(|lane| !lane.eliminated && !lane.owners.is_empty() && lane.id != sender_lane)
+        .filter(|lane| crowd(world, lane.id) + usize::from(count) <= MAX_MOBS_PER_LANE)
         .map(|lane| lane.id)
-        .collect();
-    for lane in targets {
+        .collect()
+}
+
+fn queue_spawns(world: &mut World, targets: &[LaneId], sender: PlayerId, kind: MobKind, count: u8) {
+    for &lane in targets {
         for index in 0..u64::from(count) {
             world.pending.push(PendingSpawn {
                 due_tick: world.elapsed + index * SEND_STAGGER_TICKS,
@@ -272,5 +294,43 @@ mod tests {
             send(&mut world, pid(0), MobKind::Silverfish, 1),
             Err(SimError::PlayerLeft)
         );
+    }
+
+    #[test]
+    fn income_stops_growing_at_the_cap_but_sending_still_costs_gold() {
+        let mut world = world();
+        world.players[0].income = crate::domain::MAX_INCOME - 1;
+        send(&mut world, pid(0), MobKind::Silverfish, 1).unwrap();
+        assert_eq!(world.players[0].income, crate::domain::MAX_INCOME);
+        let gold = world.players[0].gold.get();
+        send(&mut world, pid(0), MobKind::Silverfish, 1).unwrap();
+        assert_eq!(world.players[0].income, crate::domain::MAX_INCOME);
+        assert_eq!(
+            world.players[0].gold.get(),
+            gold - MobKind::Silverfish.spec().cost
+        );
+    }
+
+    #[test]
+    fn a_send_is_refused_when_every_target_lane_is_saturated() {
+        let mut world = world();
+        let target = LaneId::try_from(1).unwrap();
+        for index in 0..crate::domain::MAX_MOBS_PER_LANE {
+            let mob = crate::sim::lane::Mob::new(
+                crate::domain::MobId(index as u32 + 1_000),
+                MobKind::Silverfish,
+                pid(0),
+                35.0,
+                0.0,
+                0.0,
+            );
+            world.lane_mut(target).mobs.push(mob);
+        }
+        let gold = world.players[0].gold.get();
+        assert_eq!(
+            send(&mut world, pid(0), MobKind::Silverfish, 1),
+            Err(SimError::LanesSaturated)
+        );
+        assert_eq!(world.players[0].gold.get(), gold);
     }
 }

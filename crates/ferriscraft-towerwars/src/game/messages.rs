@@ -21,6 +21,7 @@ pub fn message(error: &SimError) -> &'static str {
         SimError::MatchEnded => "§cLa partie est terminée.",
         SimError::NotEnoughPlayers => "§cJoueurs insuffisants pour ce mode.",
         SimError::InvalidSeating => "§cRépartition des joueurs invalide.",
+        SimError::LanesSaturated => "§cLes voies adverses sont pleines, patientez.",
     }
 }
 
@@ -50,6 +51,7 @@ mod tests {
             SimError::MatchEnded,
             SimError::NotEnoughPlayers,
             SimError::InvalidSeating,
+            SimError::LanesSaturated,
         ];
         for error in errors {
             let text = message(&error);

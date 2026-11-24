@@ -170,6 +170,36 @@ pub fn lane_color(lane: LaneId) -> &'static str {
     LANE_COLORS[lane.index() % LANE_COLORS.len()]
 }
 
+const PANEL_BAR_SEGMENTS: usize = 20;
+
+pub fn lane_panel(
+    game: &Match,
+    lane: LaneId,
+    name_of: &impl Fn(PlayerId) -> Option<String>,
+) -> String {
+    let lane = game.lane(lane);
+    let color = lane_color(lane.id);
+    let names = lane_names(lane, name_of);
+    if lane.eliminated {
+        return format!("{color}§l{names}\n§4§l✖ ÉLIMINÉ ✖");
+    }
+    let (hp, cap) = (lane.hp.current(), lane.hp.cap().max(1));
+    let filled = (usize::from(hp) * PANEL_BAR_SEGMENTS).div_ceil(usize::from(cap));
+    let bar_color = match u32::from(hp) * 3 / u32::from(cap) {
+        0 => "§c",
+        1 => "§e",
+        _ => "§a",
+    };
+    format!(
+        "{color}§l{names}\n{bar_color}{}§8{} §f{hp}§7/{cap} ❤\n§6⛃ {} §7│ §b⚒ {}/{TOWER_LIMIT} §7│ §c☠ {}",
+        "|".repeat(filled),
+        "|".repeat(PANEL_BAR_SEGMENTS - filled),
+        lane_income(game, lane),
+        lane.towers().len(),
+        lane.mobs.len(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use uuid::Uuid;
@@ -220,8 +250,8 @@ mod tests {
         assert!(line.contains("Or: 85 ⛃"), "{line}");
         assert!(line.contains("Income: +12 / 6s"), "{line}");
         let lane = game.lane(LaneId::try_from(0).expect("lane"));
-        assert!(lane.is_buildable((2, 1)));
-        game.place(pid(0), TowerKind::Archer, (2, 1))
+        assert!(lane.is_buildable((2, 4)));
+        game.place(pid(0), TowerKind::Archer, (2, 4))
             .expect("place");
         let line = action_bar(&game, pid(0)).expect("line");
         assert!(line.contains("Or: 35 ⛃"), "{line}");
@@ -282,6 +312,29 @@ mod tests {
         let lines = ranking(&game, &names);
         assert!(lines[3].contains("✖"), "{lines:?}");
         assert!(lines[3].contains("P1"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_lane_panel_shows_name_hp_income_towers_and_mobs() {
+        let mut game = game(4);
+        game.place(pid(0), TowerKind::Archer, (2, 4))
+            .expect("place");
+        let lane = LaneId::try_from(0).expect("lane");
+        let panel = lane_panel(&game, lane, &names);
+        assert!(panel.contains("P1"), "{panel}");
+        assert!(panel.contains("20§7/20 ❤"), "{panel}");
+        assert!(panel.contains("⛃ 10"), "{panel}");
+        assert!(panel.contains("⚒ 1/80"), "{panel}");
+        assert!(panel.contains("☠ 0"), "{panel}");
+    }
+
+    #[test]
+    fn an_eliminated_lane_panel_says_so() {
+        let mut game = game(4);
+        game.forfeit(pid(0));
+        game.tick();
+        let lane = LaneId::try_from(0).expect("lane");
+        assert!(lane_panel(&game, lane, &names).contains("ÉLIMINÉ"));
     }
 
     #[test]

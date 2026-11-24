@@ -217,3 +217,43 @@ Remplace « min. 4 joueurs / flag dev solo ». Décision utilisateur.
 - Orchestrateur, jeu TowerWars uniquement : la file est groupée par `match_size`. Un groupe de taille s part quand il compte ≥ s joueurs en attente : les s plus anciens de ce groupe sont envoyés ensemble sur un serveur prêt, VIDE (aucun joueur, aucun transfert en cours, `expected_players` non posé). Pas de backfill. Le serveur reçoit `expected_players = s` dans la réponse de ses heartbeats (200 + JSON `HeartbeatResponse` ; sinon 204 comme aujourd'hui). `match_size` 0 ou hors 1..=4 : traité comme 1. La file persistée (Postgres) garde `match_size` (colonne `smallint NOT NULL DEFAULT 0`, migration `0004_queue_match_size.sql`, idempotente).
 - Plugin : `min_players` par défaut 1 (plus de flag `TOWERWARS_DEV_SOLO` ni de `soloDev` Helm : supprimés). Avec orchestrateur configuré, la partie ne démarre qu'une fois `expected_players` connu ET effectif (joueurs présents) ≥ `expected_players`. Sans orchestrateur : seuil `min_players`. Si `expected_players == 1` : démarrage immédiat, sans décompte ; sinon décompte habituel. Le décompte s'annule si l'effectif repasse sous `expected_players`. Les bots complètent jusqu'à 4 voies, toujours (pas seulement en dev).
 - Hors périmètre : compteurs de file par taille dans le lobby (le total reste affiché).
+
+## Amendement 2026-11-24 — équilibrage, bots et stade
+
+Décisions prises après des parties de test en solo contre les bots. Mesures : `cargo run --release -p ferriscraft-towerwars --example balance`.
+
+- Bots (`game/bot.rs`) : toutes les 10 s, un bot envoie le mob le plus cher payable avec 30 % de son or, puis construit et améliore ses tours avec le reste. Au plus 40 tours, niveau T3 maximum. Avant : tout l'or toutes les 5 s, aucune tour ; un joueur seul était éliminé vers 1:07.
+- Plafond d'income : `MAX_INCOME = 10 000`. Au-delà, un envoi coûte toujours son or mais n'augmente plus l'income. Avant : un joueur qui spamme dépassait 170 000 d'income.
+- Plafond de mobs : `MAX_MOBS_PER_LANE = 80` (mobs vivants + apparitions en attente). Une voie pleine ne reçoit plus de mob ; si toutes les voies adverses sont pleines, l'envoi est refusé (`SimError::LanesSaturated`) sans rien débiter. Avant : plus de 300 mobs simultanés sur une voie, le serveur ralentissait.
+- Résultat simulé (solo, 3 bots) : un joueur qui ne fait que défendre perd vers 13:00 ; un joueur qui attaque gagne vers 13:55, avant la mort subite.
+- Wither : affiché comme un Wither Skeleton (échelle 1,1), car l'entité Wither affiche une barre de boss par mob. Les règles du mob ne changent pas.
+- Carte : stade commun, 6 voies en 2 rangées de 3, sans mur entre elles ; toutes les voies sont construites, même sans joueur. Un panneau flottant au-dessus de chaque voie affiche nom, PV, income, tours et mobs.
+
+## Amendement 2026-11-24 — carte « Impérial » pour la production
+
+- Thème original d'inspiration impériale (pas une reproduction d'une carte existante), généré par le code dans `game/imperial.rs` : palais à deux toits (colonnes de manguier écorcé, murs de grès, toits en tuiles de deepslate, bordures en terre cuite jaune, faîtage en or), une pagode tous les trois modules, terrasse avec statues et lanternes, douves et canaux d'eau entre les voies, galerie couverte surélevée au-dessus de la place centrale.
+- Voies : cases constructibles en damier terre cuite rouge / verte, chemin des mobs en andésite polie bordé d'eau, rebord en pierre taillée, lanternes aux coins.
+- Toute l'eau est fermée (test `every_water_block_is_enclosed_so_it_never_flows`).
+- Pas de fichier de monde ni de carte S3 : la carte est construite une seule fois au démarrage du serveur. Tous les chunks de l'arène sont chargés de force puis remplis une fois chacun (`Arena::prepare`, `Arena::place_once`). Mesure locale : 71 084 blocs sur 84 chunks en environ 16 s, aucun bloc perdu. Le plugin n'envoie son premier heartbeat « prêt » qu'après la construction.
+- `cargo run -p ferriscraft-towerwars --example arena_stats` affiche le nombre de blocs et de chunks.
+
+## Amendement 2026-11-24 — murs de 3 cases et carte plus grandiose
+
+- Voies : les cases constructibles forment des murs de 3 cases de large (cases à 2 à 4 blocs du chemin), 2 blocs au-dessus du chemin des mobs (1 de plus qu'avant). Les rangées du serpentin sont espacées de 6 blocs, pour qu'un seul mur de 3 cases les sépare ; le chemin mesure 87 blocs. La portée des tours se mesure au sol (x, z), la hauteur des murs ne change donc pas le jeu. Équilibrage re-simulé : défenseur pur éliminé vers 13:15, joueur actif vainqueur vers 14:00.
+- Décor : palais à trois niveaux de toits (faîte à 26 blocs du sol), une pagode à trois étages tous les deux modules, quatre tours d'angle à cinq étages (sommet à plus de 100 blocs de hauteur absolue), galerie surélevée de 7 blocs de large avec un pavillon central à trois toits.
+- Plus de mur de barrière : un joueur qui sort du stade (ou de la plateforme d'attente) est ramené, comme pour une chute dans le vide.
+- `TOWERWARS_DECOR=false` construit la carte sans décor (sol, voies, canaux). Utilisé par les tests de bout en bout ; la production garde le décor (valeur par défaut).
+
+## Amendement 2026-11-24 — carte précuite sur S3 / RustFS
+
+- `deploy/scripts/bake-towerwars-map.sh <nom>` lance un serveur rspigot temporaire avec le plugin, attend « arène construite … pending_chunks=0 », sauvegarde (`save-all flush`, `stop`) puis produit `dist/towerwars-maps/<nom>/{world.zip,arena.json}`. `arena.json` est la carte TowerWars (`export_map`), le monde exclut `playerdata`, `stats`, `advancements`.
+- Téléversement : `upload-map.sh` existant, avec `S3_PREFIX=towerwars/`. Les cartes TowerWars ne sont jamais sous `s3.prefix` (`maps/`), sinon la rotation SheepWars les choisirait.
+- Chart : si `s3.enabled` et `orchestrator.towerwars.map` sont définis, le Pod TowerWars reçoit l'`initContainer` `map-sync` (préfixe `orchestrator.towerwars.mapPrefix`), et le plugin reçoit `TOWERWARS_MAP_PATH=/data/arena.json` et `TOWERWARS_WORLD_PREBUILT=true` (volume `/data` en lecture seule). Sans carte, rien ne change.
+- `map-sync` lit aussi `TOWERWARS_MAP_NAME` (déjà injecté par l'orchestrateur).
+- Plugin : avec `TOWERWARS_WORLD_PREBUILT=true`, les chunks de l'arène sont chargés de force mais aucun bloc n'est posé. Mesure locale : prêt en 0,1 s au lieu de 22 s.
+- Le bake doit être refait à chaque changement de carte ou de décor dans le code.
+
+## Amendement 2026-11-24 — SDK rspigot 0.1.0 et lobby
+
+- `rspigot.ref` pointe sur le commit du tag `0.1.0` de rspigot (`103f2d34`), selon l'ADR 0010. Tout le workspace compile et passe clippy contre cette version.
+- Lobby : la sidebar et la tab list affichent la file TowerWars à côté de SheepWars, le pied de la tab list propose `/towerwars`, la description du menu Mini-Jeux annonce 1 à 4 joueurs, et le menu staff Serveurs indique le jeu de chaque serveur.

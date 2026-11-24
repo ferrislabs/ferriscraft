@@ -6,10 +6,11 @@ use std::time::Duration;
 use ferriscraft_protocol::{HeartbeatRequest, HeartbeatResponse, MatchReportAck, ServerPhase};
 use futures_util::future::join_all;
 use rspigot_plugin::{
-    Billboard, BlockDisplay, BlockState, BossBar, ChunkLoad, CustomInventory, DisplayProps,
-    DisplaySpec, Effect, EffectType, Entity, EntityType, Error, GameMode, InteractionBox, InventorySlot, ItemDisplay,
-    ItemDisplayContext, ItemStack, Location, Material, Particle, ParticleBurst, Player, Position,
-    Rotation, Server, SlotItem, TextDisplay, Title, Transformation, Uuid, Vector,
+    Attribute, Billboard, BlockDisplay, BlockState, BossBar, ChunkLoad, CustomInventory,
+    DisplayProps, DisplaySpec, Effect, EffectType, Entity, EntityType, Error, GameMode,
+    InteractionBox, InventorySlot, ItemStack, Location, Material, Particle, ParticleBurst, Player,
+    Position, Rotation, Server, SlotItem, SoundCue, TextDisplay, Title, Transformation, Uuid,
+    Vector,
 };
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
@@ -23,20 +24,22 @@ use super::messages::message;
 use super::names::{next_priority, tower_name};
 use super::notices::{Audience, notices, victory_subtitle};
 use super::render::{
-    MIN_AIM_CHANGE, MobOp, MobSnapshot, MobTrack, RING_POINTS, Shot, TELEPORT_DURATION_TICKS,
-    TowerOp, death_shot, diff_mobs, leak_shot, mob_material, mob_scale, range_color, ring_points,
-    shots, snapshots, tower_block, tower_height, tower_ops, tower_transformation, yaw_differs,
+    MIN_AIM_CHANGE, MobOp, MobSnapshot, MobTrack, RING_POINTS, Shot, TowerOp, death_shot,
+    diff_mobs, leak_shot, mob_entity, mob_scale, range_color, ring_points, shots, snapshots,
+    tower_ops, yaw_differs,
 };
 use super::report::{
     DeliveryError, MatchSummary, build_report, deliver, not_counted_notice, retry_schedule,
     reward_display,
 };
 use super::session::{ForceStartError, Session, Stage};
+use super::sounds::{Hearing, REFUSED, cues as sound_cues};
+use super::tower_model::{Part, model_height, tower_model};
 use crate::config::TowerWarsConfig;
 use crate::domain::{LaneId, Level, MobId, MobKind, PlayerId, TowerId, TowerKind, Vec3};
 use crate::hud::{
     ACTION_BAR_REFRESH_TICKS, Hud, action_bar, bossbar_progress, bossbar_title, countdown_title,
-    lobby_lines, sidebar_lines, waiting_title,
+    lane_panel, lobby_lines, sidebar_lines, waiting_title,
 };
 use crate::orchestrator::{SERVER_KIND, TowerWarsOrchestratorClient, spectates_here};
 use crate::sim::{Event, Match};
@@ -151,6 +154,9 @@ struct OpenMenu {
     inventory: CustomInventory,
 }
 
+const PANEL_SCALE: f32 = 2.2;
+const PANEL_BACKGROUND: i32 = 0x6000_0000;
+
 struct MobEntry {
     track: MobTrack,
     entity: Entity,
@@ -158,10 +164,33 @@ struct MobEntry {
 }
 
 struct TowerEntry {
-    block: Entity,
+    parts: Vec<(Entity, Part)>,
     hitbox: Entity,
-    level: Level,
+    kind: TowerKind,
+    at: Vec3,
     yaw: f32,
+}
+
+impl TowerEntry {
+    fn remove(self) {
+        for (entity, _) in self.parts {
+            entity.remove();
+        }
+        self.hitbox.remove();
+    }
+
+    fn aim(&mut self, yaw: f32) {
+        self.yaw = yaw;
+        for (entity, part) in self.parts.iter().filter(|(_, part)| part.turret) {
+            entity.display.edit(
+                BlockDisplay::default().props(
+                    DisplayProps::default()
+                        .transformation(part.transformation(yaw))
+                        .interpolation(0, 3),
+                ),
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,27 +247,32 @@ struct State {
     ticks: u64,
     epoch: Epoch,
     last_reported_phase: Option<ServerPhase>,
+    panels: HashMap<LaneId, Entity>,
 }
 
 impl State {
     fn name_of(&self, id: PlayerId) -> Option<String> {
-        self.names.get(&id).cloned()
+        self.names.get(&id).cloned().or_else(|| {
+            let lane = self
+                .session
+                .lane_of(id)
+                .filter(|_| self.session.is_bot(id))?;
+            Some(format!("Bot {}", lane.index() + 1))
+        })
     }
 
     fn observed_lanes(&self) -> Vec<LaneId> {
-        let mut lanes: Vec<LaneId> = self
-            .players
-            .keys()
-            .filter_map(|id| {
-                self.views
-                    .get(id)
-                    .and_then(|view| view.viewing)
-                    .or_else(|| self.session.lane_of(*id))
-            })
-            .collect();
-        lanes.sort();
-        lanes.dedup();
-        lanes
+        if self.players.is_empty() {
+            return Vec::new();
+        }
+        self.session.game().map_or_else(Vec::new, |game| {
+            game.world()
+                .lanes
+                .iter()
+                .filter(|lane| !lane.owners.is_empty() && !lane.eliminated)
+                .map(|lane| lane.id)
+                .collect()
+        })
     }
 
     fn menu_for(&self, id: PlayerId, kind: MenuKind) -> Option<Menu> {
@@ -309,6 +343,7 @@ impl Game {
                 ticks: 0,
                 epoch: Epoch::default(),
                 last_reported_phase: None,
+                panels: HashMap::new(),
             }),
         }
     }
@@ -531,8 +566,15 @@ impl Game {
         }
     }
 
-    pub fn restore_arena(&self) -> usize {
-        self.arena.place_all()
+    pub async fn restore_arena(&self, prebuilt: bool) -> usize {
+        let placed = self.arena.prepare(prebuilt).await;
+        tracing::info!(
+            placed,
+            prebuilt,
+            pending_chunks = self.arena.pending_chunks(),
+            "arène construite"
+        );
+        placed
     }
 
     pub fn on_chunk_load(&self, event: &ChunkLoad) {
@@ -540,7 +582,7 @@ impl Game {
             return;
         }
         let chunk = event.chunk();
-        let placed = self.arena.place_chunk(chunk.x, chunk.z);
+        let placed = self.arena.place_once(chunk.x, chunk.z);
         if placed > 0 {
             tracing::debug!(
                 "placé {placed} blocs dans le chunk ({}, {})",
@@ -638,8 +680,8 @@ impl Game {
         self.check_phase_changed();
     }
 
-    pub fn is_void(&self, y: f64) -> bool {
-        self.arena.layout.is_void_fall(y)
+    pub fn is_lost(&self, x: f64, y: f64, z: f64) -> bool {
+        self.arena.layout.is_void_fall(y) || self.arena.layout.is_outside(x, z)
     }
 
     pub async fn rescue(&self, player: &Player) {
@@ -668,6 +710,7 @@ impl Game {
         self.advance_previews().await;
         self.advance_celebration();
         self.refresh();
+        self.sync_panels().await;
         self.check_phase_changed();
         let total = started.elapsed();
         if total >= SLOW_TICK {
@@ -688,10 +731,12 @@ impl Game {
             entry.label.remove();
         }
         for (_, entry) in state.towers.drain() {
-            entry.block.remove();
-            entry.hitbox.remove();
+            entry.remove();
         }
         state.hitboxes.clear();
+        for (_, panel) in state.panels.drain() {
+            panel.remove();
+        }
         for (_, open) in state.menus.drain() {
             open.inventory.discard();
         }
@@ -767,15 +812,6 @@ impl Game {
                 }
             }
             Intent::Begin { seats } => {
-                let human_lanes: Vec<LaneId> = {
-                    let state = self.lock();
-                    seats
-                        .iter()
-                        .filter(|seat| !state.session.is_bot(seat.player))
-                        .map(|seat| seat.lane)
-                        .collect()
-                };
-                self.arena.enable_lanes(&human_lanes);
                 for seat in seats {
                     if let Some(player) = self.player(seat.player) {
                         self.begin(&player, seat.lane).await;
@@ -863,7 +899,11 @@ impl Game {
                 game.world()
                     .lanes
                     .iter()
-                    .find(|lane| lane.owners.iter().any(|owner| !state.session.is_bot(*owner)))
+                    .find(|lane| {
+                        lane.owners
+                            .iter()
+                            .any(|owner| !state.session.is_bot(*owner))
+                    })
                     .map(|lane| lane.id)
             })
         };
@@ -911,7 +951,6 @@ impl Game {
     }
 
     fn reset(&self) -> Vec<Intent> {
-        self.arena.clear_lanes();
         let mut state = self.lock();
         state.epoch.advance();
         for (_, entry) in state.mobs.drain() {
@@ -919,10 +958,12 @@ impl Game {
             entry.label.remove();
         }
         for (_, entry) in state.towers.drain() {
-            entry.block.remove();
-            entry.hitbox.remove();
+            entry.remove();
         }
         state.hitboxes.clear();
+        for (_, panel) in state.panels.drain() {
+            panel.remove();
+        }
         for (_, open) in state.menus.drain() {
             open.inventory.discard();
         }
@@ -988,11 +1029,35 @@ impl Game {
         if events.is_empty() {
             return;
         }
-        let (tower_changes, mut drawn, notified, epoch) = {
+        let (tower_changes, mut drawn, notified, epoch, heard) = {
             let state = self.lock();
             let Some(game) = state.session.game() else {
                 return;
             };
+            let heard: Vec<(Option<Player>, SoundCue)> = sound_cues(events, game)
+                .into_iter()
+                .flat_map(|cue| {
+                    let sound = SoundCue::new(cue.sound).volume(cue.volume).pitch(cue.pitch);
+                    let listeners: Vec<Option<Player>> = match cue.hearing {
+                        Hearing::At(at) => {
+                            return vec![(None, sound.at(position(at)))];
+                        }
+                        Hearing::Everyone => state.players.values().cloned().map(Some).collect(),
+                        Hearing::Lane(lane) => state
+                            .players
+                            .iter()
+                            .filter(|(id, _)| state.session.lane_of(**id) == Some(lane))
+                            .map(|(_, player)| Some(player.clone()))
+                            .collect(),
+                        Hearing::Player(id) => vec![state.players.get(&id).cloned()],
+                    };
+                    listeners
+                        .into_iter()
+                        .flatten()
+                        .map(|player| (Some(player), sound.clone()))
+                        .collect()
+                })
+                .collect();
             let name_of = |id: PlayerId| state.name_of(id);
             let audience: Vec<(Audience, String)> = notices(events, game, &name_of)
                 .into_iter()
@@ -1017,10 +1082,17 @@ impl Game {
                 shots(events, game),
                 recipients,
                 state.epoch.current(),
+                heard,
             )
         };
         for (_, player, text) in notified {
             player.message.send(text);
+        }
+        for (listener, sound) in heard {
+            match listener {
+                Some(player) => player.sound.play(sound),
+                None => self.arena.world.sound.play(sound),
+            }
         }
         drawn.extend(self.retire_mobs(events));
         for op in tower_changes {
@@ -1070,29 +1142,24 @@ impl Game {
                 if !self.lock().epoch.admits(epoch) {
                     return;
                 }
-                if let Some(entry) = self.spawn_tower(kind, level, at).await {
-                    let mut state = self.lock();
-                    if state.epoch.admits(epoch) {
-                        state.hitboxes.insert(entry.hitbox.entity_id, tower);
-                        state.towers.insert(tower, entry);
-                    } else {
-                        drop(state);
-                        entry.block.remove();
-                        entry.hitbox.remove();
-                    }
+                if let Some(entry) = self.spawn_tower(kind, level, at, 0.0).await {
+                    self.keep_tower(tower, entry, epoch);
                 }
             }
             TowerOp::Upgrade { tower, level } => {
-                let mut state = self.lock();
-                if let Some(entry) = state.towers.get_mut(&tower) {
-                    entry.level = level;
-                    entry.block.display.edit(
-                        BlockDisplay::default().props(
-                            DisplayProps::default()
-                                .transformation(tower_transformation(level, entry.yaw))
-                                .interpolation(0, 4),
-                        ),
-                    );
+                let old = {
+                    let mut state = self.lock();
+                    let old = state.towers.remove(&tower);
+                    if let Some(entry) = &old {
+                        state.hitboxes.remove(&entry.hitbox.entity_id);
+                    }
+                    old
+                };
+                let Some(old) = old else { return };
+                let (kind, at, yaw) = (old.kind, old.at, old.yaw);
+                old.remove();
+                if let Some(entry) = self.spawn_tower(kind, level, at, yaw).await {
+                    self.keep_tower(tower, entry, epoch);
                 }
             }
             TowerOp::Aim { tower, yaw } => {
@@ -1100,22 +1167,14 @@ impl Game {
                 if let Some(entry) = state.towers.get_mut(&tower)
                     && yaw_differs(entry.yaw, yaw, MIN_AIM_CHANGE)
                 {
-                    entry.yaw = yaw;
-                    entry.block.display.edit(
-                        BlockDisplay::default().props(
-                            DisplayProps::default()
-                                .transformation(tower_transformation(entry.level, yaw))
-                                .interpolation(0, 3),
-                        ),
-                    );
+                    entry.aim(yaw);
                 }
             }
             TowerOp::Remove { tower } => {
                 let mut state = self.lock();
                 if let Some(entry) = state.towers.remove(&tower) {
                     state.hitboxes.remove(&entry.hitbox.entity_id);
-                    entry.block.remove();
-                    entry.hitbox.remove();
+                    entry.remove();
                 }
             }
         }
@@ -1132,36 +1191,70 @@ impl Game {
         Ok(entity)
     }
 
-    async fn spawn_tower(&self, kind: TowerKind, level: Level, at: Vec3) -> Option<TowerEntry> {
-        let block = BlockDisplay::new(BlockState {
-            kind: tower_block(kind),
-            properties: Vec::new(),
-        })
-        .props(DisplayProps::default().transformation(tower_transformation(level, 0.0)));
-        let block = match self.spawn_display(position(at), block).await {
-            Ok(entity) => entity,
-            Err(error) => {
-                tracing::warn!(
-                    "impossible d'afficher la tour {} : {error}",
-                    tower_name(kind)
-                );
-                return None;
+    fn keep_tower(&self, tower: TowerId, entry: TowerEntry, epoch: Generation) {
+        let mut state = self.lock();
+        if state.epoch.admits(epoch) {
+            state.hitboxes.insert(entry.hitbox.entity_id, tower);
+            state.towers.insert(tower, entry);
+        } else {
+            drop(state);
+            entry.remove();
+        }
+    }
+
+    async fn spawn_tower(
+        &self,
+        kind: TowerKind,
+        level: Level,
+        at: Vec3,
+        yaw: f32,
+    ) -> Option<TowerEntry> {
+        let model = tower_model(kind, level);
+        let spawned = join_all(model.iter().map(|part| {
+            let display = BlockDisplay::new(BlockState {
+                kind: part.block,
+                properties: Vec::new(),
+            })
+            .props(DisplayProps::default().transformation(part.transformation(yaw)));
+            self.spawn_display(position(at), display)
+        }))
+        .await;
+        let mut parts = Vec::with_capacity(model.len());
+        let mut failed = false;
+        for (result, part) in spawned.into_iter().zip(model) {
+            match result {
+                Ok(entity) => parts.push((entity, part)),
+                Err(error) => {
+                    tracing::warn!(
+                        "impossible d'afficher la tour {} : {error}",
+                        tower_name(kind)
+                    );
+                    failed = true;
+                }
             }
-        };
-        let hitbox = InteractionBox::new(0.95, tower_height(level) + 0.3).response(true);
-        let hitbox = match self.spawn_display(position(at), hitbox).await {
-            Ok(entity) => entity,
-            Err(error) => {
-                tracing::warn!("impossible de créer la zone de clic de la tour : {error}");
-                block.remove();
+        }
+        let hitbox = InteractionBox::new(0.95, model_height(kind, level) + 0.2).response(true);
+        let hitbox = match (failed, self.spawn_display(position(at), hitbox).await) {
+            (false, Ok(entity)) => entity,
+            (_, result) => {
+                if let Err(error) = &result {
+                    tracing::warn!("impossible de créer la zone de clic de la tour : {error}");
+                }
+                for (entity, _) in parts {
+                    entity.remove();
+                }
+                if let Ok(entity) = result {
+                    entity.remove();
+                }
                 return None;
             }
         };
         Some(TowerEntry {
-            block,
+            parts,
             hitbox,
-            level,
-            yaw: 0.0,
+            kind,
+            at,
+            yaw,
         })
     }
 
@@ -1229,22 +1322,22 @@ impl Game {
     }
 
     async fn spawn_mob(&self, snapshot: &MobSnapshot) -> Option<MobEntry> {
-        let scale = mob_scale(snapshot.kind);
-        let body = ItemDisplay::new(ItemStack::new(mob_material(snapshot.kind), 1))
-            .context(ItemDisplayContext::Fixed)
-            .props(
-                DisplayProps::default()
-                    .transformation(Transformation::default().scale(scale, scale, scale))
-                    .teleport_duration(TELEPORT_DURATION_TICKS),
-            );
         let at = position(snapshot.position);
-        let entity = match self.spawn_display(at, body).await {
+        let entity = match self.arena.world.spawn(mob_entity(snapshot.kind), at).await {
             Ok(entity) => entity,
             Err(error) => {
-                tracing::debug!("impossible d'afficher un mob : {error}");
+                tracing::warn!("impossible de faire apparaître un mob : {error}");
                 return None;
             }
         };
+        entity.ai.set(false);
+        entity.flags.set_gravity(false);
+        entity.flags.set_silent(true);
+        entity.flags.set_invulnerable(true);
+        entity.flags.set_persistent(false);
+        entity
+            .attributes
+            .set(Attribute::Scale, mob_scale(snapshot.kind));
         entity.set_rotation(Rotation {
             yaw: snapshot.yaw,
             pitch: 0.0,
@@ -1254,7 +1347,7 @@ impl Game {
                 .billboard(Billboard::Center)
                 .transformation(Transformation::default().translation(
                     0.0,
-                    scale / 2.0 + super::render::LABEL_LIFT,
+                    super::render::LABEL_LIFT,
                     0.0,
                 )),
         );
@@ -1272,6 +1365,60 @@ impl Game {
             entity,
             label,
         })
+    }
+
+    async fn sync_panels(&self) {
+        let (missing, epoch) = {
+            let state = self.lock();
+            if !state.ticks.is_multiple_of(ACTION_BAR_REFRESH_TICKS) {
+                return;
+            }
+            let Some(game) = state.session.game() else {
+                return;
+            };
+            let name_of = |id: PlayerId| state.name_of(id);
+            let mut missing = Vec::new();
+            for lane in game
+                .world()
+                .lanes
+                .iter()
+                .filter(|lane| !lane.owners.is_empty())
+            {
+                let text = lane_panel(game, lane.id, &name_of);
+                match state.panels.get(&lane.id) {
+                    Some(panel) => panel.display.edit(TextDisplay::new(text.as_str())),
+                    None => missing.push((lane.id, text)),
+                }
+            }
+            (missing, state.epoch.current())
+        };
+        for (lane, text) in missing {
+            let Some(at) = self.arena.layout.panel(lane) else {
+                continue;
+            };
+            let panel = TextDisplay::new(text.as_str())
+                .line_width(260)
+                .background(PANEL_BACKGROUND)
+                .props(
+                    DisplayProps::default()
+                        .billboard(Billboard::Vertical)
+                        .transformation(Transformation::default().scale(
+                            PANEL_SCALE,
+                            PANEL_SCALE,
+                            PANEL_SCALE,
+                        )),
+                );
+            let Ok(entity) = self.spawn_display(point_position(at), panel).await else {
+                continue;
+            };
+            let mut state = self.lock();
+            if state.epoch.admits(epoch) && !state.panels.contains_key(&lane) {
+                state.panels.insert(lane, entity);
+            } else {
+                drop(state);
+                entity.remove();
+            }
+        }
     }
 
     async fn advance_previews(&self) {
@@ -1417,6 +1564,7 @@ impl Game {
             Err(text) => {
                 tracing::info!(player = %player.name, ?cell, ?kind, refus = text, "pose refusée");
                 player.message.send(text);
+                player.sound.play(SoundCue::new(REFUSED).volume(0.7));
             }
         }
     }
@@ -1601,6 +1749,7 @@ impl Game {
                 let count = send_count(right_click, shift);
                 if let Err(text) = self.send_mob(id, mob, count) {
                     player.message.send(text);
+                    player.sound.play(SoundCue::new(REFUSED).volume(0.7));
                 }
                 false
             }

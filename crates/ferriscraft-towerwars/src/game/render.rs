@@ -1,17 +1,17 @@
 use std::collections::HashMap;
 
-use rspigot_plugin::{BlockType, Color, Material, Particle, Transformation};
+use rspigot_plugin::{Color, EntityType, Material, Particle};
 
+use super::tower_model::model_height;
 use crate::domain::{LaneId, Level, MobId, MobKind, TowerId, TowerKind, Vec3};
 use crate::sim::{Event, Match};
 
 pub const MOVE_EVERY_TICKS: u64 = 2;
-pub const TELEPORT_DURATION_TICKS: i32 = 2;
 pub const MIN_MOVE_BLOCKS: f32 = 0.02;
 pub const MIN_YAW_CHANGE: f32 = 1.0;
 pub const MAX_SPAWNS_PER_TICK: usize = 60;
 pub const MAX_PARTICLES_PER_TICK: usize = 120;
-pub const LABEL_LIFT: f32 = 0.7;
+pub const LABEL_LIFT: f32 = 0.3;
 pub const SHOT_LIFT: f32 = 0.8;
 pub const SHOT_STEP: f32 = 1.0;
 pub const MAX_SHOT_POINTS: usize = 12;
@@ -41,36 +41,43 @@ pub const fn mob_material(kind: MobKind) -> Material {
     }
 }
 
-pub fn mob_scale(kind: MobKind) -> f32 {
+pub const fn mob_entity(kind: MobKind) -> EntityType {
     match kind {
-        MobKind::MediumSlime => 0.6,
-        other => 0.6 + 0.15 * f32::from(other.spec().tier),
+        MobKind::Silverfish => EntityType::Silverfish,
+        MobKind::Zombie => EntityType::Zombie,
+        MobKind::Endermite => EntityType::Endermite,
+        MobKind::Skeleton => EntityType::Skeleton,
+        MobKind::Spider => EntityType::Spider,
+        MobKind::Creeper => EntityType::Creeper,
+        MobKind::Blaze => EntityType::Blaze,
+        MobKind::Witch => EntityType::Witch,
+        MobKind::GiantSlime | MobKind::MediumSlime => EntityType::Slime,
+        MobKind::PiglinBrute => EntityType::PiglinBrute,
+        MobKind::Enderman => EntityType::Enderman,
+        MobKind::Ghast => EntityType::Ghast,
+        MobKind::IronGolem => EntityType::IronGolem,
+        MobKind::Ravager => EntityType::Ravager,
+        MobKind::Warden => EntityType::Warden,
+        MobKind::Wither => EntityType::WitherSkeleton,
     }
 }
 
-pub const fn tower_block(kind: TowerKind) -> BlockType {
+pub fn mob_scale(kind: MobKind) -> f64 {
     match kind {
-        TowerKind::Archer => BlockType::Dispenser,
-        TowerKind::Ice => BlockType::BlueIce,
-        TowerKind::Mage => BlockType::AmethystBlock,
-        TowerKind::Cannon => BlockType::Tnt,
-        TowerKind::Tesla => BlockType::LightningRod,
-        TowerKind::Slime => BlockType::SlimeBlock,
-        TowerKind::Beacon => BlockType::Beacon,
+        MobKind::Silverfish | MobKind::Endermite | MobKind::GiantSlime => 1.0,
+        MobKind::MediumSlime => 0.5,
+        MobKind::Zombie
+        | MobKind::Skeleton
+        | MobKind::Spider
+        | MobKind::Creeper
+        | MobKind::Blaze
+        | MobKind::Witch => 0.8,
+        MobKind::PiglinBrute => 0.85,
+        MobKind::Enderman | MobKind::IronGolem => 0.7,
+        MobKind::Ravager | MobKind::Warden => 0.6,
+        MobKind::Wither => 1.1,
+        MobKind::Ghast => 0.35,
     }
-}
-
-pub fn tower_scale(level: Level) -> f32 {
-    match level {
-        Level::T1 => 0.6,
-        Level::T2 => 0.75,
-        Level::T3 => 0.9,
-        Level::T4(_) => 1.05,
-    }
-}
-
-pub fn tower_height(level: Level) -> f32 {
-    tower_scale(level) + 0.2
 }
 
 pub fn aim_yaw(from: Vec3, to: Vec3) -> f32 {
@@ -85,29 +92,6 @@ pub fn yaw_differs(a: f32, b: f32, threshold: f32) -> bool {
         delta += 360.0;
     }
     delta.abs() > threshold
-}
-
-pub fn tower_rotation(yaw: f32) -> [f32; 4] {
-    let half = (-yaw).to_radians() / 2.0;
-    [0.0, half.sin(), 0.0, half.cos()]
-}
-
-pub fn tower_translation(level: Level, yaw: f32) -> [f32; 3] {
-    let scale = tower_scale(level);
-    let angle = (-yaw).to_radians();
-    let (sin, cos) = angle.sin_cos();
-    let half = scale / 2.0;
-    [-(half * cos + half * sin), 0.0, -(-half * sin + half * cos)]
-}
-
-pub fn tower_transformation(level: Level, yaw: f32) -> Transformation {
-    let scale = tower_scale(level);
-    let [tx, ty, tz] = tower_translation(level, yaw);
-    let [qx, qy, qz, qw] = tower_rotation(yaw);
-    Transformation::default()
-        .translation(tx, ty, tz)
-        .scale(scale, scale, scale)
-        .left_rotation(qx, qy, qz, qw)
 }
 
 pub fn hp_label(hp: f32, max_hp: f32) -> String {
@@ -151,7 +135,6 @@ pub fn snapshots(game: &Match, observed: &[LaneId]) -> Vec<MobSnapshot> {
             lane.mobs.iter().map(|mob| {
                 let sample = lane.path().sample(mob.progress);
                 let mut position = lane.mob_position(mob);
-                position.y += mob_scale(mob.kind) / 2.0;
                 if mob.kind.spec().flying {
                     position.y += FLYING_LIFT;
                 }
@@ -397,7 +380,7 @@ pub fn shots(events: &[Event], game: &Match) -> Vec<Shot> {
                 if let Some(found) = game.lane(*lane).tower(*tower) {
                     out.push(Shot {
                         particle: Particle::Smoke,
-                        at: lifted(found.world_pos, tower_height(found.level)),
+                        at: lifted(found.world_pos, model_height(found.kind, found.level)),
                         count: 6,
                     });
                 }
@@ -512,7 +495,7 @@ mod tests {
         let expected = lane_ref.mob_position(mob);
         assert!((snapshot.position.x - expected.x).abs() < 1e-4);
         assert!((snapshot.position.z - expected.z).abs() < 1e-4);
-        assert!(snapshot.position.y > expected.y);
+        assert!((snapshot.position.y - expected.y).abs() < 1e-4);
         assert_eq!(snapshot.yaw, lane_ref.path().sample(mob.progress).yaw);
     }
 
@@ -625,56 +608,7 @@ mod tests {
     }
 
     #[test]
-    fn towers_grow_with_their_level() {
-        let scales: Vec<f32> = [
-            Level::T1,
-            Level::T2,
-            Level::T3,
-            Level::T4(crate::domain::Branch::A),
-        ]
-        .into_iter()
-        .map(tower_scale)
-        .collect();
-        assert!(scales.windows(2).all(|pair| pair[0] < pair[1]));
-    }
-
-    #[test]
-    fn the_tower_stays_centred_on_its_cell_whatever_the_aim() {
-        for level in [Level::T1, Level::T3] {
-            for yaw in [0.0f32, 37.0, 90.0, 180.0, -120.0] {
-                let scale = tower_scale(level);
-                let [tx, _, tz] = tower_translation(level, yaw);
-                let angle = (-yaw).to_radians();
-                let (sin, cos) = angle.sin_cos();
-                let (cx, cz) = (scale / 2.0, scale / 2.0);
-                let x = cx * cos + cz * sin + tx;
-                let z = -cx * sin + cz * cos + tz;
-                assert!(x.abs() < 1e-4 && z.abs() < 1e-4, "{level:?} {yaw}: {x} {z}");
-            }
-        }
-    }
-
-    #[test]
-    fn the_rotation_is_a_unit_quaternion_about_the_vertical_axis() {
-        let [x, y, z, w] = tower_rotation(53.0);
-        assert_eq!((x, z), (0.0, 0.0));
-        assert!((y * y + w * w - 1.0).abs() < 1e-5);
-    }
-
-    #[test]
-    fn the_transformation_carries_scale_rotation_and_translation() {
-        let transformation = tower_transformation(Level::T2, 0.0);
-        assert_eq!(transformation.scale, Some([0.75, 0.75, 0.75]));
-        assert!(transformation.left_rotation.is_some());
-        assert!(transformation.translation.is_some());
-    }
-
-    #[test]
-    fn every_tower_kind_has_its_own_block_and_particle() {
-        let blocks: Vec<BlockType> = TowerKind::ALL.into_iter().map(tower_block).collect();
-        for (index, block) in blocks.iter().enumerate() {
-            assert!(!blocks[..index].contains(block));
-        }
+    fn every_tower_kind_has_its_own_particle() {
         assert_ne!(
             shot_particle(TowerKind::Archer),
             shot_particle(TowerKind::Tesla)
@@ -685,7 +619,7 @@ mod tests {
     fn placing_a_tower_spawns_a_display_at_its_world_position() {
         let mut game = game();
         let tower = game
-            .place(pid(0), TowerKind::Archer, (2, 1))
+            .place(pid(0), TowerKind::Archer, (2, 4))
             .expect("place");
         let events = game.drain_events();
         let ops = tower_ops(&events, &game);
@@ -704,7 +638,7 @@ mod tests {
     fn selling_removes_the_display_and_upgrading_restyles_it() {
         let mut game = game();
         let tower = game
-            .place(pid(0), TowerKind::Archer, (2, 1))
+            .place(pid(0), TowerKind::Archer, (2, 4))
             .expect("place");
         game.drain_events();
         game.sell(pid(0), tower).expect("sell");
@@ -728,7 +662,7 @@ mod tests {
     fn a_placement_undone_in_the_same_batch_spawns_nothing() {
         let mut game = game();
         let tower = game
-            .place(pid(0), TowerKind::Archer, (2, 1))
+            .place(pid(0), TowerKind::Archer, (2, 4))
             .expect("place");
         game.sell(pid(0), tower).expect("sell");
         let events = game.drain_events();
@@ -740,7 +674,7 @@ mod tests {
     fn a_shot_aims_the_tower_and_draws_a_particle_line() {
         let mut game = game();
         let tower = game
-            .place(pid(0), TowerKind::Archer, (2, 1))
+            .place(pid(0), TowerKind::Archer, (2, 4))
             .expect("place");
         let from = Vec3::new(2.5, 64.0, 1.5);
         let to = Vec3::new(8.5, 64.0, 1.5);
@@ -841,12 +775,13 @@ mod tests {
     }
 
     #[test]
-    fn every_mob_has_a_material_and_a_scale() {
+    fn every_mob_is_a_real_entity_with_a_scale() {
         for kind in MobKind::SENDABLE {
             assert!(mob_scale(kind) > 0.0);
             let _ = mob_material(kind);
         }
-        assert!(mob_scale(MobKind::Warden) > mob_scale(MobKind::Silverfish));
+        assert_eq!(mob_entity(MobKind::Zombie), EntityType::Zombie);
+        assert_eq!(mob_entity(MobKind::GiantSlime), EntityType::Slime);
         assert!(mob_scale(MobKind::MediumSlime) < mob_scale(MobKind::GiantSlime));
     }
 }

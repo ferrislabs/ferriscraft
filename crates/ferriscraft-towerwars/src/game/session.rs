@@ -2,13 +2,13 @@ use ferriscraft_protocol::ServerPhase;
 use thiserror::Error;
 use uuid::Uuid;
 
+use super::bot::{BOT_TURN_TICKS, Bot};
 use super::intent::Intent;
 use super::lanes::assign_seats;
 use super::report::MatchLog;
 use crate::config::TowerWarsConfig;
 use crate::domain::{GameMode, LaneId, PlayerId, TICKS_PER_SECOND};
 use crate::map::Map;
-use crate::domain::MobKind;
 use crate::sim::{Event, Match};
 
 pub const RESET_DELAY_TICKS: u32 = 20 * 10;
@@ -89,29 +89,9 @@ pub struct Session {
     pending_report: Option<Uuid>,
     delay_elapsed: bool,
     bots: Vec<PlayerId>,
+    brains: Vec<Bot>,
     expected: Option<u32>,
 }
-
-const BOT_SEND_INTERVAL_TICKS: u64 = 5 * TICKS_PER_SECOND as u64;
-
-const BOT_MENU: [MobKind; 16] = [
-    MobKind::Wither,
-    MobKind::Warden,
-    MobKind::Ravager,
-    MobKind::IronGolem,
-    MobKind::Ghast,
-    MobKind::Enderman,
-    MobKind::PiglinBrute,
-    MobKind::GiantSlime,
-    MobKind::Witch,
-    MobKind::Blaze,
-    MobKind::Creeper,
-    MobKind::Spider,
-    MobKind::Skeleton,
-    MobKind::Endermite,
-    MobKind::Zombie,
-    MobKind::Silverfish,
-];
 
 fn bots_to_fill(mode: GameMode, humans: usize) -> Vec<PlayerId> {
     let missing = mode.min_players().saturating_sub(humans);
@@ -143,6 +123,7 @@ impl Session {
             pending_report: None,
             delay_elapsed: false,
             bots: Vec::new(),
+            brains: Vec::new(),
             expected: None,
         }
     }
@@ -429,6 +410,11 @@ impl Session {
                         .filter(|seat| !self.bots.contains(&seat.player))
                         .map(|seat| (seat.player, seat.lane)),
                 ));
+                self.brains = seats
+                    .iter()
+                    .filter(|seat| self.bots.contains(&seat.player))
+                    .map(|seat| Bot::new(&game, seat.player, seat.lane))
+                    .collect();
                 self.game = Some(game);
                 self.stage = Stage::Playing;
                 vec![Intent::Begin { seats }]
@@ -448,13 +434,9 @@ impl Session {
             return;
         };
         game.tick();
-        if !self.bots.is_empty() && game.elapsed() % BOT_SEND_INTERVAL_TICKS == 0 {
-            for bot in &self.bots {
-                for kind in BOT_MENU {
-                    if game.send(*bot, kind, 1).is_ok() {
-                        break;
-                    }
-                }
+        if game.elapsed() % BOT_TURN_TICKS == 0 {
+            for bot in &mut self.brains {
+                bot.act(game);
             }
         }
         let events = game.drain_events();
@@ -530,6 +512,7 @@ impl Session {
         self.pending_report = None;
         self.delay_elapsed = false;
         self.bots.clear();
+        self.brains.clear();
         self.expected = None;
         vec![Intent::Broadcast(text.to_owned()), Intent::Reset]
     }
@@ -1079,7 +1062,7 @@ mod tests {
         session.join(pid(0));
         let mut sent_by_bot = false;
         let mut reached_human_lane = false;
-        for _ in 0..(BOT_SEND_INTERVAL_TICKS * 2) {
+        for _ in 0..(BOT_TURN_TICKS * 2) {
             for event in session.tick().events {
                 match event {
                     Event::MobSent { sender, .. } if sender != pid(0) => sent_by_bot = true,

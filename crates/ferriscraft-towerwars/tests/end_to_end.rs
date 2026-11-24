@@ -541,6 +541,7 @@ fn start_with(spectators: &[&str], setup: Setup) -> Env {
         countdown_ticks: setup.countdown_ticks,
         end_delay_ticks: setup.end_delay_ticks,
         seed: Some(5),
+        decor: false,
         ..TowerWarsConfig::default()
     };
     let plugin = TowerWarsPlugin::new(config);
@@ -661,11 +662,11 @@ fn towerwars_full_lifecycle_orchestrator_countdown_play_forfeit_and_report() {
         game.place_tower(alice, TowerKind::Archer, (200, 200)),
         Err("§cOn ne peut pas construire ici.")
     );
-    game.place_tower(alice, TowerKind::Archer, (2, 1))
+    game.place_tower(alice, TowerKind::Archer, (2, 4))
         .expect("tower");
     assert_eq!(gold(&game, alice), Some(50));
     assert_eq!(
-        game.place_tower(alice, TowerKind::Archer, (2, 1)),
+        game.place_tower(alice, TowerKind::Archer, (2, 4)),
         Err("§cCette case est déjà occupée.")
     );
     game.send_mob(alice, MobKind::Silverfish, 1).expect("send");
@@ -946,10 +947,10 @@ fn leaving_forfeits_the_lane_and_the_player_can_no_longer_act() {
             .flatten()
     };
     let before = gold(bob);
-    assert_eq!(game.place_tower(bob, TowerKind::Archer, (2, 1)), Err(LEFT));
+    assert_eq!(game.place_tower(bob, TowerKind::Archer, (2, 4)), Err(LEFT));
     assert_eq!(game.send_mob(bob, MobKind::Silverfish, 1), Err(LEFT));
     assert_eq!(gold(bob), before);
-    game.place_tower(alice, TowerKind::Archer, (2, 1))
+    game.place_tower(alice, TowerKind::Archer, (2, 4))
         .expect("alice still plays");
     env.task.abort();
     drop(env.runtime);
@@ -986,7 +987,7 @@ fn the_hub_command_sends_the_player_to_the_lobby_and_removes_them_from_the_match
     });
     assert_eq!(has_left(&game, &players[0]), Some(false));
     assert_eq!(
-        game.place_tower(domain_id(&players[2]), TowerKind::Archer, (2, 1)),
+        game.place_tower(domain_id(&players[2]), TowerKind::Archer, (2, 4)),
         Err(LEFT)
     );
 
@@ -1021,7 +1022,7 @@ fn an_admin_stop_ends_the_match_and_removes_every_display_entity() {
     let mut players = forced_match(&mut env);
     let game = env.handle.game().expect("game is ready");
     let alice = domain_id(&players[0]);
-    game.place_tower(alice, TowerKind::Archer, (2, 1))
+    game.place_tower(alice, TowerKind::Archer, (2, 4))
         .expect("tower");
     game.send_mob(alice, MobKind::Silverfish, 1).expect("send");
     env.core.run_until("a tower and mobs are rendered", |c| {
@@ -1039,7 +1040,11 @@ fn an_admin_stop_ends_the_match_and_removes_every_display_entity() {
                 && game.with_match(|_| ()).is_none()
                 && last_heartbeat(&orch).is_some_and(|hb| hb.phase != ServerPhase::InGame)
         });
-    assert!(players[1].said("Vous ne pouvez pas faire ça"));
+    env.core
+        .run_until("the non-admin is told they cannot stop", |c| {
+            pump(c, &mut players);
+            players[1].said("Vous ne pouvez pas faire ça")
+        });
     let settle = Instant::now() + Duration::from_secs(1);
     env.core.run_until("nothing reappears after the stop", |c| {
         pump(c, &mut players);
@@ -1101,7 +1106,7 @@ fn in_teams_the_teammate_keeps_playing_when_a_partner_leaves() {
         last_heartbeat(&orch).map(|hb| hb.phase),
         Some(ServerPhase::InGame)
     );
-    game.place_tower(domain_id(&players[mate]), TowerKind::Archer, (2, 1))
+    game.place_tower(domain_id(&players[mate]), TowerKind::Archer, (2, 4))
         .expect("the teammate still builds");
     assert_eq!(
         game.place_tower(domain_id(&players[leaver]), TowerKind::Archer, (3, 1)),
