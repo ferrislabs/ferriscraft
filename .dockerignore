@@ -37,6 +37,13 @@ LICENSE
 /server-sheepwars/banned-players.json
 /server-sheepwars/ops.json
 /server-sheepwars/whitelist.json
+/server-towerwars/world
+/server-towerwars/logs
+/server-towerwars/spigot.yml
+/server-towerwars/banned-ips.json
+/server-towerwars/banned-players.json
+/server-towerwars/ops.json
+/server-towerwars/whitelist.json
 
 # java build artifacts
 /proxy/velocity-plugin/target

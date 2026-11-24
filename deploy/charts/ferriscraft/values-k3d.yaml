@@ -16,6 +16,15 @@ orchestrator:
     maxReplicas: 5
     standbyServers: 1
     idleTtlSecs: 60
+  towerwars:
+    enabled: true
+    minReplicas: 0
+    maxReplicas: 2
+    standbyServers: 1
+    idleTtlSecs: 60
+    # Carte précuite téléversée sur RustFS : s3://ferriscraft-maps/towerwars/imperial/
+    # (deploy/scripts/bake-towerwars-map.sh puis upload-map.sh, voir README).
+    map: imperial
 
 lobby:
   replicas: 1

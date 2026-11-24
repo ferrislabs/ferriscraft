@@ -3,10 +3,10 @@ use std::time::Duration;
 
 use ferriscraft_progression::{Coins, Level, Unlock};
 use ferriscraft_protocol::{
-    AdminCoinGrant, CosmeticId, CosmeticSlot, EquipRequest, FleetStatusSnapshot, HeartbeatRequest,
-    JoinQueueRequest, JoinQueueResponse, LeaveQueueRequest, LeaveQueueResponse, LeaveReason,
-    PlayerIdentityUpdate, PlayerProfile, PlayerQueueState, PlayerQueueStatus, PlayerRank,
-    PurchaseRequest, SpectateRequest,
+    AdminCoinGrant, CosmeticId, CosmeticSlot, EquipRequest, FleetStatusSnapshot, GameFleetStatus,
+    GameKind, HeartbeatRequest, JoinQueueRequest, JoinQueueResponse, LeaveQueueRequest,
+    LeaveQueueResponse, LeaveReason, PlayerIdentityUpdate, PlayerProfile, PlayerQueueState,
+    PlayerQueueStatus, PlayerRank, PurchaseRequest, SpectateRequest,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -217,19 +217,23 @@ impl OrchestratorClient {
         Ok(snap)
     }
 
-    pub async fn toggle_queue(
+    async fn queue_status(
         &self,
         player_uuid: Uuid,
-        player_name: &str,
-    ) -> Result<ToggleQueueOutcome, OrchestratorClientError> {
-        let deadline = Instant::now() + self.retry.budget;
+        game: GameKind,
+        deadline: Instant,
+    ) -> Result<PlayerQueueStatus, OrchestratorClientError> {
         let status_resp = self
             .send_retrying(
                 || {
-                    self.apply_auth(self.http.get(format!(
-                        "{}/api/v1/queue/player/{player_uuid}",
-                        self.base_url
-                    )))
+                    self.apply_auth(
+                        self.http
+                            .get(format!(
+                                "{}/api/v1/queue/player/{player_uuid}",
+                                self.base_url
+                            ))
+                            .query(&[("game", game)]),
+                    )
                 },
                 deadline,
             )
@@ -240,20 +244,36 @@ impl OrchestratorClient {
             ));
         }
         let current: PlayerQueueStatus = status_resp.json().await?;
+        Ok(current)
+    }
+
+    pub async fn is_queued(
+        &self,
+        player_uuid: Uuid,
+        game: GameKind,
+    ) -> Result<bool, OrchestratorClientError> {
+        let deadline = Instant::now() + self.retry.budget;
+        let status = self.queue_status(player_uuid, game, deadline).await?;
+        Ok(status.state == PlayerQueueState::Queued)
+    }
+
+    pub async fn toggle_queue(
+        &self,
+        player_uuid: Uuid,
+        player_name: &str,
+        game: GameKind,
+        match_size: u8,
+    ) -> Result<ToggleQueueOutcome, OrchestratorClientError> {
+        let deadline = Instant::now() + self.retry.budget;
+        let current = self.queue_status(player_uuid, game, deadline).await?;
         if current.state == PlayerQueueState::Queued {
-            let body = LeaveQueueRequest {
-                player_uuid,
-                reason: LeaveReason::UserToggle,
-            };
+            let body = leave_body(player_uuid, LeaveReason::UserToggle, game);
             let resp = self.post_queue("leave", &body, deadline).await?;
             let left: LeaveQueueResponse = resp.json().await?;
             return Ok(ToggleQueueOutcome::Left(left));
         }
 
-        let body = JoinQueueRequest {
-            player_uuid,
-            player_name: player_name.to_owned(),
-        };
+        let body = join_body(player_uuid, player_name, game, match_size);
         let resp = self.post_queue("join", &body, deadline).await?;
         let joined: JoinQueueResponse = resp.json().await?;
         Ok(ToggleQueueOutcome::Joined(joined))
@@ -284,13 +304,15 @@ impl OrchestratorClient {
     }
 
     pub async fn leave_if_queued(&self, player_uuid: Uuid) -> Result<(), OrchestratorClientError> {
-        let body = LeaveQueueRequest {
-            player_uuid,
-            reason: LeaveReason::LobbyQuit,
-        };
         let deadline = Instant::now() + self.retry.budget;
-        self.post_queue("leave", &body, deadline).await?;
-        Ok(())
+        let mut first_error = None;
+        for game in GameKind::ALL {
+            let body = leave_body(player_uuid, LeaveReason::LobbyQuit, game);
+            if let Err(err) = self.post_queue("leave", &body, deadline).await {
+                first_error.get_or_insert(err);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     pub async fn spectate(
@@ -411,12 +433,90 @@ impl OrchestratorClient {
             .clone()
     }
 
-    pub fn cached_queue_len(&self) -> usize {
+    pub fn cached_queue_counts(&self) -> QueueCounts {
         self.last_snapshot
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .map_or(0, |s| s.queue_len)
+            .map_or_else(QueueCounts::default, QueueCounts::from_snapshot)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueueCounts {
+    pub sheepwars: usize,
+    pub towerwars: usize,
+}
+
+impl QueueCounts {
+    pub fn from_snapshot(snapshot: &FleetStatusSnapshot) -> Self {
+        let per_game = |game: GameKind| {
+            snapshot
+                .games
+                .iter()
+                .find(|status| status.game == game)
+                .map(|status| status.queue_len)
+        };
+        Self {
+            sheepwars: per_game(GameKind::SheepWars).unwrap_or(snapshot.queue_len),
+            towerwars: per_game(GameKind::TowerWars).unwrap_or(0),
+        }
+    }
+
+    pub const fn get(self, game: GameKind) -> usize {
+        match game {
+            GameKind::SheepWars => self.sheepwars,
+            GameKind::TowerWars => self.towerwars,
+        }
+    }
+
+    pub const fn with(mut self, game: GameKind, count: usize) -> Self {
+        match game {
+            GameKind::SheepWars => self.sheepwars = count,
+            GameKind::TowerWars => self.towerwars = count,
+        }
+        self
+    }
+}
+
+pub fn game_fleet(snapshot: &FleetStatusSnapshot, game: GameKind) -> Option<GameFleetStatus> {
+    if let Some(found) = snapshot.games.iter().find(|status| status.game == game) {
+        return Some(found.clone());
+    }
+    (game == GameKind::SheepWars).then(|| GameFleetStatus {
+        game,
+        queue_len: snapshot.queue_len,
+        min_players: snapshot.min_players,
+        max_players_per_server: snapshot.max_players_per_server,
+        min_replicas: snapshot.min_replicas,
+        max_replicas: snapshot.max_replicas,
+        standby_servers: snapshot.standby_servers,
+        ready_servers: snapshot.ready_servers,
+        in_game_servers: snapshot.in_game_servers,
+        starting_servers: snapshot.starting_servers,
+        queued_players: snapshot.queued_players.clone(),
+    })
+}
+
+pub fn join_body(
+    player_uuid: Uuid,
+    player_name: &str,
+    game: GameKind,
+    match_size: u8,
+) -> JoinQueueRequest {
+    JoinQueueRequest {
+        player_uuid,
+        player_name: player_name.to_owned(),
+        game,
+        match_size,
+    }
+}
+
+pub fn leave_body(player_uuid: Uuid, reason: LeaveReason, game: GameKind) -> LeaveQueueRequest {
+    LeaveQueueRequest {
+        player_uuid,
+        reason,
+        game,
     }
 }
 
@@ -429,6 +529,62 @@ pub enum ToggleQueueOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_bodies_carry_the_game() {
+        let uuid = Uuid::nil();
+        let join = serde_json::to_value(join_body(uuid, "Alex", GameKind::TowerWars, 3))
+            .expect("serialize");
+        assert_eq!(join["game"], "tower_wars");
+        assert_eq!(join["match_size"], 3);
+        let sheep = join_body(uuid, "Alex", GameKind::SheepWars, 0);
+        assert_eq!(sheep.match_size, 0);
+        let leave = serde_json::to_value(leave_body(
+            uuid,
+            LeaveReason::UserToggle,
+            GameKind::SheepWars,
+        ))
+        .expect("serialize");
+        assert_eq!(leave["game"], "sheep_wars");
+    }
+
+    #[test]
+    fn queue_counts_prefer_per_game_entries_and_fall_back_to_the_legacy_field() {
+        let mut snapshot: FleetStatusSnapshot = serde_json::from_value(serde_json::json!({
+            "queue_len": 3, "min_players": 2, "max_players_per_server": 8,
+            "min_replicas": 1, "max_replicas": 2, "standby_servers": 0,
+            "ready_servers": 0, "in_game_servers": 0, "starting_servers": 0,
+            "queued_players": [], "servers": []
+        }))
+        .expect("snapshot");
+        assert_eq!(
+            QueueCounts::from_snapshot(&snapshot),
+            QueueCounts {
+                sheepwars: 3,
+                towerwars: 0
+            }
+        );
+        snapshot.games = vec![GameFleetStatus {
+            game: GameKind::TowerWars,
+            queue_len: 5,
+            min_players: 2,
+            max_players_per_server: 8,
+            min_replicas: 1,
+            max_replicas: 2,
+            standby_servers: 0,
+            ready_servers: 0,
+            in_game_servers: 0,
+            starting_servers: 0,
+            queued_players: Vec::new(),
+        }];
+        let counts = QueueCounts::from_snapshot(&snapshot);
+        assert_eq!(
+            game_fleet(&snapshot, GameKind::TowerWars).map(|g| g.queue_len),
+            Some(5)
+        );
+        assert_eq!(counts.get(GameKind::TowerWars), 5);
+        assert_eq!(counts.get(GameKind::SheepWars), 3);
+    }
 
     #[test]
     fn insufficient_coins_carries_the_missing_amount() {

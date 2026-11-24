@@ -144,6 +144,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=rspigot-builder /usr/local/bin/rspigot /usr/local/bin/rspigot
 COPY server/bukkit.yml server/permissions.yml server/server.properties server/spigot.yml.example server/world.zip /opt/ferriscraft/templates/lobby/
 COPY server-sheepwars/bukkit.yml server-sheepwars/permissions.yml server-sheepwars/server.properties server-sheepwars/spigot.yml.example server-sheepwars/arena.jso[n] server-sheepwars/world.zi[p] /opt/ferriscraft/templates/sheepwars/
+COPY server-towerwars/bukkit.yml server-towerwars/permissions.yml server-towerwars/server.properties server-towerwars/spigot.yml.example /opt/ferriscraft/templates/towerwars/
 COPY --chmod=0755 deploy/docker/rspigot-entrypoint.sh /usr/local/bin/rspigot-entrypoint.sh
 
 EXPOSE 25565 25580 25581
@@ -154,7 +155,7 @@ ENV FERRISCRAFT_VERSION=${FERRISCRAFT_VERSION} \
 ENTRYPOINT ["/usr/local/bin/rspigot-entrypoint.sh"]
 
 # ==============================================================================
-# Pipeline 3: FerrisCraft Rust Plugins (lobby + sheepwars)
+# Pipeline 3: FerrisCraft Rust Plugins (lobby + sheepwars + towerwars)
 # ==============================================================================
 FROM chef AS plugins-planner
 
@@ -224,6 +225,32 @@ ARG RSPIGOT_REF=local
 ENV FERRISCRAFT_VERSION=${FERRISCRAFT_VERSION} \
     RSPIGOT_REF=${RSPIGOT_REF}
 ENTRYPOINT ["/usr/local/bin/ferriscraft-sheepwars"]
+
+FROM chef AS towerwars-cook
+
+COPY --exclude=target --exclude=.git --exclude=rust-toolchain.toml --from=rspigot-src . /opt/minecraft/dev/rspigot
+WORKDIR /opt/ferrislabs/ferriscraft
+COPY --from=plugins-planner /opt/ferrislabs/ferriscraft/recipe.json recipe.json
+RUN --mount=type=cache,id=ferriscraft-cargo-registry-plugins,sharing=locked,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=ferriscraft-cargo-git-plugins,sharing=locked,target=/usr/local/cargo/git \
+    cargo chef cook --release --bin ferriscraft-towerwars --recipe-path recipe.json
+
+FROM towerwars-cook AS towerwars-builder
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN --mount=type=cache,id=ferriscraft-cargo-registry-plugins,sharing=locked,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=ferriscraft-cargo-git-plugins,sharing=locked,target=/usr/local/cargo/git \
+    cargo build --release --bin ferriscraft-towerwars
+
+FROM distroless-runtime AS towerwars
+
+COPY --from=towerwars-builder /opt/ferrislabs/ferriscraft/target/release/ferriscraft-towerwars /usr/local/bin/ferriscraft-towerwars
+ARG FERRISCRAFT_VERSION=dev
+ARG RSPIGOT_REF=local
+ENV FERRISCRAFT_VERSION=${FERRISCRAFT_VERSION} \
+    RSPIGOT_REF=${RSPIGOT_REF}
+ENTRYPOINT ["/usr/local/bin/ferriscraft-towerwars"]
 
 # ==============================================================================
 # Pipeline 4: Velocity Proxy + FerrisCraft Velocity Plugin

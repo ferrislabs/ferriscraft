@@ -180,11 +180,43 @@ pub async fn load_or_seed<R: LayoutRepository>(
 ) -> Result<LobbyLayout, RepositoryError> {
     let stored = retry_unavailable(backoff, "chargement du layout", || repo.load()).await?;
     match stored {
-        Some(layout) => Ok(layout),
+        Some(mut layout) => {
+            if add_missing_towerwars_pedestal(&mut layout, seed) {
+                retry_unavailable(backoff, "migration du layout", || repo.save(&layout)).await?;
+                tracing::info!("Piédestal TowerWars ajouté au layout stocké");
+            }
+            Ok(layout)
+        }
         None => {
             retry_unavailable(backoff, "initialisation du layout", || repo.save(seed)).await?;
             tracing::info!("Layout initialisé depuis la configuration embarquée");
             Ok(seed.clone())
         }
     }
+}
+
+fn add_missing_towerwars_pedestal(layout: &mut LobbyLayout, seed: &LobbyLayout) -> bool {
+    const ID: &str = "towerwars";
+    if layout.pedestals.iter().any(|p| p.id == ID) {
+        return false;
+    }
+    let Some(wanted) = seed.pedestals.iter().find(|p| p.id == ID) else {
+        return false;
+    };
+    if let Some(legacy) = layout
+        .pedestals
+        .iter_mut()
+        .find(|p| p.id == "uhc" && !p.active)
+    {
+        let mut upgraded = wanted.clone();
+        upgraded.index = legacy.index;
+        upgraded.pose = legacy.pose;
+        *legacy = upgraded;
+        return true;
+    }
+    if layout.pedestals.iter().any(|p| p.index == wanted.index) {
+        return false;
+    }
+    layout.pedestals.push(wanted.clone());
+    true
 }

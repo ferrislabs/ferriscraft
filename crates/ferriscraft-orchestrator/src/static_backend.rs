@@ -1,25 +1,30 @@
 use std::time::{Duration, Instant};
 
 use crate::api::AppState;
-use crate::config::OrchestratorConfig;
+use crate::config::{GameConfig, OrchestratorConfig};
 
 pub async fn run_static_reconcile_loop(state: AppState, config: OrchestratorConfig) {
-    tracing::info!(
-        servers = config.static_servers.len(),
-        queue_min_players = config.queue_min_players,
-        "Réconciliateur statique local démarré"
-    );
+    for game in config.games() {
+        tracing::info!(
+            game = game.spec().display_name,
+            servers = game.static_servers.len(),
+            queue_min_players = game.queue_min_players,
+            "Réconciliateur statique local démarré"
+        );
+    }
 
     let mut ticker = tokio::time::interval(config.reconcile_interval);
     loop {
         ticker.tick().await;
-        reconcile_static_once(&state, &config).await;
+        for game in config.games() {
+            reconcile_static_once(&state, game).await;
+        }
     }
 }
 
-async fn reconcile_static_once(state: &AppState, config: &OrchestratorConfig) {
-    let mut statuses = Vec::with_capacity(config.static_servers.len());
-    for spec in &config.static_servers {
+async fn reconcile_static_once(state: &AppState, game: &GameConfig) {
+    let mut statuses = Vec::with_capacity(game.static_servers.len());
+    for spec in &game.static_servers {
         let ready = tokio::time::timeout(
             Duration::from_millis(250),
             tokio::net::TcpStream::connect(&spec.address),
@@ -32,7 +37,10 @@ async fn reconcile_static_once(state: &AppState, config: &OrchestratorConfig) {
     let now = Instant::now();
     let mut events = Vec::new();
     {
-        let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
+        let mut games = state.lock_games();
+        let Ok(engine) = games.engine_mut(game.game) else {
+            return;
+        };
         for (server_id, address, ready) in statuses {
             events.extend(engine.upsert_infra_server(
                 now,

@@ -16,9 +16,29 @@ use crate::capitainerie::{
 use crate::config::{
     AmbientNpcSpec, AmbientRole, LayoutStore, LobbyLayout, PedestalSpec, WaypointPose,
 };
+use crate::orchestrator::QueueCounts;
+use ferriscraft_protocol::GameKind;
 
 const AMBIENT_TICK: Duration = Duration::from_millis(1500);
 const CAPITAINERIE_POLL: Duration = Duration::from_secs(3);
+
+pub fn pedestal_game(spec: &PedestalSpec) -> Option<GameKind> {
+    spec.active.then(|| GameKind::from_slug(&spec.game_id))?
+}
+
+pub fn pedestal_label(spec: &PedestalSpec, queued: QueueCounts) -> Option<String> {
+    let game = pedestal_game(spec)?;
+    let color = match game {
+        GameKind::SheepWars => "§d",
+        GameKind::TowerWars => "§b",
+    };
+    Some(format!(
+        "{}\n§fEn file : {color}{}\n{}",
+        spec.title,
+        queued.get(game),
+        spec.subtitle
+    ))
+}
 
 #[derive(Debug, Clone)]
 pub enum NpcClickTarget {
@@ -208,22 +228,18 @@ impl NpcDirector {
         )
     }
 
-    pub async fn spawn_all(&self, server: &Server, sheepwars_queued: usize) {
+    pub async fn spawn_all(&self, server: &Server, queued: QueueCounts) {
         let snapshot = self.layout.snapshot();
-        self.sync_pedestals(&server.world, &snapshot, sheepwars_queued)
-            .await;
+        self.sync_pedestals(&server.world, &snapshot, queued).await;
         self.sync_ambients(&server.world, &snapshot).await;
         self.sync_captain(&server.world, &snapshot, false).await;
     }
 
-    pub fn update_sheepwars_pedestal_label(&self, queued: usize) {
+    pub fn update_pedestal_labels(&self, queued: QueueCounts) {
         let guard = self.pedestals.read().unwrap_or_else(|e| e.into_inner());
         for actor in guard.iter() {
-            if actor.spec.game_id == "sheepwars" {
-                actor.npc.set_label(format!(
-                    "{}\n§fEn file : §d{queued}\n{}",
-                    actor.spec.title, actor.spec.subtitle
-                ));
+            if let Some(label) = pedestal_label(&actor.spec, queued) {
+                actor.npc.set_label(label);
             }
         }
     }
@@ -651,7 +667,7 @@ impl NpcDirector {
         self.total_agents.store(total_now, Ordering::Relaxed);
     }
 
-    async fn sync_pedestals(&self, world: &World, layout: &LobbyLayout, sheepwars_queued: usize) {
+    async fn sync_pedestals(&self, world: &World, layout: &LobbyLayout, queued: QueueCounts) {
         let mut actors = Vec::with_capacity(layout.pedestals.len());
         for spec in &layout.pedestals {
             let key = format!("pedestal:{}", spec.id);
@@ -674,14 +690,8 @@ impl NpcDirector {
                         NpcSlot::OffHand,
                         spec.off_material().map(|m| ItemStack::new(m, 1)),
                     );
-                    let label = if spec.game_id == "sheepwars" {
-                        format!(
-                            "{}\n§fEn file : §d{sheepwars_queued}\n{}",
-                            spec.title, spec.subtitle
-                        )
-                    } else {
-                        format!("{}\n{}", spec.title, spec.subtitle)
-                    };
+                    let label = pedestal_label(spec, queued)
+                        .unwrap_or_else(|| format!("{}\n{}", spec.title, spec.subtitle));
                     npc.set_label(label);
                     npc.look_at_nearest(10.0);
                     actors.push(PedestalActor {
@@ -929,6 +939,22 @@ async fn adopt_or_create(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pedestal_labels_show_the_queue_of_their_own_game() {
+        let layout = LobbyLayout::default();
+        let counts = QueueCounts {
+            sheepwars: 2,
+            towerwars: 7,
+        };
+        let label_of = |id: &str| {
+            let spec = layout.pedestals.iter().find(|p| p.id == id).expect("spec");
+            pedestal_label(spec, counts)
+        };
+        assert!(label_of("sheepwars").expect("label").contains("§d2"));
+        assert!(label_of("towerwars").expect("label").contains("§b7"));
+        assert_eq!(label_of("rush"), None);
+    }
+
     use super::*;
 
     #[test]

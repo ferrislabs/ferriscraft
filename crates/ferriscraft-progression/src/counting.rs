@@ -93,6 +93,16 @@ mod tests {
     }
 
     #[test]
+    fn a_towerwars_duel_is_counted_for_its_own_game() {
+        let mut towerwars = duel();
+        towerwars.game = GameKind::TowerWars;
+        towerwars.server_id = "towerwars-1".into();
+        let counted = count_match(&towerwars).unwrap();
+        assert_eq!(counted.game, GameKind::TowerWars);
+        assert_eq!(counted.rewarded.len(), 2);
+    }
+
+    #[test]
     fn a_normal_duel_is_counted() {
         let counted = count_match(&duel()).unwrap();
         assert_eq!(counted.rewarded.len(), 2);

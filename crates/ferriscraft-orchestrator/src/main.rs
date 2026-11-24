@@ -6,7 +6,7 @@ use ferriscraft_orchestrator::engine::FleetPolicy;
 use ferriscraft_orchestrator::k8s::run_k8s_reconcile_loop;
 use ferriscraft_orchestrator::progression::{ProgressionService, ProgressionStore};
 use ferriscraft_orchestrator::queue::{
-    MemoryQueueRepository, PgQueueRepository, QueueStore, restore_engine,
+    MemoryQueueRepository, PgQueueRepository, QueueStore, restore_games,
 };
 use ferriscraft_orchestrator::static_backend::run_static_reconcile_loop;
 use ferriscraft_progression::MemoryProgressionRepository;
@@ -23,20 +23,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let config = OrchestratorConfig::from_env()?;
-    let policy = FleetPolicy {
-        lobby_server_name: config.lobby_server_name.clone(),
-        queue_min_players: config.queue_min_players,
-        max_players_per_server: config.max_players_per_server,
-        min_replicas: config.min_replicas,
-        max_replicas: config.max_replicas,
-        standby_servers: config.standby_servers,
-        idle_ttl: config.idle_ttl,
-        starting_timeout: config.starting_timeout,
-        transfer_timeout: config.transfer_timeout,
-        empty_grace: config.empty_grace,
-        ending_timeout: config.ending_timeout,
-        heartbeat_timeout: config.heartbeat_timeout,
-    };
+    let lobby_host = config.policy(&config.sheepwars);
+    let others: Vec<FleetPolicy> = config
+        .towerwars
+        .iter()
+        .map(|game| config.policy(game))
+        .collect();
 
     let queue_store = match config.progression_database_url.as_deref() {
         Some(url) => match PgQueueRepository::connect(url).await {
@@ -51,8 +43,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             QueueStore::Memory(MemoryQueueRepository::default())
         }
     };
-    let engine = match restore_engine(policy, &queue_store, Instant::now()).await {
-        Ok(engine) => engine,
+    let games = match restore_games(lobby_host, others, &queue_store, Instant::now()).await {
+        Ok(games) => games,
         Err(err) => {
             tracing::error!(error = %err, "rechargement de la file d'attente impossible");
             std::process::exit(1);
@@ -71,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ProgressionStore::Memory(MemoryProgressionRepository::default())
         }
     };
-    let state = AppState::new(engine, config.api_token.clone())
+    let state = AppState::from_games(games, config.api_token.clone())
         .with_queue(queue_store)
         .with_version(config.version.clone())
         .with_progression(ProgressionService::new(store));

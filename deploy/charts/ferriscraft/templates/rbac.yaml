@@ -25,6 +25,14 @@ rules:
     resources: ["sheepwarsservers/status"]
     verbs: ["get", "patch"]
   {{- end }}
+  {{- if and .Values.orchestrator.towerwars.enabled .Values.orchestrator.towerwars.crd.enabled }}
+  - apiGroups: ["ferriscraft.io"]
+    resources: ["towerwarsservers"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["ferriscraft.io"]
+    resources: ["towerwarsservers/status"]
+    verbs: ["get", "patch"]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

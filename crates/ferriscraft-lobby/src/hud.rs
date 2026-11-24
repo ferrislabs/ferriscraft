@@ -55,6 +55,7 @@ pub struct HubMetrics {
     pub max_players: u32,
     pub tps_1m: f64,
     pub sheepwars_queued: usize,
+    pub towerwars_queued: usize,
     pub agents_working: usize,
     pub agents_total: usize,
 }
@@ -102,6 +103,7 @@ pub fn build_sidebar_lines(input: &PlayerHudInput) -> Vec<String> {
             input.metrics.online, input.metrics.max_players
         ),
         format!("§fSheepWars : §d{} prêt(s)", input.metrics.sheepwars_queued),
+        format!("§fTowerWars : §b{} prêt(s)", input.metrics.towerwars_queued),
         format!(
             "§fCapitainerie : §b{}§7/§f{}",
             input.metrics.agents_working, input.metrics.agents_total
@@ -127,9 +129,10 @@ pub fn build_tab_list(input: &PlayerHudInput) -> TabList {
         input.metrics.online, input.metrics.max_players
     );
     let footer = format!(
-        "\n§7Grade : {} §8• §7Compte : {fk_status}\n§7Ping : §a{ping} ms §8• §7TPS : §a{tps:.1} §8• §7SheepWars : §d{} prêt(s)\n§6/menu §8• §d/sheepwars §8• §b/gadgets §8• §b/fly §8• §e/options\n",
+        "\n§7Grade : {} §8• §7Compte : {fk_status}\n§7Ping : §a{ping} ms §8• §7TPS : §a{tps:.1} §8• §7SheepWars : §d{} §8• §7TowerWars : §b{}\n§6/menu §8• §d/sheepwars §8• §b/towerwars §8• §b/gadgets §8• §b/fly §8• §e/options\n",
         input.rank.sidebar_label(),
-        input.metrics.sheepwars_queued
+        input.metrics.sheepwars_queued,
+        input.metrics.towerwars_queued
     );
     TabList::new(header, footer)
 }
@@ -343,6 +346,7 @@ mod tests {
                 max_players: 100,
                 tps_1m: 20.0,
                 sheepwars_queued: 3,
+                towerwars_queued: 5,
                 agents_working: 2,
                 agents_total: 4,
             },
@@ -358,6 +362,7 @@ mod tests {
         );
         assert!(lines.iter().any(|l| l.contains("✔ nathael")));
         assert!(lines.iter().any(|l| l.contains("SheepWars : §d3")));
+        assert!(lines.iter().any(|l| l.contains("TowerWars : §b5")));
         assert!(lines.iter().any(|l| l == "§6Coins §f340"));
 
         let tab = build_tab_list(&input);

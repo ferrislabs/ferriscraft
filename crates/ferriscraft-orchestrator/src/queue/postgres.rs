@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use ferriscraft_protocol::GameKind;
 use sqlx::postgres::{PgPoolOptions, PgRow};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -32,12 +33,18 @@ fn record(row: &PgRow) -> Result<QueueRecord, QueueStoreError> {
         },
         (other, _, _) => return Err(corrupted("état illisible", other)),
     };
+    let game: String = row.try_get("game").map_err(unavailable)?;
+    let game = GameKind::from_slug(&game).ok_or_else(|| corrupted("jeu illisible", &game))?;
+    let match_size: i16 = row.try_get("match_size").map_err(unavailable)?;
     Ok(QueueRecord {
         seq: u64::try_from(seq).map_err(|_| corrupted("seq négatif", seq))?,
         player_uuid: row.try_get("player_uuid").map_err(unavailable)?,
         name: row.try_get("name").map_err(unavailable)?,
         joined_at: row.try_get("joined_at").map_err(unavailable)?,
         state,
+        game,
+        match_size: u8::try_from(match_size)
+            .map_err(|_| corrupted("match_size illisible", match_size))?,
     })
 }
 
@@ -60,7 +67,7 @@ impl PgQueueRepository {
 impl QueueRepository for PgQueueRepository {
     async fn load_all(&self) -> Result<Vec<QueueRecord>, QueueStoreError> {
         let rows = sqlx::query(
-            "SELECT seq, player_uuid, name, joined_at, state, server_id, transfer_id \
+            "SELECT seq, player_uuid, name, joined_at, state, server_id, transfer_id, game, match_size \
              FROM queue_entries ORDER BY seq",
         )
         .fetch_all(&self.pool)
@@ -75,8 +82,8 @@ impl QueueRepository for PgQueueRepository {
             .map(|seq| i64::try_from(seq).map_err(|_| corrupted("seq trop grand", seq)))
             .transpose()?;
         let row = sqlx::query(
-            "INSERT INTO queue_entries (seq, player_uuid, name, joined_at) \
-             VALUES (COALESCE($1, nextval('queue_entries_seq_seq')), $2, $3, $4) \
+            "INSERT INTO queue_entries (seq, player_uuid, name, joined_at, game, match_size) \
+             VALUES (COALESCE($1, nextval('queue_entries_seq_seq')), $2, $3, $4, $5, $6) \
              ON CONFLICT (player_uuid) DO UPDATE SET name = EXCLUDED.name \
              RETURNING seq",
         )
@@ -84,6 +91,8 @@ impl QueueRepository for PgQueueRepository {
         .bind(entry.player_uuid)
         .bind(entry.name)
         .bind(entry.joined_at)
+        .bind(entry.game.slug())
+        .bind(i16::from(entry.match_size))
         .fetch_one(&self.pool)
         .await
         .map_err(unavailable)?;

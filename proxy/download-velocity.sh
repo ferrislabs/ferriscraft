@@ -24,7 +24,7 @@ import pathlib, re, sys
 root = pathlib.Path(sys.argv[1])
 secret = sys.argv[2]
 
-for rel in ("server/spigot.yml", "server-sheepwars/spigot.yml"):
+for rel in ("server/spigot.yml", "server-sheepwars/spigot.yml", "server-towerwars/spigot.yml"):
     p = root / rel
     example = root / f"{rel}.example"
     if not p.exists() and example.exists():

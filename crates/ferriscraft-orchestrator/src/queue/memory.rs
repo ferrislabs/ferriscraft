@@ -69,6 +69,8 @@ impl QueueRepository for MemoryQueueRepository {
                 name: entry.name.to_owned(),
                 joined_at: entry.joined_at,
                 state: QueueEntryState::Waiting,
+                game: entry.game,
+                match_size: entry.match_size,
             },
         );
         Ok(seq)

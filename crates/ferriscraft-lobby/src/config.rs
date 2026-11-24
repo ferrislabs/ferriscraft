@@ -425,14 +425,14 @@ impl Default for LobbyLayout {
             },
             PedestalSpec {
                 index: 7,
-                id: "uhc".to_owned(),
-                npc_name: "Jeu_UHC".to_owned(),
-                title: "§c§lArena UHC".to_owned(),
-                subtitle: "§7Bientôt disponible".to_owned(),
-                game_id: "uhc".to_owned(),
-                active: false,
-                main_hand: "minecraft:gold_ingot".to_owned(),
-                off_hand: None,
+                id: "towerwars".to_owned(),
+                npc_name: "TowerWars".to_owned(),
+                title: "§b§lTOWER WARS".to_owned(),
+                subtitle: "§a▶ Clic droit pour jouer !".to_owned(),
+                game_id: "towerwars".to_owned(),
+                active: true,
+                main_hand: "minecraft:crossbow".to_owned(),
+                off_hand: Some("minecraft:arrow".to_owned()),
                 pose: WaypointPose::new(0.5, 27.0, -70.5, -105.0, 0.0),
             },
         ];
@@ -613,6 +613,25 @@ mod tests {
         assert_eq!(center.game_id, "sheepwars");
         assert!(center.active);
         assert_eq!(center.main_material(), Some(Material::WhiteWool));
+    }
+
+    #[test]
+    fn default_layout_has_an_active_towerwars_pedestal_matching_its_game_slug() {
+        let layout = LobbyLayout::default();
+        let tower = layout
+            .pedestals
+            .iter()
+            .find(|p| p.id == "towerwars")
+            .expect("towerwars pedestal");
+        assert!(tower.active);
+        assert_eq!(
+            Some(ferriscraft_protocol::GameKind::TowerWars),
+            ferriscraft_protocol::GameKind::from_slug(&tower.game_id)
+        );
+        assert_eq!(tower.main_material(), Some(Material::Crossbow));
+        let indexes: std::collections::BTreeSet<_> =
+            layout.pedestals.iter().map(|p| p.index).collect();
+        assert_eq!(indexes.len(), layout.pedestals.len());
     }
 
     async fn open_file_store(path: &std::path::Path) -> LayoutStore {

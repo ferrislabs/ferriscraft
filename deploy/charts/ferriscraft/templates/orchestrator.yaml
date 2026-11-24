@@ -17,6 +17,9 @@ spec:
     metadata:
       annotations:
         checksum/sheepwars-template: {{ include (print $.Template.BasePath "/sheepwars-template-cm.yaml") . | sha256sum }}
+        {{- if .Values.orchestrator.towerwars.enabled }}
+        checksum/towerwars-template: {{ include (print $.Template.BasePath "/towerwars-template-cm.yaml") . | sha256sum }}
+        {{- end }}
       labels:
         {{- include "ferriscraft.labels" . | nindent 8 }}
         app.kubernetes.io/component: orchestrator
@@ -82,6 +85,40 @@ spec:
               value: {{ .Values.sheepwars.port | quote }}
             - name: SHEEPWARS_POD_TEMPLATE_PATH
               value: "/etc/ferriscraft/template/pod-template.yaml"
+            {{- if .Values.orchestrator.towerwars.enabled }}
+            - name: TOWERWARS_ENABLED
+              value: "true"
+            - name: TOWERWARS_MAX_PLAYERS
+              value: {{ .Values.orchestrator.towerwars.maxPlayers | quote }}
+            - name: TOWERWARS_MIN_REPLICAS
+              value: {{ .Values.orchestrator.towerwars.minReplicas | quote }}
+            - name: TOWERWARS_MAX_REPLICAS
+              value: {{ .Values.orchestrator.towerwars.maxReplicas | quote }}
+            - name: TOWERWARS_STANDBY_SERVERS
+              value: {{ .Values.orchestrator.towerwars.standbyServers | quote }}
+            - name: TOWERWARS_QUEUE_MIN_PLAYERS
+              value: {{ .Values.orchestrator.towerwars.queueMinPlayers | quote }}
+            - name: TOWERWARS_IDLE_TTL_SECS
+              value: {{ .Values.orchestrator.towerwars.idleTtlSecs | quote }}
+            - name: TOWERWARS_STARTING_TIMEOUT_SECS
+              value: {{ .Values.orchestrator.towerwars.startingTimeoutSecs | quote }}
+            - name: TOWERWARS_EMPTY_GRACE_SECS
+              value: {{ .Values.orchestrator.towerwars.emptyGraceSecs | quote }}
+            - name: TOWERWARS_ENDING_TIMEOUT_SECS
+              value: {{ .Values.orchestrator.towerwars.endingTimeoutSecs | quote }}
+            - name: TOWERWARS_HEARTBEAT_TIMEOUT_SECS
+              value: {{ .Values.orchestrator.towerwars.heartbeatTimeoutSecs | quote }}
+            - name: TOWERWARS_CRD_ENABLED
+              value: {{ .Values.orchestrator.towerwars.crd.enabled | quote }}
+            - name: TOWERWARS_PORT
+              value: {{ .Values.towerwars.port | quote }}
+            - name: TOWERWARS_POD_TEMPLATE_PATH
+              value: "/etc/ferriscraft/towerwars-template/pod-template.yaml"
+            {{- if .Values.orchestrator.towerwars.map }}
+            - name: TOWERWARS_MAP
+              value: {{ .Values.orchestrator.towerwars.map | quote }}
+            {{- end }}
+            {{- end }}
             {{- if (include "ferriscraft.orchestratorTokenSecretName" .) }}
             - name: ORCHESTRATOR_TOKEN
               valueFrom:
@@ -141,10 +178,20 @@ spec:
             - name: pod-template
               mountPath: /etc/ferriscraft/template
               readOnly: true
+            {{- if .Values.orchestrator.towerwars.enabled }}
+            - name: towerwars-pod-template
+              mountPath: /etc/ferriscraft/towerwars-template
+              readOnly: true
+            {{- end }}
       volumes:
         - name: pod-template
           configMap:
             name: {{ include "ferriscraft.fullname" . }}-sheepwars-template
+        {{- if .Values.orchestrator.towerwars.enabled }}
+        - name: towerwars-pod-template
+          configMap:
+            name: {{ include "ferriscraft.fullname" . }}-towerwars-template
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service

@@ -15,3 +15,4 @@
 | cosmétique | Effet visuel sans effet de gameplay, à débloquer puis équiper dans un emplacement. | skin, bonus |
 | déblocage | Droit d'équiper un cosmétique, obtenu par achat, grade ou level réseau. | unlock |
 | grade | Rang en jeu (`Admin` à `Guest`) déduit des rôles FerrisKey du joueur. | rôle (réservé à FerrisKey) |
+| jeu | Mini-jeu hébergé par le réseau (`GameKind` : SheepWars, TowerWars). Il a sa file, sa flotte, sa politique, ses Pods et son CRD dans l'orchestrateur. | mode, mini-jeu (seul), game (hors code) |

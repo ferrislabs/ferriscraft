@@ -578,11 +578,20 @@ fn sheepwars_full_lifecycle_orchestrator_countdown_combat_and_ephemeral_end() {
         alice.event_debug_has("Wool") || alice.event_debug_has("Mouton")
     });
 
-    // Move Bob below void_fall_y (20.0) -> killed -> 1 life -> eliminated -> Alice wins
+    // Teleport Bob below void_fall_y (20.0) -> killed -> 1 life -> eliminated -> Alice wins.
+    // A single 55-block move packet is refused by rspigot movement checks since 0.1.0.
+    core.server.handle(Inbound::Console(format!(
+        "tp Bob {} 10 {}",
+        bob.pos.x, bob.pos.z
+    )));
+    core.run_until("Bob is teleported below the arena", |c| {
+        confirm_teleports(&mut c.server, &mut bob);
+        bob.pos.y < 20.0
+    });
     core.server.handle(Inbound::Input {
         player: bob.id,
         input: PlayerInput::Move {
-            position: Some(Vec3::new(bob.pos.x, 10.0, bob.pos.z)),
+            position: Some(Vec3::new(bob.pos.x, bob.pos.y - 0.5, bob.pos.z)),
             rotation: None,
             on_ground: false,
         },

@@ -6,16 +6,28 @@ use std::future::Future;
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
+use ferriscraft_protocol::GameKind;
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::engine::{FleetEngine, FleetPolicy};
+use crate::games::Games;
 
 pub use memory::MemoryQueueRepository;
 pub use postgres::PgQueueRepository;
 pub use store::QueueStore;
 
 pub const FIRST_SEQ: u64 = 1 << 32;
+
+pub const MAX_MATCH_SIZE: u8 = 4;
+
+pub const fn normalize_match_size(game: GameKind, raw: u8) -> u8 {
+    match game {
+        GameKind::TowerWars if raw >= 1 && raw <= MAX_MATCH_SIZE => raw,
+        GameKind::TowerWars => 1,
+        GameKind::SheepWars => 0,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueueEntryState {
@@ -33,6 +45,8 @@ pub struct QueueRecord {
     pub name: String,
     pub joined_at: DateTime<Utc>,
     pub state: QueueEntryState,
+    pub game: GameKind,
+    pub match_size: u8,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -41,6 +55,8 @@ pub struct NewQueueEntry<'a> {
     pub name: &'a str,
     pub joined_at: DateTime<Utc>,
     pub seq: Option<u64>,
+    pub game: GameKind,
+    pub match_size: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +65,8 @@ pub enum QueueMutation {
         seq: u64,
         player_uuid: Uuid,
         name: String,
+        game: GameKind,
+        match_size: u8,
     },
     SetState {
         player_uuid: Uuid,
@@ -94,12 +112,16 @@ pub async fn persist<R: QueueRepository>(
             seq,
             player_uuid,
             name,
+            game,
+            match_size,
         } => repo
             .insert(NewQueueEntry {
                 player_uuid: *player_uuid,
                 name,
                 joined_at: Utc::now(),
                 seq: Some(*seq),
+                game: *game,
+                match_size: *match_size,
             })
             .await
             .map(drop),
@@ -117,4 +139,22 @@ pub async fn restore_engine<R: QueueRepository>(
     let mut engine = FleetEngine::new(policy);
     engine.restore_queue(now, records);
     Ok(engine)
+}
+
+pub async fn restore_games<R: QueueRepository>(
+    lobby_host: FleetPolicy,
+    others: Vec<FleetPolicy>,
+    repo: &R,
+    now: Instant,
+) -> Result<Games, QueueStoreError> {
+    let records = repo.load_all().await?;
+    let mut host = FleetEngine::new(lobby_host);
+    host.restore_queue(now, records.clone());
+    let mut games = Games::new(host);
+    for policy in others {
+        let mut engine = FleetEngine::new(policy);
+        engine.restore_queue(now, records.clone());
+        games.insert_engine(engine);
+    }
+    Ok(games)
 }

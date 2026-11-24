@@ -326,6 +326,23 @@ mod tests {
     }
 
     #[test]
+    fn a_towerwars_win_earns_xp_on_its_own_game_curve_and_the_network_curve() {
+        let mut a = PlayerProgress::new(RED);
+        let credit = a.record_match(MATCH, GameKind::TowerWars, MatchOutcome::Win);
+
+        assert_eq!(credit.game, GameKind::TowerWars);
+        assert_eq!(a.game_progress(GameKind::TowerWars).total, Xp(150));
+        assert_eq!(a.game_progress(GameKind::SheepWars).total, Xp::ZERO);
+        assert_eq!(a.network_xp(), Xp(150));
+        assert_eq!(a.coins(), Coins(30));
+
+        let _ = a.record_match(MATCH, GameKind::SheepWars, MatchOutcome::Loss);
+        assert_eq!(a.network_xp(), Xp(200));
+        let stats = a.record().games[&GameKind::TowerWars];
+        assert_eq!((stats.played, stats.wins, stats.losses), (1, 1, 0));
+    }
+
+    #[test]
     fn spec_prg_6_crossing_a_threshold_reports_a_level_up() {
         let mut a = player(PlayerRank::Member, 0);
         with_sheepwars_xp(&mut a, 240);

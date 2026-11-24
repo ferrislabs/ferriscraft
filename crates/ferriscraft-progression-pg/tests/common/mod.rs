@@ -13,6 +13,7 @@ pub const ALEX: Uuid = Uuid::from_u128(0xA1);
 pub const BOB: Uuid = Uuid::from_u128(0xB2);
 pub const UNKNOWN: Uuid = Uuid::from_u128(0xFF);
 pub const MATCH: Uuid = Uuid::from_u128(0x99);
+pub const TOWER_MATCH: Uuid = Uuid::from_u128(0x9A);
 
 pub async fn contract<R: ProgressionRepository>(repo: R) {
     assert_eq!(repo.load(UNKNOWN).await.unwrap(), None);
@@ -169,4 +170,41 @@ pub async fn contract<R: ProgressionRepository>(repo: R) {
     assert_eq!(repo.load(BOB).await.unwrap().unwrap(), bob);
     assert_eq!(repo.ledger(ALEX).await.unwrap().len(), 3);
     assert_eq!(repo.ledger(BOB).await.unwrap().len(), 1);
+
+    let tower_players = [ALEX];
+    let tower = MatchToSettle {
+        match_id: TOWER_MATCH,
+        game: GameKind::TowerWars,
+        server_id: "towerwars-1",
+        players: &tower_players,
+    };
+    let tower_ack = repo
+        .settle_match(tower, |map| {
+            let mut ledger = Vec::new();
+            for (uuid, progress) in map.iter_mut() {
+                let credit =
+                    progress.record_match(TOWER_MATCH, GameKind::TowerWars, MatchOutcome::Win);
+                ledger.push(LedgerEntry {
+                    uuid: *uuid,
+                    movement: credit.movement,
+                });
+            }
+            Settlement {
+                ack: MatchReportAck {
+                    match_id: TOWER_MATCH,
+                    counted: true,
+                    duplicate: false,
+                    rewards: Vec::new(),
+                },
+                ledger,
+            }
+        })
+        .await
+        .unwrap();
+    assert!(tower_ack.counted);
+    let alex_after = repo.load(ALEX).await.unwrap().unwrap();
+    assert_eq!(alex_after.games[&GameKind::TowerWars].xp, Xp(150));
+    assert_eq!(alex_after.games[&GameKind::TowerWars].wins, 1);
+    assert_eq!(alex_after.games[&GameKind::SheepWars].xp, Xp(150));
+    assert_eq!(alex_after.coins, Coins(560));
 }

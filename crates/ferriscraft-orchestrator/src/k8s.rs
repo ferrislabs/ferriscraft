@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use ferriscraft_protocol::GameKind;
 use k8s_openapi::api::core::v1::{
     Container, ContainerPort, EmptyDirVolumeSource, EnvVar, Pod, PodSpec, PodTemplateSpec, Probe,
     SecretVolumeSource, TCPSocketAction, Volume, VolumeMount,
@@ -13,12 +14,12 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::api::AppState;
-use crate::config::OrchestratorConfig;
+use crate::config::{GameConfig, OrchestratorConfig};
 use crate::crd::{
-    SheepWarsServer, SheepWarsServerStatus, desired_status, needs_patch, new_server,
-    owner_reference,
+    GameServerObject, GameServerStatus, SheepWarsServer, TowerWarsServer, desired_status,
+    needs_patch, new_server, owner_reference,
 };
-use crate::engine::ServerDeletion;
+use crate::engine::{FleetEngine, ServerDeletion};
 
 use crate::s3::{MapCatalog, S3Client, hex_lower, sanitize_k8s_label};
 
@@ -27,31 +28,29 @@ const TEMPLATE_HASH_LEN: usize = 12;
 
 const DELETE_RETRY_AFTER: Duration = Duration::from_secs(30);
 
-const SHEEPWARS_SELECTOR: &str =
-    "app.kubernetes.io/component=sheepwars,app.kubernetes.io/managed-by=ferriscraft-orchestrator";
-
-pub fn load_pod_template(config: &OrchestratorConfig) -> Option<PodTemplateSpec> {
-    let path = config.pod_template_path.as_ref()?;
+pub fn load_pod_template(game: &GameConfig) -> Option<PodTemplateSpec> {
+    let path = game.pod_template_path.as_ref()?;
+    let name = game.spec().display_name;
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
         Err(err) => {
-            tracing::warn!(?path, %err, "Impossible de lire le template de Pod SheepWars");
+            tracing::warn!(?path, %err, game = name, "Impossible de lire le template de Pod");
             return None;
         }
     };
     match serde_yaml::from_str::<PodTemplateSpec>(&raw) {
         Ok(tpl) => Some(tpl),
         Err(err) => {
-            tracing::warn!(?path, %err, "YAML/JSON PodTemplateSpec SheepWars invalide");
+            tracing::warn!(?path, %err, game = name, "YAML/JSON PodTemplateSpec invalide");
             None
         }
     }
 }
 
-pub fn template_hash(config: &OrchestratorConfig, template: Option<&PodTemplateSpec>) -> String {
+pub fn template_hash(game: &GameConfig, template: Option<&PodTemplateSpec>) -> String {
     let rendered = match template {
         Some(tpl) => serde_json::to_vec(tpl),
-        None => serde_json::to_vec(&default_pod_spec(config)),
+        None => serde_json::to_vec(&default_pod_spec(game)),
     }
     .unwrap_or_default();
     let mut hash = hex_lower(&Sha256::digest(&rendered));
@@ -59,12 +58,14 @@ pub fn template_hash(config: &OrchestratorConfig, template: Option<&PodTemplateS
     hash
 }
 
-pub fn build_sheepwars_pod(
+pub fn build_pod(
     pod_name: &str,
     config: &OrchestratorConfig,
+    game: &GameConfig,
     template: Option<&PodTemplateSpec>,
     selected_map: Option<&str>,
 ) -> Pod {
+    let spec_of_game = game.spec();
     let mut labels = BTreeMap::new();
     labels.insert(
         "app.kubernetes.io/name".to_owned(),
@@ -72,7 +73,7 @@ pub fn build_sheepwars_pod(
     );
     labels.insert(
         "app.kubernetes.io/component".to_owned(),
-        "sheepwars".to_owned(),
+        spec_of_game.component.to_owned(),
     );
     labels.insert(
         "app.kubernetes.io/managed-by".to_owned(),
@@ -81,7 +82,7 @@ pub fn build_sheepwars_pod(
     labels.insert("ferriscraft.io/server-id".to_owned(), pod_name.to_owned());
     labels.insert(
         TEMPLATE_HASH_LABEL.to_owned(),
-        template_hash(config, template),
+        template_hash(game, template),
     );
     if let Some(map_name) = selected_map {
         let label = sanitize_k8s_label(map_name);
@@ -108,14 +109,17 @@ pub fn build_sheepwars_pod(
 
     let mut spec = template
         .and_then(|t| t.spec.clone())
-        .unwrap_or_else(|| default_pod_spec(config));
+        .unwrap_or_else(|| default_pod_spec(game));
 
     spec.restart_policy = Some("Never".to_owned());
+
+    let map_env = spec_of_game.env_name("MAP_NAME");
+    let max_players_env = spec_of_game.env_name("MAX_PLAYERS");
 
     if let Some(init_containers) = &mut spec.init_containers {
         for container in init_containers {
             if let Some(map_name) = selected_map {
-                upsert_env(&mut container.env, "SHEEPWARS_MAP_NAME", map_name);
+                upsert_env(&mut container.env, &map_env, map_name);
             }
         }
     }
@@ -129,16 +133,12 @@ pub fn build_sheepwars_pod(
         );
         upsert_env(
             &mut container.env,
-            "SHEEPWARS_MAX_PLAYERS",
-            &config.max_players_per_server.to_string(),
+            &max_players_env,
+            &game.max_players_per_server.to_string(),
         );
-        upsert_env(
-            &mut container.env,
-            "SERVER_PORT",
-            &config.sheepwars_port.to_string(),
-        );
+        upsert_env(&mut container.env, "SERVER_PORT", &game.port.to_string());
         if let Some(map_name) = selected_map {
-            upsert_env(&mut container.env, "SHEEPWARS_MAP_NAME", map_name);
+            upsert_env(&mut container.env, &map_env, map_name);
         }
     }
 
@@ -173,16 +173,16 @@ fn upsert_env(envs: &mut Option<Vec<EnvVar>>, name: &str, value: &str) {
     }
 }
 
-fn default_pod_spec(config: &OrchestratorConfig) -> PodSpec {
+fn default_pod_spec(game: &GameConfig) -> PodSpec {
     PodSpec {
         restart_policy: Some("Never".to_owned()),
         containers: vec![Container {
             name: "rspigot".to_owned(),
-            image: Some(config.sheepwars_image.clone()),
+            image: Some(game.image.clone()),
             ports: Some(vec![
                 ContainerPort {
                     name: Some("minecraft".to_owned()),
-                    container_port: i32::from(config.sheepwars_port),
+                    container_port: i32::from(game.port),
                     ..Default::default()
                 },
                 ContainerPort {
@@ -193,7 +193,7 @@ fn default_pod_spec(config: &OrchestratorConfig) -> PodSpec {
             ]),
             readiness_probe: Some(Probe {
                 tcp_socket: Some(TCPSocketAction {
-                    port: IntOrString::Int(i32::from(config.sheepwars_port)),
+                    port: IntOrString::Int(i32::from(game.port)),
                     host: None,
                 }),
                 initial_delay_seconds: Some(2),
@@ -219,7 +219,7 @@ fn default_pod_spec(config: &OrchestratorConfig) -> PodSpec {
             Volume {
                 name: "forwarding-secret".to_owned(),
                 secret: Some(SecretVolumeSource {
-                    secret_name: Some(config.forwarding_secret_name.clone()),
+                    secret_name: Some(game.forwarding_secret_name.clone()),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -270,7 +270,7 @@ impl MapDiscoveryState {
         }
     }
 
-    async fn refresh_if_due(&mut self, ttl: Duration) {
+    async fn refresh_if_due(&mut self, ttl: Duration, game: &str) {
         let now = Instant::now();
         let retry_interval = if self.catalog.maps().is_empty() {
             ttl.min(Duration::from_secs(3))
@@ -289,7 +289,8 @@ impl MapDiscoveryState {
                     tracing::info!(
                         maps = ?self.catalog.maps(),
                         bucket = %self.client.config().bucket,
-                        "Catalogue des maps SheepWars mis à jour depuis S3"
+                        game,
+                        "Catalogue des maps mis à jour depuis S3"
                     );
                 }
             }
@@ -308,16 +309,50 @@ pub async fn run_k8s_reconcile_loop(state: AppState, config: OrchestratorConfig)
             return;
         }
     };
+    let mut tasks = tokio::task::JoinSet::new();
+    for game in config.games() {
+        let (state, config, client, game_config) =
+            (state.clone(), config.clone(), client.clone(), game.clone());
+        match game.game {
+            GameKind::SheepWars => {
+                tasks.spawn(run_game_reconcile_loop::<SheepWarsServer>(
+                    state,
+                    config,
+                    game_config,
+                    client,
+                ));
+            }
+            GameKind::TowerWars => {
+                tasks.spawn(run_game_reconcile_loop::<TowerWarsServer>(
+                    state,
+                    config,
+                    game_config,
+                    client,
+                ));
+            }
+        }
+    }
+    while tasks.join_next().await.is_some() {}
+}
+
+async fn run_game_reconcile_loop<K: GameServerObject>(
+    state: AppState,
+    config: OrchestratorConfig,
+    game: GameConfig,
+    client: Client,
+) {
+    let spec = game.spec();
     let pods_api: Api<Pod> = Api::namespaced(client.clone(), &config.k8s_namespace);
-    let servers_api: Option<Api<SheepWarsServer>> = config
+    let servers_api: Option<Api<K>> = game
         .use_crd
         .then(|| Api::namespaced(client, &config.k8s_namespace));
-    let template = load_pod_template(&config);
-    let current_hash = template_hash(&config, template.as_ref());
+    let template = load_pod_template(&game);
+    let current_hash = template_hash(&game, template.as_ref());
 
     let mut map_discovery = config
         .s3
         .as_ref()
+        .filter(|_| spec.s3_maps)
         .and_then(|s3_cfg| match S3Client::new(s3_cfg.clone()) {
             Ok(client) => Some(MapDiscoveryState::new(client)),
             Err(err) => {
@@ -327,43 +362,55 @@ pub async fn run_k8s_reconcile_loop(state: AppState, config: OrchestratorConfig)
         });
 
     tracing::info!(
+        game = spec.display_name,
         namespace = %config.k8s_namespace,
-        min_replicas = config.min_replicas,
-        max_replicas = config.max_replicas,
-        queue_min_players = config.queue_min_players,
+        min_replicas = game.min_replicas,
+        max_replicas = game.max_replicas,
+        queue_min_players = game.queue_min_players,
         s3_enabled = map_discovery.is_some(),
-        fixed_map = ?config.fixed_map,
+        fixed_map = ?game.fixed_map,
         template_hash = %current_hash,
-        "Réconciliateur Kubernetes SheepWars démarré"
+        "Réconciliateur Kubernetes démarré"
     );
 
     let mut ticker = tokio::time::interval(config.reconcile_interval);
     loop {
         ticker.tick().await;
         if let Some(discovery) = map_discovery.as_mut() {
-            discovery.refresh_if_due(config.s3_cache_ttl).await;
+            discovery
+                .refresh_if_due(config.s3_cache_ttl, spec.display_name)
+                .await;
         }
         let ctx = ReconcileCtx {
             state: &state,
             config: &config,
+            game: &game,
             pods_api: &pods_api,
             servers_api: servers_api.as_ref(),
             template: template.as_ref(),
             current_hash: &current_hash,
         };
         if let Err(err) = reconcile_once(&ctx, map_discovery.as_mut()).await {
-            tracing::warn!(%err, "Erreur lors de la réconciliation Kubernetes");
+            tracing::warn!(%err, game = spec.display_name, "Erreur lors de la réconciliation Kubernetes");
         }
     }
 }
 
-struct ReconcileCtx<'a> {
+struct ReconcileCtx<'a, K> {
     state: &'a AppState,
     config: &'a OrchestratorConfig,
+    game: &'a GameConfig,
     pods_api: &'a Api<Pod>,
-    servers_api: Option<&'a Api<SheepWarsServer>>,
+    servers_api: Option<&'a Api<K>>,
     template: Option<&'a PodTemplateSpec>,
     current_hash: &'a str,
+}
+
+impl<K> ReconcileCtx<'_, K> {
+    fn with_engine<R>(&self, f: impl FnOnce(&mut FleetEngine) -> R) -> Option<R> {
+        let mut games = self.state.games.lock().unwrap_or_else(|e| e.into_inner());
+        games.engine_mut(self.game.game).ok().map(f)
+    }
 }
 
 fn attach_owner(pod: &mut Pod, owner: Option<OwnerReference>) {
@@ -375,34 +422,34 @@ fn attach_owner(pod: &mut Pod, owner: Option<OwnerReference>) {
     }
 }
 
-async fn list_servers(api: &Api<SheepWarsServer>) -> HashMap<String, SheepWarsServer> {
+async fn list_servers<K: GameServerObject>(api: &Api<K>) -> HashMap<String, K> {
     match api.list(&ListParams::default()).await {
         Ok(list) => list
             .items
             .into_iter()
-            .filter_map(|server| Some((server.metadata.name.clone()?, server)))
+            .filter_map(|server| Some((server.meta().name.clone()?, server)))
             .collect(),
         Err(err) => {
-            tracing::warn!(%err, "Impossible de lister les SheepWarsServer");
+            tracing::warn!(%err, kind = %K::kind(&()), "Impossible de lister les objets");
             HashMap::new()
         }
     }
 }
 
-async fn delete_server_object(api: &Api<SheepWarsServer>, name: &str) {
+async fn delete_server_object<K: GameServerObject>(api: &Api<K>, name: &str) {
     let dp = DeleteParams {
         propagation_policy: Some(PropagationPolicy::Background),
         ..Default::default()
     };
     if let Err(err) = api.delete(name, &dp).await {
-        tracing::warn!(%name, %err, "Échec suppression SheepWarsServer");
+        tracing::warn!(%name, %err, kind = %K::kind(&()), "Échec suppression de l'objet");
     }
 }
 
-async fn delete_server(
-    ctx: &ReconcileCtx<'_>,
+async fn delete_server<K: GameServerObject>(
+    ctx: &ReconcileCtx<'_, K>,
     server_id: &str,
-    objects: &mut HashMap<String, SheepWarsServer>,
+    objects: &mut HashMap<String, K>,
 ) {
     if let Some(api) = ctx.servers_api
         && objects.remove(server_id).is_some()
@@ -415,7 +462,7 @@ async fn delete_server(
         .delete(server_id, &DeleteParams::default())
         .await
     {
-        tracing::warn!(%server_id, %err, "Échec suppression Pod SheepWars");
+        tracing::warn!(%server_id, %err, game = ctx.game.spec().display_name, "Échec suppression du Pod");
     }
 }
 
@@ -423,20 +470,20 @@ async fn create_bare_pod(pods_api: &Api<Pod>, pod_name: &str, pod: &Pod) -> bool
     match pods_api.create(&PostParams::default(), pod).await {
         Ok(_) => true,
         Err(err) => {
-            tracing::error!(%pod_name, %err, "Échec création Pod SheepWars");
+            tracing::error!(%pod_name, %err, "Échec création du Pod");
             false
         }
     }
 }
 
-async fn create_owned_pod(
-    ctx: &ReconcileCtx<'_>,
-    api: &Api<SheepWarsServer>,
+async fn create_owned_pod<K: GameServerObject>(
+    ctx: &ReconcileCtx<'_, K>,
+    api: &Api<K>,
     pod_name: &str,
     mut pod: Pod,
     map: Option<&str>,
 ) -> bool {
-    let server = new_server(
+    let server: K = new_server(
         pod_name,
         &ctx.config.k8s_namespace,
         pod.metadata.labels.clone().unwrap_or_default(),
@@ -446,7 +493,7 @@ async fn create_owned_pod(
     let created = match api.create(&PostParams::default(), &server).await {
         Ok(created) => created,
         Err(err) => {
-            tracing::warn!(%pod_name, %err, "Échec création SheepWarsServer");
+            tracing::warn!(%pod_name, %err, kind = %K::kind(&()), "Échec création de l'objet");
             return false;
         }
     };
@@ -458,23 +505,23 @@ async fn create_owned_pod(
     false
 }
 
-async fn delete_orphan_objects(
-    ctx: &ReconcileCtx<'_>,
-    api: &Api<SheepWarsServer>,
+async fn delete_orphan_objects<K: GameServerObject>(
+    ctx: &ReconcileCtx<'_, K>,
+    api: &Api<K>,
     pod_names: &HashSet<String>,
-    objects: &mut HashMap<String, SheepWarsServer>,
+    objects: &mut HashMap<String, K>,
 ) {
-    let Ok(timeout) = chrono::Duration::from_std(ctx.config.starting_timeout) else {
+    let Ok(timeout) = chrono::Duration::from_std(ctx.game.starting_timeout) else {
         return;
     };
     let now = chrono::Utc::now();
     let orphans: Vec<String> = objects
         .iter()
         .filter(|(name, server)| {
+            let meta = server.meta();
             !pod_names.contains(*name)
-                && server.metadata.deletion_timestamp.is_none()
-                && server
-                    .metadata
+                && meta.deletion_timestamp.is_none()
+                && meta
                     .creation_timestamp
                     .as_ref()
                     .is_some_and(|created| now - created.0 > timeout)
@@ -482,27 +529,26 @@ async fn delete_orphan_objects(
         .map(|(name, _)| name.clone())
         .collect();
     for name in orphans {
-        tracing::info!(%name, "Suppression d'un SheepWarsServer sans Pod");
+        tracing::info!(%name, kind = %K::kind(&()), "Suppression d'un objet sans Pod");
         delete_server_object(api, &name).await;
         objects.remove(&name);
     }
 }
 
-async fn sync_statuses(
-    ctx: &ReconcileCtx<'_>,
-    api: &Api<SheepWarsServer>,
-    objects: &HashMap<String, SheepWarsServer>,
+async fn sync_statuses<K: GameServerObject>(
+    ctx: &ReconcileCtx<'_, K>,
+    api: &Api<K>,
+    objects: &HashMap<String, K>,
 ) {
-    let summaries = {
-        let engine = ctx.state.engine.lock().unwrap_or_else(|e| e.into_inner());
-        engine.snapshot(Instant::now()).servers
+    let Some(summaries) = ctx.with_engine(|engine| engine.snapshot(Instant::now()).servers) else {
+        return;
     };
     let now = chrono::Utc::now().to_rfc3339();
     for summary in &summaries {
         let Some(object) = objects.get(&summary.server_id) else {
             continue;
         };
-        let current: Option<&SheepWarsServerStatus> = object.status.as_ref();
+        let current: Option<&GameServerStatus> = object.current_status();
         let desired = desired_status(summary, current, &now);
         if !needs_patch(&desired, current) {
             continue;
@@ -512,25 +558,27 @@ async fn sync_statuses(
             .patch_status(&summary.server_id, &PatchParams::default(), &patch)
             .await
         {
-            tracing::warn!(server_id = %summary.server_id, %err, "Échec mise à jour du statut SheepWarsServer");
+            tracing::warn!(server_id = %summary.server_id, %err, kind = %K::kind(&()), "Échec mise à jour du statut");
         }
     }
 }
 
-async fn reconcile_once(
-    ctx: &ReconcileCtx<'_>,
+async fn reconcile_once<K: GameServerObject>(
+    ctx: &ReconcileCtx<'_, K>,
     mut map_discovery: Option<&mut MapDiscoveryState>,
 ) -> Result<(), kube::Error> {
     let ReconcileCtx {
         state,
         config,
+        game,
         pods_api,
         servers_api,
         template,
         ..
     } = *ctx;
+    let spec = game.spec();
     let current_hash = ctx.current_hash;
-    let lp = ListParams::default().labels(SHEEPWARS_SELECTOR);
+    let lp = ListParams::default().labels(&spec.pod_selector());
     let list = pods_api.list(&lp).await?;
     let pod_names: HashSet<String> = if servers_api.is_some() {
         list.items
@@ -571,40 +619,43 @@ async fn reconcile_once(
             .status
             .as_ref()
             .and_then(|s| s.pod_ip.as_ref())
-            .map(|ip| format!("{ip}:{}", config.sheepwars_port));
+            .map(|ip| format!("{ip}:{}", game.port));
         let ready = is_pod_ready_condition(&pod);
         let terminating = is_pod_terminating_or_done(&pod);
 
-        let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
-        events.extend(engine.upsert_infra_server(
-            now,
-            server_id.clone(),
-            Some(pod_name),
-            address,
-            ready,
-            terminating,
-        ));
-        if outdated {
-            engine.mark_outdated(&server_id);
-        }
+        ctx.with_engine(|engine| {
+            events.extend(engine.upsert_infra_server(
+                now,
+                server_id.clone(),
+                Some(pod_name),
+                address,
+                ready,
+                terminating,
+            ));
+            if outdated {
+                engine.mark_outdated(&server_id);
+            }
+        });
     }
 
-    let (actions, retries) = {
-        let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
+    let planned = ctx.with_engine(|engine| {
         events.extend(engine.retain_infra_servers(&live_ids));
         let actions = engine.tick(now);
         events.extend(actions.proxy_events.clone());
         let retries = engine.deletions_to_retry(now, DELETE_RETRY_AFTER);
         (actions, retries)
-    };
+    });
     state.emit_proxy_events(events);
     state.flush_queue_logged().await;
+    let Some((actions, retries)) = planned else {
+        return Ok(());
+    };
 
     for ServerDeletion { server_id, reason } in actions.servers_to_delete {
         if reason.is_abnormal() {
-            tracing::warn!(%server_id, ?reason, "Suppression du Pod SheepWars");
+            tracing::warn!(%server_id, ?reason, game = spec.display_name, "Suppression du Pod");
         } else {
-            tracing::info!(%server_id, ?reason, "Suppression du Pod SheepWars");
+            tracing::info!(%server_id, ?reason, game = spec.display_name, "Suppression du Pod");
         }
         delete_server(ctx, &server_id, &mut objects).await;
     }
@@ -613,19 +664,20 @@ async fn reconcile_once(
         if terminating_ids.contains(&server_id) {
             continue;
         }
-        tracing::warn!(%server_id, "Pod SheepWars toujours présent, nouvelle suppression");
+        tracing::warn!(%server_id, game = spec.display_name, "Pod toujours présent, nouvelle suppression");
         delete_server(ctx, &server_id, &mut objects).await;
     }
 
     for _ in 0..actions.servers_to_create {
-        let selected_map: Option<String> = if let Some(fixed) = &config.fixed_map {
+        let selected_map: Option<String> = if let Some(fixed) = &game.fixed_map {
             Some(fixed.clone())
         } else if let Some(discovery) = map_discovery.as_deref_mut() {
             match discovery.catalog.next_map() {
                 Some(map) => Some(map.to_owned()),
                 None => {
                     tracing::warn!(
-                        "Création de Pod SheepWars différée : aucune map disponible dans S3"
+                        game = spec.display_name,
+                        "Création de Pod différée : aucune map disponible dans S3"
                     );
                     break;
                 }
@@ -635,16 +687,17 @@ async fn reconcile_once(
         };
 
         let short = Uuid::new_v4().simple().to_string();
-        let pod_name = format!("sheepwars-{}", &short[..6]);
-        let pod = build_sheepwars_pod(&pod_name, config, template, selected_map.as_deref());
-        tracing::info!(%pod_name, map = ?selected_map, "Création d'un nouveau Pod SheepWars");
+        let pod_name = format!("{}-{}", spec.pod_prefix, &short[..6]);
+        let pod = build_pod(&pod_name, config, game, template, selected_map.as_deref());
+        tracing::info!(%pod_name, map = ?selected_map, game = spec.display_name, "Création d'un nouveau Pod");
         let created = match servers_api {
             Some(api) => create_owned_pod(ctx, api, &pod_name, pod, selected_map.as_deref()).await,
             None => create_bare_pod(pods_api, &pod_name, &pod).await,
         };
         if created {
-            let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
-            engine.register_creating_server(Instant::now(), pod_name.clone(), Some(pod_name));
+            ctx.with_engine(|engine| {
+                engine.register_creating_server(Instant::now(), pod_name.clone(), Some(pod_name));
+            });
         } else {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
@@ -661,40 +714,46 @@ async fn reconcile_once(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::BackendMode;
 
     fn test_config() -> OrchestratorConfig {
-        OrchestratorConfig {
-            bind_addr: "127.0.0.1:8080".parse().unwrap(),
-            backend: BackendMode::Kubernetes,
-            api_token: None,
-            lobby_server_name: "lobby".to_owned(),
-            queue_min_players: 1,
-            max_players_per_server: 16,
-            min_replicas: 1,
-            max_replicas: 5,
-            standby_servers: 1,
-            idle_ttl: Duration::from_secs(60),
-            starting_timeout: Duration::from_secs(120),
-            transfer_timeout: Duration::from_secs(15),
-            empty_grace: Duration::from_secs(30),
-            ending_timeout: Duration::from_secs(60),
-            heartbeat_timeout: Duration::from_secs(30),
-            reconcile_interval: Duration::from_secs(1),
-            k8s_namespace: "ferriscraft".to_owned(),
-            pod_template_path: None,
-            sheepwars_image: "ghcr.io/ferrislabs/ferriscraft-rspigot:dev".to_owned(),
-            sheepwars_port: 25565,
-            forwarding_secret_name: "ferriscraft-forwarding".to_owned(),
-            orchestrator_public_url: "http://ferriscraft-orchestrator:8080".to_owned(),
-            static_servers: Vec::new(),
-            s3: None,
-            s3_cache_ttl: Duration::from_secs(30),
-            fixed_map: None,
-            version: None,
-            use_crd: false,
-            progression_database_url: None,
-        }
+        let vars: HashMap<&str, &str> = HashMap::from([
+            ("ORCHESTRATOR_BACKEND", "kubernetes"),
+            ("K8S_NAMESPACE", "ferriscraft"),
+            (
+                "SHEEPWARS_IMAGE",
+                "ghcr.io/ferrislabs/ferriscraft-rspigot:dev",
+            ),
+            ("SHEEPWARS_MAX_PLAYERS", "16"),
+            ("TOWERWARS_ENABLED", "true"),
+            (
+                "TOWERWARS_IMAGE",
+                "ghcr.io/ferrislabs/ferriscraft-towerwars:dev",
+            ),
+            ("TOWERWARS_PORT", "25566"),
+            ("TOWERWARS_MAX_PLAYERS", "12"),
+        ]);
+        OrchestratorConfig::from_lookup(|name| vars.get(name).map(|v| (*v).to_owned()), None)
+            .unwrap()
+    }
+
+    fn sheepwars_pod(name: &str, template: Option<&PodTemplateSpec>, map: Option<&str>) -> Pod {
+        let config = test_config();
+        build_pod(name, &config, &config.sheepwars, template, map)
+    }
+
+    fn towerwars_pod(name: &str, template: Option<&PodTemplateSpec>, map: Option<&str>) -> Pod {
+        let config = test_config();
+        let tower = config.towerwars.as_ref().unwrap();
+        build_pod(name, &config, tower, template, map)
+    }
+
+    fn env_of<'a>(container: &'a Container, name: &str) -> Option<&'a str> {
+        container
+            .env
+            .as_ref()?
+            .iter()
+            .find(|e| e.name == name)
+            .and_then(|e| e.value.as_deref())
     }
 
     #[test]
@@ -720,12 +779,7 @@ mod tests {
             }),
         };
 
-        let pod = build_sheepwars_pod(
-            "sheepwars-abc123",
-            &test_config(),
-            Some(&template),
-            Some("steampunk"),
-        );
+        let pod = sheepwars_pod("sheepwars-abc123", Some(&template), Some("steampunk"));
 
         let labels = pod.metadata.labels.as_ref().unwrap();
         assert_eq!(labels.get("ferriscraft.io/map").unwrap(), "steampunk");
@@ -744,16 +798,16 @@ mod tests {
         for container in &spec.containers {
             let envs = container.env.as_ref().unwrap();
             assert!(
-                envs.iter().any(
-                    |e| e.name == "SHEEPWARS_MAP_NAME" && e.value.as_deref() == Some("steampunk")
-                )
+                envs.iter()
+                    .any(|e| e.name == "SHEEPWARS_MAP_NAME"
+                        && e.value.as_deref() == Some("steampunk"))
             );
         }
     }
 
     #[test]
     fn crd_mode_pod_carries_the_owner_reference() {
-        let mut server = new_server(
+        let mut server = new_server::<SheepWarsServer>(
             "sheepwars-abc123",
             "ferriscraft",
             BTreeMap::new(),
@@ -761,7 +815,7 @@ mod tests {
             None,
         );
         server.metadata.uid = Some("uid-1".to_owned());
-        let mut pod = build_sheepwars_pod("sheepwars-abc123", &test_config(), None, None);
+        let mut pod = sheepwars_pod("sheepwars-abc123", None, None);
         attach_owner(&mut pod, owner_reference(&server));
         let owners = pod.metadata.owner_references.unwrap();
         assert_eq!(owners.len(), 1);
@@ -773,7 +827,7 @@ mod tests {
 
     #[test]
     fn attach_owner_without_reference_leaves_pod_untouched() {
-        let mut pod = build_sheepwars_pod("sheepwars-abc123", &test_config(), None, None);
+        let mut pod = sheepwars_pod("sheepwars-abc123", None, None);
         attach_owner(&mut pod, None);
         assert!(pod.metadata.owner_references.is_none());
     }
@@ -796,25 +850,128 @@ mod tests {
     fn pod_is_labelled_with_the_template_hash() {
         let config = test_config();
         let template = plugin_template("plugin:v1");
-        let pod = build_sheepwars_pod("sheepwars-abc123", &config, Some(&template), None);
+        let pod = sheepwars_pod("sheepwars-abc123", Some(&template), None);
         let labels = pod.metadata.labels.unwrap();
         assert_eq!(
             labels.get(TEMPLATE_HASH_LABEL),
-            Some(&template_hash(&config, Some(&template)))
+            Some(&template_hash(&config.sheepwars, Some(&template)))
         );
     }
 
     #[test]
     fn template_hash_changes_with_the_image_and_is_stable() {
         let config = test_config();
-        let v1 = template_hash(&config, Some(&plugin_template("plugin:v1")));
-        let v2 = template_hash(&config, Some(&plugin_template("plugin:v2")));
+        let game = &config.sheepwars;
+        let v1 = template_hash(game, Some(&plugin_template("plugin:v1")));
+        let v2 = template_hash(game, Some(&plugin_template("plugin:v2")));
         assert_eq!(v1.len(), TEMPLATE_HASH_LEN);
         assert_ne!(v1, v2);
+        assert_eq!(v1, template_hash(game, Some(&plugin_template("plugin:v1"))));
+        assert_ne!(template_hash(game, None), v1);
+    }
+
+    #[test]
+    fn spec_tw_26_towerwars_pod_has_its_own_labels_and_name() {
+        let pod = towerwars_pod("towerwars-abc123", None, None);
+        assert_eq!(pod.metadata.name.as_deref(), Some("towerwars-abc123"));
+        let labels = pod.metadata.labels.as_ref().unwrap();
         assert_eq!(
-            v1,
-            template_hash(&config, Some(&plugin_template("plugin:v1")))
+            labels
+                .get("app.kubernetes.io/component")
+                .map(String::as_str),
+            Some("towerwars")
         );
-        assert_ne!(template_hash(&config, None), v1);
+        assert_eq!(
+            labels.get("ferriscraft.io/server-id").map(String::as_str),
+            Some("towerwars-abc123")
+        );
+        assert_eq!(
+            labels
+                .get("app.kubernetes.io/managed-by")
+                .map(String::as_str),
+            Some("ferriscraft-orchestrator")
+        );
+        let sheep = sheepwars_pod("sheepwars-abc123", None, None);
+        assert_eq!(
+            sheep
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get("app.kubernetes.io/component"))
+                .map(String::as_str),
+            Some("sheepwars")
+        );
+    }
+
+    #[test]
+    fn spec_tw_26_towerwars_pod_uses_its_image_port_and_env() {
+        let pod = towerwars_pod("towerwars-abc123", None, Some("test"));
+        let spec = pod.spec.as_ref().unwrap();
+        let container = &spec.containers[0];
+        assert_eq!(
+            container.image.as_deref(),
+            Some("ghcr.io/ferrislabs/ferriscraft-towerwars:dev")
+        );
+        assert_eq!(container.ports.as_ref().unwrap()[0].container_port, 25566);
+        assert_eq!(env_of(container, "SERVER_PORT"), Some("25566"));
+        assert_eq!(env_of(container, "SERVER_ID"), Some("towerwars-abc123"));
+        assert_eq!(env_of(container, "TOWERWARS_MAX_PLAYERS"), Some("12"));
+        assert_eq!(env_of(container, "TOWERWARS_MAP_NAME"), Some("test"));
+        assert_eq!(env_of(container, "SHEEPWARS_MAX_PLAYERS"), None);
+        assert_eq!(env_of(container, "SHEEPWARS_MAP_NAME"), None);
+    }
+
+    #[test]
+    fn towerwars_pod_without_a_map_sets_no_map_env() {
+        let pod = towerwars_pod("towerwars-abc123", None, None);
+        let container = &pod.spec.as_ref().unwrap().containers[0];
+        assert_eq!(env_of(container, "TOWERWARS_MAP_NAME"), None);
+        assert!(
+            !pod.metadata
+                .labels
+                .as_ref()
+                .unwrap()
+                .contains_key("ferriscraft.io/map")
+        );
+    }
+
+    #[test]
+    fn spec_tw_26_towerwars_pod_is_owned_by_a_towerwarsserver() {
+        let mut server = new_server::<TowerWarsServer>(
+            "towerwars-abc123",
+            "ferriscraft",
+            BTreeMap::new(),
+            "h",
+            None,
+        );
+        server.metadata.uid = Some("uid-2".to_owned());
+        let mut pod = towerwars_pod("towerwars-abc123", None, None);
+        attach_owner(&mut pod, owner_reference(&server));
+        let owners = pod.metadata.owner_references.unwrap();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].kind, "TowerWarsServer");
+        assert_eq!(owners[0].api_version, "ferriscraft.io/v1alpha1");
+        assert_eq!(owners[0].name, "towerwars-abc123");
+        assert_eq!(owners[0].uid, "uid-2");
+        assert_eq!(owners[0].controller, Some(true));
+    }
+
+    #[test]
+    fn towerwars_template_hash_differs_from_sheepwars_default() {
+        let config = test_config();
+        let tower = config.towerwars.as_ref().unwrap();
+        assert_ne!(
+            template_hash(tower, None),
+            template_hash(&config.sheepwars, None)
+        );
+    }
+
+    #[test]
+    fn each_game_lists_only_its_own_pods() {
+        let config = test_config();
+        let selectors: Vec<String> = config.games().map(|g| g.spec().pod_selector()).collect();
+        assert_eq!(selectors.len(), 2);
+        assert!(selectors[0].contains("component=sheepwars"));
+        assert!(selectors[1].contains("component=towerwars"));
     }
 }

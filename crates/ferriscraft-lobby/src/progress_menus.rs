@@ -156,6 +156,7 @@ pub fn progress_bar(into: u64, needed: u64) -> String {
 pub const fn game_label(game: GameKind) -> &'static str {
     match game {
         GameKind::SheepWars => "SheepWars",
+        GameKind::TowerWars => "TowerWars",
     }
 }
 
@@ -274,7 +275,7 @@ pub fn populate_profile_menu(inv: &CustomInventory, profile: Option<&PlayerProfi
             Some(
                 ItemStack::new(Material::WhiteWool, 1)
                     .name("§7Aucune partie comptée")
-                    .lore(["§7Jouez à SheepWars pour gagner de l'XP !"]),
+                    .lore(["§7Jouez à SheepWars ou TowerWars pour gagner de l'XP !"]),
             ),
         );
     }

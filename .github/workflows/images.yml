@@ -18,6 +18,7 @@ on:
       - deploy/docker/**
       - server/**
       - server-sheepwars/**
+      - server-towerwars/**
       - lobby.json
   workflow_dispatch:
 

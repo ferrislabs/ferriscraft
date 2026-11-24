@@ -27,15 +27,16 @@ target_image_name() {
     rspigot) echo "ferriscraft-rspigot" ;;
     lobby) echo "ferriscraft-lobby" ;;
     sheepwars) echo "ferriscraft-sheepwars-plugin" ;;
+    towerwars) echo "ferriscraft-towerwars-plugin" ;;
     *)
-      echo "Cible inconnue : $1 (attendu : orchestrator | velocity | rspigot | lobby | sheepwars)" >&2
+      echo "Cible inconnue : $1 (attendu : orchestrator | velocity | rspigot | lobby | sheepwars | towerwars)" >&2
       exit 1
       ;;
   esac
 }
 
 if [[ "${TARGETS[0]}" == "default" ]]; then
-  IMAGE_NAMES=("ferriscraft-orchestrator" "ferriscraft-velocity" "ferriscraft-rspigot" "ferriscraft-lobby" "ferriscraft-sheepwars-plugin")
+  IMAGE_NAMES=("ferriscraft-orchestrator" "ferriscraft-velocity" "ferriscraft-rspigot" "ferriscraft-lobby" "ferriscraft-sheepwars-plugin" "ferriscraft-towerwars-plugin")
 else
   IMAGE_NAMES=()
   for t in "${TARGETS[@]}"; do

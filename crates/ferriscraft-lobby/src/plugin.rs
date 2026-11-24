@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 use ferriscraft_progression::Catalog;
 use ferriscraft_protocol::{
-    AdminCoinGrant, CosmeticId, CosmeticSlot, PlayerIdentityUpdate, PlayerProfile, QueueJoinStatus,
+    AdminCoinGrant, CosmeticId, CosmeticSlot, GameKind, PlayerIdentityUpdate, PlayerProfile,
+    QueueJoinStatus,
 };
 use rspigot_plugin::prelude::*;
 use rspigot_plugin::{
@@ -26,10 +27,12 @@ use crate::heartbeat::HeartbeatReporter;
 use crate::hud::{HubMetrics, HudManager, PlayerHudInput};
 use crate::menus::{
     GadgetsMenuAction, GamesMenuAction, MenuManager, OptionsMenuAction, apply_lobby_hotbar,
-    decode_gadgets_click, decode_games_click, decode_options_click,
+    decode_gadgets_click, decode_games_click, decode_options_click, decode_towerwars_size_click,
 };
-use crate::npcs::{CaptainTurn, NpcClickTarget, NpcDirector};
-use crate::orchestrator::{OrchestratorClient, OrchestratorClientError, ToggleQueueOutcome};
+use crate::npcs::{CaptainTurn, NpcClickTarget, NpcDirector, pedestal_game};
+use crate::orchestrator::{
+    OrchestratorClient, OrchestratorClientError, QueueCounts, ToggleQueueOutcome, game_fleet,
+};
 use crate::prefs::PrefsStore;
 use crate::profile::{
     ProfileCache, ShopItemState, can_grant_coins, equipped_gadget, equipped_trail, error_message,
@@ -38,7 +41,7 @@ use crate::profile::{
 };
 use crate::progress_menus::{
     ProfileMenuAction, ProgressMenuKind, ShopMenuAction, cosmetic_title, decode_profile_click,
-    decode_shop_click,
+    decode_shop_click, game_label,
 };
 use crate::servers_menu::decode_servers_slot;
 
@@ -133,15 +136,17 @@ impl FerrisCraftLobby {
         }
     }
 
-    fn queued_count(&self) -> usize {
+    fn queued_counts(&self) -> QueueCounts {
         if let Some(client) = &self.state.orchestrator {
-            return client.cached_queue_len();
+            return client.cached_queue_counts();
         }
-        self.state
+        let sheepwars = self
+            .state
             .sheepwars_queue
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .len()
+            .len();
+        QueueCounts::default().with(GameKind::SheepWars, sheepwars)
     }
 
     async fn collect_metrics(&self, server: &Server) -> HubMetrics {
@@ -154,7 +159,8 @@ impl FerrisCraftLobby {
             online,
             max_players,
             tps_1m,
-            sheepwars_queued: self.queued_count(),
+            sheepwars_queued: self.queued_counts().sheepwars,
+            towerwars_queued: self.queued_counts().towerwars,
             agents_working,
             agents_total,
         }
@@ -647,27 +653,58 @@ impl FerrisCraftLobby {
     }
 
     fn join_sheepwars(&self, player: Player) {
+        self.join_game(player, GameKind::SheepWars, 0);
+    }
+
+    fn join_towerwars(&self, player: Player) {
+        let lobby = self.clone();
+        tokio::spawn(async move {
+            let queued = match &lobby.state.orchestrator {
+                Some(orch) => orch
+                    .is_queued(player.uuid, GameKind::TowerWars)
+                    .await
+                    .unwrap_or(true),
+                None => true,
+            };
+            if queued {
+                lobby.join_game(player, GameKind::TowerWars, 0);
+                return;
+            }
+            let _ = lobby
+                .state
+                .menus
+                .open_towerwars_size(&player.server(), &player)
+                .await;
+        });
+    }
+
+    fn join_game(&self, player: Player, game: GameKind, match_size: u8) {
         let lobby = self.clone();
         tokio::spawn(async move {
             player.inventory.close();
+            let tag = game_tag(game);
+            let name = game_name(game);
             if let Some(orch) = lobby.state.orchestrator.clone() {
-                match orch.toggle_queue(player.uuid, &player.name).await {
+                match orch
+                    .toggle_queue(player.uuid, &player.name, game, match_size)
+                    .await
+                {
                     Ok(ToggleQueueOutcome::Joined(resp)) => {
-                        let count = match orch.fetch_status().await {
-                            Ok(snap) => snap.queue_len,
-                            Err(_) => resp.total_queued,
+                        let counts = match orch.fetch_status().await {
+                            Ok(snap) => QueueCounts::from_snapshot(&snap),
+                            Err(_) => orch.cached_queue_counts().with(game, resp.total_queued),
                         };
-                        lobby.state.menus.refresh_games_menu(count);
-                        lobby.state.npcs.update_sheepwars_pedestal_label(count);
+                        lobby.state.menus.refresh_games_menu(counts);
+                        lobby.state.npcs.update_pedestal_labels(counts);
                         if resp.status == QueueJoinStatus::Transferring {
                             player.sound.play(
                                 SoundCue::new(Sound::EntityEndermanTeleport)
                                     .volume(0.85)
                                     .pitch(1.15),
                             );
-                            let target = resp.target_server.as_deref().unwrap_or("sheepwars");
+                            let target = resp.target_server.as_deref().unwrap_or(game.slug());
                             player.message.send(format!(
-                                "§d§lSheepWars §8» §aPartie trouvée ! Transfert vers §f{target}§a…"
+                                "{tag} §8» §aPartie trouvée ! Transfert vers §f{target}§a…"
                             ));
                         } else {
                             player.sound.play(
@@ -675,19 +712,20 @@ impl FerrisCraftLobby {
                                     .volume(0.8)
                                     .pitch(1.3),
                             );
+                            let size = queue_size_hint(game, resp.min_players, resp.total_queued);
                             player.action_bar.send(format!(
-                                "§d§lSheepWars §8• §aFile #{}/{}{} §7(§b{}/{} srv§7)",
+                                "{tag} §8• §aFile #{}/{}{}{size} §7(§b{}/{} srv§7)",
                                 resp.position,
                                 resp.total_queued.max(1),
-                                queue_min_hint(resp.min_players),
+                                queue_min_hint(game, resp.min_players),
                                 resp.ready_servers,
                                 resp.max_servers
                             ));
                             player.message.send(format!(
-                                "§d§lSheepWars §8» §aFile d'attente rejointe (§f#{}§a/§f{}§a{} — §b{}§a prêt(s) / §f{} max§a). Recliquez pour quitter.",
+                                "{tag} §8» §aFile d'attente rejointe{size} (§f#{}§a/§f{}§a{} — §b{}§a prêt(s) / §f{} max§a). Recliquez pour quitter.",
                                 resp.position,
                                 resp.total_queued,
-                                queue_min_hint(resp.min_players),
+                                queue_min_hint(game, resp.min_players),
                                 resp.ready_servers,
                                 resp.max_servers
                             ));
@@ -695,24 +733,31 @@ impl FerrisCraftLobby {
                         lobby.refresh_single_player_ui(&player).await;
                     }
                     Ok(ToggleQueueOutcome::Left(resp)) => {
-                        let count = match orch.fetch_status().await {
-                            Ok(snap) => snap.queue_len,
-                            Err(_) => resp.total_queued,
+                        let counts = match orch.fetch_status().await {
+                            Ok(snap) => QueueCounts::from_snapshot(&snap),
+                            Err(_) => orch.cached_queue_counts().with(game, resp.total_queued),
                         };
-                        lobby.state.menus.refresh_games_menu(count);
-                        lobby.state.npcs.update_sheepwars_pedestal_label(count);
+                        lobby.state.menus.refresh_games_menu(counts);
+                        lobby.state.npcs.update_pedestal_labels(counts);
                         player
                             .message
-                            .send("§d§lSheepWars §8» §7Vous avez quitté la file d'attente.");
+                            .send(format!("{tag} §8» §7Vous avez quitté la file d'attente."));
                         lobby.refresh_single_player_ui(&player).await;
                     }
                     Err(err) => {
-                        tracing::warn!("Orchestrateur SheepWars injoignable : {err}");
+                        tracing::warn!("Orchestrateur {name} injoignable : {err}");
                         player.message.send(format!(
-                            "§cService de file d'attente SheepWars indisponible ({err})."
+                            "§cService de file d'attente {name} indisponible ({err})."
                         ));
                     }
                 }
+                return;
+            }
+
+            if game != GameKind::SheepWars {
+                player.message.send(format!(
+                    "§cService de file d'attente {name} indisponible (orchestrateur non configuré)."
+                ));
                 return;
             }
 
@@ -781,8 +826,9 @@ impl FerrisCraftLobby {
                 (joined, q.len())
             };
 
-            lobby.state.menus.refresh_games_menu(count);
-            lobby.state.npcs.update_sheepwars_pedestal_label(count);
+            let counts = QueueCounts::default().with(GameKind::SheepWars, count);
+            lobby.state.menus.refresh_games_menu(counts);
+            lobby.state.npcs.update_pedestal_labels(counts);
 
             if joined {
                 player.sound.play(
@@ -1058,6 +1104,7 @@ impl FerrisCraftLobby {
                     .play(SoundCue::new(Sound::UiButtonClick).volume(0.7));
                 match action {
                     GamesMenuAction::JoinSheepWars => self.join_sheepwars(player),
+                    GamesMenuAction::JoinTowerWars => self.join_towerwars(player),
                     GamesMenuAction::ComingSoon(game) => {
                         player.inventory.close();
                         player.message.send(format!(
@@ -1145,6 +1192,20 @@ impl FerrisCraftLobby {
                         });
                     }
                 }
+            }
+            return;
+        }
+
+        if self
+            .state
+            .menus
+            .is_player_towerwars_size_inventory(player.uuid, clicked_inv)
+        {
+            if let Some(size) = decode_towerwars_size_click(slot) {
+                player
+                    .sound
+                    .play(SoundCue::new(Sound::UiButtonClick).volume(0.7));
+                self.join_game(player, GameKind::TowerWars, size);
             }
             return;
         }
@@ -1622,8 +1683,40 @@ impl FerrisCraftLobby {
     }
 }
 
-fn queue_min_hint(min_players: usize) -> String {
-    if min_players > 1 {
+const fn game_tag(game: GameKind) -> &'static str {
+    match game {
+        GameKind::SheepWars => "§d§lSheepWars",
+        GameKind::TowerWars => "§b§lTowerWars",
+    }
+}
+
+const fn game_name(game: GameKind) -> &'static str {
+    game_label(game)
+}
+
+fn queue_size_hint(game: GameKind, min_players: usize, total_queued: usize) -> String {
+    if game != GameKind::TowerWars {
+        return String::new();
+    }
+    match min_players {
+        1 => " §b(Solo)§a".to_owned(),
+        2..=4 => {
+            let name = match min_players {
+                2 => "Duo",
+                3 => "Trio",
+                _ => "Quatuor",
+            };
+            format!(
+                " §b({name} — {}/{min_players})§a",
+                total_queued.min(min_players)
+            )
+        }
+        _ => String::new(),
+    }
+}
+
+fn queue_min_hint(game: GameKind, min_players: usize) -> String {
+    if game != GameKind::TowerWars && min_players > 1 {
         format!(" §7(min §f{min_players}§7)")
     } else {
         String::new()
@@ -1659,7 +1752,10 @@ impl FerrisCraftLobby {
             tracing::warn!("Impossible de créer le menu des jeux : {err}");
         }
 
-        self.state.npcs.spawn_all(server, 0).await;
+        self.state
+            .npcs
+            .spawn_all(server, QueueCounts::default())
+            .await;
 
         let npcs = Arc::clone(&self.state.npcs);
         let auth = Arc::clone(&self.state.auth);
@@ -1681,29 +1777,31 @@ impl FerrisCraftLobby {
                 if let Some(orch) = &lobby_hud.state.orchestrator
                     && let Ok(snap) = orch.fetch_status().await
                 {
-                    lobby_hud.state.menus.refresh_games_menu(snap.queue_len);
-                    lobby_hud
-                        .state
-                        .npcs
-                        .update_sheepwars_pedestal_label(snap.queue_len);
-                    if !snap.queued_players.is_empty()
-                        && let Ok(online) = srv_hud.get_players().await
-                    {
-                        for qp in &snap.queued_players {
-                            if let Some(p) = online.iter().find(|p| p.uuid == qp.player_uuid) {
-                                let state_hint = if snap.ready_servers > 0 {
-                                    format!("§b{} serveur(s) prêt(s)", snap.ready_servers)
-                                } else if snap.starting_servers > 0 {
-                                    "§eDémarrage serveur…".to_owned()
-                                } else {
-                                    format!("§7{}/{} max", snap.in_game_servers, snap.max_replicas)
-                                };
-                                p.action_bar.send(format!(
-                                    "§d§lSheepWars §8• §aFile #{}/{}{} §8• {state_hint}",
-                                    qp.position,
-                                    snap.queue_len,
-                                    queue_min_hint(snap.min_players)
-                                ));
+                    let counts = QueueCounts::from_snapshot(&snap);
+                    lobby_hud.state.menus.refresh_games_menu(counts);
+                    lobby_hud.state.npcs.update_pedestal_labels(counts);
+                    if let Ok(online) = srv_hud.get_players().await {
+                        for game in GameKind::ALL {
+                            let Some(fleet) = game_fleet(&snap, game) else {
+                                continue;
+                            };
+                            let state_hint = if fleet.ready_servers > 0 {
+                                format!("§b{} serveur(s) prêt(s)", fleet.ready_servers)
+                            } else if fleet.starting_servers > 0 {
+                                "§eDémarrage serveur…".to_owned()
+                            } else {
+                                format!("§7{}/{} max", fleet.in_game_servers, fleet.max_replicas)
+                            };
+                            for qp in &fleet.queued_players {
+                                if let Some(p) = online.iter().find(|p| p.uuid == qp.player_uuid) {
+                                    p.action_bar.send(format!(
+                                        "{} §8• §aFile #{}/{}{} §8• {state_hint}",
+                                        game_tag(game),
+                                        qp.position,
+                                        fleet.queue_len,
+                                        queue_min_hint(game, fleet.min_players)
+                                    ));
+                                }
                             }
                         }
                     }
@@ -1864,8 +1962,9 @@ impl FerrisCraftLobby {
             }
         };
         if let Some(count) = new_len {
-            self.state.menus.refresh_games_menu(count);
-            self.state.npcs.update_sheepwars_pedestal_label(count);
+            let counts = QueueCounts::default().with(GameKind::SheepWars, count);
+            self.state.menus.refresh_games_menu(counts);
+            self.state.npcs.update_pedestal_labels(counts);
         }
     }
 
@@ -1898,6 +1997,9 @@ impl FerrisCraftLobby {
             }
             Material::WhiteWool if !prefs.build_mode => {
                 self.join_sheepwars(player);
+            }
+            Material::Crossbow if !prefs.build_mode => {
+                self.join_towerwars(player);
             }
             Material::AmethystShard if !prefs.build_mode => {
                 self.start_ferriskey_login(player);
@@ -1990,8 +2092,12 @@ impl FerrisCraftLobby {
 
         match target {
             NpcClickTarget::Pedestal(spec) => {
-                if spec.active && spec.game_id == "sheepwars" {
-                    self.join_sheepwars(player);
+                if let Some(game) = pedestal_game(&spec) {
+                    if game == GameKind::TowerWars {
+                        self.join_towerwars(player);
+                    } else {
+                        self.join_game(player, game, 0);
+                    }
                 } else {
                     player.sound.play(
                         SoundCue::new(Sound::BlockNoteBlockBell)
@@ -2577,6 +2683,11 @@ impl FerrisCraftLobby {
         self.teleport_to_poi(ctx.sender.clone(), "spawn");
     }
 
+    #[command("towerwars")]
+    async fn cmd_towerwars(&self, ctx: Context) {
+        self.join_towerwars(ctx.sender.clone());
+    }
+
     #[command("sheepwars")]
     async fn cmd_sheepwars(&self, ctx: Context) {
         self.join_sheepwars(ctx.sender.clone());
@@ -2747,7 +2858,7 @@ impl FerrisCraftLobby {
                 Ok(_) => {
                     self.state
                         .npcs
-                        .spawn_all(&player.server(), self.queued_count())
+                        .spawn_all(&player.server(), self.queued_counts())
                         .await;
                     ctx.reply("§a✔ Configuration lobby.json rechargée et PNJ synchronisés.");
                 }
@@ -2809,7 +2920,7 @@ impl FerrisCraftLobby {
                     Ok(_) => {
                         self.state
                             .npcs
-                            .spawn_all(&player.server(), self.queued_count())
+                            .spawn_all(&player.server(), self.queued_counts())
                             .await;
                         ctx.reply(format!("§a✔ Plot #{idx} repositionné et PNJ mis à jour."));
                     }
@@ -2829,7 +2940,7 @@ impl FerrisCraftLobby {
                     Ok(_) => {
                         self.state
                             .npcs
-                            .spawn_all(&player.server(), self.queued_count())
+                            .spawn_all(&player.server(), self.queued_counts())
                             .await;
                         ctx.reply("§a✔ Position du Capitaine enregistrée.");
                     }
@@ -2898,7 +3009,7 @@ impl FerrisCraftLobby {
                     Ok(_) => {
                         self.state
                             .npcs
-                            .spawn_all(&player.server(), self.queued_count())
+                            .spawn_all(&player.server(), self.queued_counts())
                             .await;
                         ctx.reply(format!(
                             "§a✔ Waypoint #{wp_idx} du PNJ '{npc_id}' enregistré."
@@ -2939,5 +3050,28 @@ fn portal_launch_velocity(entry_step: Option<Vector>, yaw: f32) -> Vector {
         x: dir_x * speed,
         y: PORTAL_LAUNCH_LIFT,
         z: dir_z * speed,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn towerwars_queue_hint_names_the_chosen_size() {
+        let hint = |min, queued| queue_size_hint(GameKind::TowerWars, min, queued);
+        assert_eq!(hint(1, 1), " §b(Solo)§a");
+        assert_eq!(hint(2, 1), " §b(Duo — 1/2)§a");
+        assert_eq!(hint(3, 5), " §b(Trio — 3/3)§a");
+        assert_eq!(hint(4, 2), " §b(Quatuor — 2/4)§a");
+        assert_eq!(hint(0, 2), "");
+        assert_eq!(hint(8, 2), "");
+    }
+
+    #[test]
+    fn sheepwars_keeps_the_legacy_min_hint_and_no_size() {
+        assert_eq!(queue_size_hint(GameKind::SheepWars, 2, 1), "");
+        assert_eq!(queue_min_hint(GameKind::SheepWars, 2), " §7(min §f2§7)");
+        assert_eq!(queue_min_hint(GameKind::TowerWars, 2), "");
     }
 }
