@@ -27,6 +27,43 @@ data:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- if and .Values.s3.enabled .Values.orchestrator.towerwars.map }}
+      initContainers:
+        - name: map-sync
+          image: {{ include "ferriscraft.image" (dict "global" .Values.global "repository" .Values.orchestrator.image.repository "tag" .Values.orchestrator.image.tag) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          securityContext:
+            runAsUser: 0
+          command: ["/usr/local/bin/ferriscraft-map-sync"]
+          env:
+            - name: MAP_DEST_DIR
+              value: "/data"
+            - name: TOWERWARS_MAP_NAME
+              value: {{ .Values.orchestrator.towerwars.map | quote }}
+            - name: S3_ENDPOINT
+              value: {{ .Values.s3.endpoint | quote }}
+            - name: S3_BUCKET
+              value: {{ .Values.s3.bucket | quote }}
+            - name: S3_PREFIX
+              value: {{ .Values.orchestrator.towerwars.mapPrefix | quote }}
+            - name: S3_REGION
+              value: {{ .Values.s3.region | quote }}
+            - name: S3_PATH_STYLE
+              value: {{ .Values.s3.pathStyle | quote }}
+            - name: S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ferriscraft.s3SecretName" . }}
+                  key: accessKeyId
+            - name: S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "ferriscraft.s3SecretName" . }}
+                  key: secretAccessKey
+          volumeMounts:
+            - name: world-data
+              mountPath: /data
+      {{- end }}
       containers:
         - name: rspigot
           image: {{ include "ferriscraft.image" (dict "global" .Values.global "repository" .Values.towerwars.rspigotImage.repository "tag" .Values.towerwars.rspigotImage.tag) }}
@@ -84,6 +121,12 @@ data:
               value: "true"
             - name: TOWERWARS_MODE
               value: {{ .Values.orchestrator.towerwars.mode | quote }}
+            {{- if and .Values.s3.enabled .Values.orchestrator.towerwars.map }}
+            - name: TOWERWARS_MAP_PATH
+              value: "/data/arena.json"
+            - name: TOWERWARS_WORLD_PREBUILT
+              value: "true"
+            {{- end }}
             {{- if (include "ferriscraft.orchestratorTokenSecretName" .) }}
             - name: ORCHESTRATOR_TOKEN
               valueFrom:
@@ -98,6 +141,10 @@ data:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+          volumeMounts:
+            - name: world-data
+              mountPath: /data
+              readOnly: true
         {{- end }}
       volumes:
         - name: forwarding-secret

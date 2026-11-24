@@ -201,6 +201,20 @@ helm upgrade --install ferriscraft ./deploy/charts/ferriscraft \
   --set orchestrator.towerwars.maxReplicas=4
 ```
 
+#### Carte TowerWars précuite sur S3 / RustFS
+
+Sans carte S3, chaque Pod TowerWars construit sa carte au démarrage (~22 s). Avec une carte précuite, le monde arrive déjà construit par l'`initContainer` `map-sync` et le serveur est prêt en moins d'une seconde.
+
+```bash
+./deploy/scripts/bake-towerwars-map.sh imperial
+S3_PREFIX=towerwars/ ./deploy/scripts/upload-map.sh imperial dist/towerwars-maps/imperial
+helm upgrade --install ferriscraft ./deploy/charts/ferriscraft \
+  --namespace ferriscraft -f ./deploy/charts/ferriscraft/values-k3d.yaml \
+  --set orchestrator.towerwars.map=imperial
+```
+
+Les cartes TowerWars vivent sous `orchestrator.towerwars.mapPrefix` (`towerwars/` par défaut), jamais sous `s3.prefix` : la rotation SheepWars les prendrait pour des arènes. Il faut refaire le bake à chaque changement de la carte ou du décor dans le code (`map/generate.rs`, `game/arena.rs`, `game/imperial.rs`).
+
 Voir [`docs/TOWERWARS_PLUGIN_CONTRACT.md`](./docs/TOWERWARS_PLUGIN_CONTRACT.md) pour le contrat du sidecar `ferriscraft-towerwars`, et [`docs/adr/0011-un-moteur-de-flotte-par-jeu.md`](./docs/adr/0011-un-moteur-de-flotte-par-jeu.md) pour l'architecture.
 
 Voir [`docs/SHEEPWARS_PLUGIN_CONTRACT.md`](./docs/SHEEPWARS_PLUGIN_CONTRACT.md) pour les variables d'environnement et le contrat du sidecar `ferriscraft-sheepwars`.

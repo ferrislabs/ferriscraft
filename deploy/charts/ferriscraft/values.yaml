@@ -84,8 +84,12 @@ orchestrator:
     # ignoré pour TowerWars (taille choisie au lobby)
     queueMinPlayers: 4
     mode: solo
-    # Vide : carte intégrée du plugin (monde vide généré au démarrage).
+    # Vide : carte intégrée du plugin (monde vide, construit au démarrage, ~22 s).
+    # Sinon (avec s3.enabled) : nom d'une map téléversée par deploy/scripts/bake-towerwars-map.sh,
+    # lue sous s3://<bucket>/<mapPrefix><map>/{world.zip,arena.json}. Le monde arrive déjà construit.
     map: ""
+    # Préfixe distinct de s3.prefix : la rotation SheepWars ne doit jamais voir ces maps.
+    mapPrefix: "towerwars/"
     idleTtlSecs: 180
     startingTimeoutSecs: 120
     emptyGraceSecs: 30

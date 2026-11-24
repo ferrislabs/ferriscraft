@@ -46,7 +46,10 @@ async fn sync_map() -> Result<(), Box<dyn std::error::Error>> {
     };
     let client = S3Client::new(s3_cfg)?;
 
-    let map_name = match non_empty_env("SHEEPWARS_MAP_NAME").or_else(|| non_empty_env("SHEEPWARS_MAP")) {
+    let requested = ["SHEEPWARS_MAP_NAME", "SHEEPWARS_MAP", "TOWERWARS_MAP_NAME"]
+        .into_iter()
+        .find_map(non_empty_env);
+    let map_name = match requested {
         Some(name) => name,
         None => {
             let maps = client.list_maps().await?;
@@ -118,7 +121,7 @@ async fn sync_map() -> Result<(), Box<dyn std::error::Error>> {
         arena_bytes,
         zip_bytes,
         dest = %dest_dir.display(),
-        "Map SheepWars synchronisée depuis S3"
+        "Map synchronisée depuis S3"
     );
     Ok(())
 }
@@ -167,7 +170,7 @@ async fn upload_map(
         bucket = %client.config().bucket,
         world_key = %world_key,
         arena_key = %arena_key,
-        "Map SheepWars téléversée sur S3"
+        "Map téléversée sur S3"
     );
     Ok(())
 }

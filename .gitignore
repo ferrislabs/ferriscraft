@@ -49,3 +49,6 @@
 /server-towerwars/spigot.yml
 /server-towerwars/world/
 /server-towerwars/world_rspigot_*/
+
+# Cartes TowerWars précuites (deploy/scripts/bake-towerwars-map.sh)
+/dist/
