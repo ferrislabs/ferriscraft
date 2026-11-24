@@ -169,15 +169,15 @@ impl FerrisCraftLobby {
     async fn refresh_single_player_ui(&self, player: &Player) {
         let claims = self.state.auth.claims_of(player.uuid);
         let prefs = self.state.prefs.get(player.uuid);
-        apply_lobby_hotbar(player, claims.as_ref(), &prefs);
-        self.state
-            .menus
-            .refresh_open_options(player.uuid, &prefs, claims.as_ref());
+        apply_lobby_hotbar(player, &prefs);
+        self.state.menus.refresh_open_options(player.uuid, &prefs);
         self.state.profiles.with(player.uuid, |profile| {
             self.state
                 .menus
                 .refresh_open_gadgets(player.uuid, &prefs, profile);
-            self.state.menus.refresh_open_progress(player.uuid, profile);
+            self.state
+                .menus
+                .refresh_open_progress(player.uuid, profile, claims.as_ref());
         });
 
         let (ping_ms, is_op) = match player.get_state().await {
@@ -279,10 +279,17 @@ impl FerrisCraftLobby {
                 lobby.refresh_single_player_ui(&player).await;
             }
             let profile = lobby.state.profiles.snapshot(player.uuid);
+            let claims = lobby.state.auth.claims_of(player.uuid);
             if let Err(err) = lobby
                 .state
                 .menus
-                .open_progress(&player.server(), &player, kind, profile.as_ref())
+                .open_progress(
+                    &player.server(),
+                    &player,
+                    kind,
+                    profile.as_ref(),
+                    claims.as_ref(),
+                )
                 .await
             {
                 tracing::debug!("Menu de progression non ouvert pour {}: {err}", player.name);
@@ -363,29 +370,35 @@ impl FerrisCraftLobby {
 
     fn handle_progress_click(&self, player: Player, kind: ProgressMenuKind, slot: i32) {
         match kind {
-            ProgressMenuKind::Profile => match decode_profile_click(slot) {
-                Some(ProfileMenuAction::OpenShop) => {
-                    player
-                        .sound
-                        .play(SoundCue::new(Sound::UiButtonClick).volume(0.7));
-                    self.open_progress_for(
+            ProgressMenuKind::Profile => {
+                let Some(action) = decode_profile_click(slot) else {
+                    return;
+                };
+                player
+                    .sound
+                    .play(SoundCue::new(Sound::UiButtonClick).volume(0.7));
+                match action {
+                    ProfileMenuAction::OpenSettings => self.open_settings_for(player),
+                    ProfileMenuAction::FerrisKey => self.ferriskey_action(player),
+                    ProfileMenuAction::OpenShop => self.open_progress_for(
                         player,
                         ProgressMenuKind::Shop(CosmeticSlot::LobbyGadget),
-                    );
+                    ),
+                    ProfileMenuAction::Close => player.inventory.close(),
                 }
-                Some(ProfileMenuAction::BackToGames) => self.back_to_games(player),
-                None => {}
-            },
+            }
             ProgressMenuKind::Shop(page) => match decode_shop_click(slot, page) {
                 Some(ShopMenuAction::Page(tab)) => {
                     player
                         .sound
                         .play(SoundCue::new(Sound::UiButtonClick).volume(0.7));
+                    let claims = self.state.auth.claims_of(player.uuid);
                     self.state.profiles.with(player.uuid, |profile| {
                         self.state.menus.show_progress_page(
                             player.uuid,
                             ProgressMenuKind::Shop(tab),
                             profile,
+                            claims.as_ref(),
                         );
                     });
                 }
@@ -395,17 +408,44 @@ impl FerrisCraftLobby {
                         .play(SoundCue::new(Sound::UiButtonClick).volume(0.7));
                     self.shop_item_click(player, cosmetic);
                 }
-                Some(ShopMenuAction::BackToGames) => self.back_to_games(player),
+                Some(ShopMenuAction::BackToCollectibles) => {
+                    player
+                        .sound
+                        .play(SoundCue::new(Sound::UiButtonClick).volume(0.7));
+                    self.open_gadgets_menu_for(player);
+                }
                 None => {}
             },
         }
     }
 
-    fn back_to_games(&self, player: Player) {
+    fn open_settings_for(&self, player: Player) {
         let lobby = self.clone();
         tokio::spawn(async move {
-            let _ = lobby.state.menus.open_games(&player).await;
+            let prefs = lobby.state.prefs.get(player.uuid);
+            let _ = lobby
+                .state
+                .menus
+                .open_options(&player.server(), &player, &prefs)
+                .await;
         });
+    }
+
+    fn ferriskey_action(&self, player: Player) {
+        player.inventory.close();
+        if self.state.auth.is_authenticated(player.uuid) {
+            let lobby = self.clone();
+            tokio::spawn(async move {
+                lobby.state.auth.logout(player.uuid).await;
+                player
+                    .message
+                    .send("§eVotre compte FerrisKey a été délié de cette session.");
+                lobby.refresh_single_player_ui(&player).await;
+                lobby.sync_progression(&player).await;
+            });
+        } else {
+            self.start_ferriskey_login(player);
+        }
     }
 
     fn start_ferriskey_login(&self, player: Player) {
@@ -892,12 +932,8 @@ impl FerrisCraftLobby {
                 }
             }
 
-            let claims = lobby.state.auth.claims_of(player.uuid);
-            apply_lobby_hotbar(&player, claims.as_ref(), &prefs);
-            lobby
-                .state
-                .menus
-                .refresh_open_options(player.uuid, &prefs, claims.as_ref());
+            apply_lobby_hotbar(&player, &prefs);
+            lobby.state.menus.refresh_open_options(player.uuid, &prefs);
 
             player.sound.play(
                 SoundCue::new(Sound::UiButtonClick)
@@ -918,15 +954,7 @@ impl FerrisCraftLobby {
             .prefs
             .update(player.uuid, |p| p.flight_enabled = !p.flight_enabled);
         updated.apply_movement(player);
-        let claims = self.state.auth.claims_of(player.uuid);
-        self.state
-            .menus
-            .refresh_open_options(player.uuid, &updated, claims.as_ref());
-        self.state.profiles.with(player.uuid, |profile| {
-            self.state
-                .menus
-                .refresh_open_gadgets(player.uuid, &updated, profile);
-        });
+        self.state.menus.refresh_open_options(player.uuid, &updated);
 
         if updated.flight_enabled {
             player.sound.play(
@@ -965,15 +993,7 @@ impl FerrisCraftLobby {
             .prefs
             .update(player.uuid, |p| p.speed_tier = p.speed_tier.next());
         updated.apply_movement(player);
-        let claims = self.state.auth.claims_of(player.uuid);
-        self.state
-            .menus
-            .refresh_open_options(player.uuid, &updated, claims.as_ref());
-        self.state.profiles.with(player.uuid, |profile| {
-            self.state
-                .menus
-                .refresh_open_gadgets(player.uuid, &updated, profile);
-        });
+        self.state.menus.refresh_open_options(player.uuid, &updated);
 
         player.sound.play(
             SoundCue::new(Sound::EntityExperienceOrbPickup)
@@ -1049,8 +1069,7 @@ impl FerrisCraftLobby {
             .state
             .prefs
             .update(player.uuid, |p| p.equipped_gadget = gadget);
-        let claims = self.state.auth.claims_of(player.uuid);
-        apply_lobby_hotbar(player, claims.as_ref(), &updated);
+        apply_lobby_hotbar(player, &updated);
         self.state.profiles.with(player.uuid, |profile| {
             self.state
                 .menus
@@ -1071,9 +1090,9 @@ impl FerrisCraftLobby {
             Some(g) => {
                 player
                     .action_bar
-                    .send(format!("{} §aéquipé ! §7(Slot 7 · Clic droit)", g.title()));
+                    .send(format!("{} §aéquipé ! §7(Slot 6 · Clic droit)", g.title()));
                 player.message.send(format!(
-                    "§b✦ Gadget équipé : {} §7— clic droit en main (slot 7) pour l'utiliser !",
+                    "§b✦ Gadget équipé : {} §7— clic droit en main (slot 6) pour l'utiliser !",
                     g.title()
                 ));
             }
@@ -1111,29 +1130,8 @@ impl FerrisCraftLobby {
                             "§6§lFerrisCraft §8» §e{game} §7arrive très prochainement sur le réseau !"
                         ));
                     }
-                    GamesMenuAction::OpenGadgets => self.open_gadgets_menu_for(player),
-                    GamesMenuAction::OpenProfile => {
-                        self.open_progress_for(player, ProgressMenuKind::Profile);
-                    }
-                    GamesMenuAction::OpenShop => {
-                        self.open_progress_for(
-                            player,
-                            ProgressMenuKind::Shop(CosmeticSlot::LobbyGadget),
-                        );
-                    }
                     GamesMenuAction::TeleportPoi(poi) => self.teleport_to_poi(player, poi),
-                    GamesMenuAction::OpenOptions => {
-                        let lobby = self.clone();
-                        tokio::spawn(async move {
-                            let claims = lobby.state.auth.claims_of(player.uuid);
-                            let cur = lobby.state.prefs.get(player.uuid);
-                            let _ = lobby
-                                .state
-                                .menus
-                                .open_options(&player.server(), &player, &cur, claims.as_ref())
-                                .await;
-                        });
-                    }
+                    GamesMenuAction::Close => player.inventory.close(),
                 }
             }
             return;
@@ -1157,39 +1155,15 @@ impl FerrisCraftLobby {
                             .state
                             .prefs
                             .update(player.uuid, |p| p.chat_sounds = !p.chat_sounds);
-                        let claims = self.state.auth.claims_of(player.uuid);
-                        self.state.menus.refresh_open_options(
-                            player.uuid,
-                            &updated,
-                            claims.as_ref(),
-                        );
+                        self.state.menus.refresh_open_options(player.uuid, &updated);
                         player.action_bar.send(if updated.chat_sounds {
                             "§a🔔 Sons & Mentions tchat activés"
                         } else {
                             "§7🔕 Sons & Mentions tchat coupés"
                         });
                     }
-                    OptionsMenuAction::FerrisKeyAction => {
-                        player.inventory.close();
-                        if self.state.auth.is_authenticated(player.uuid) {
-                            let lobby = self.clone();
-                            tokio::spawn(async move {
-                                lobby.state.auth.logout(player.uuid).await;
-                                player
-                                    .message
-                                    .send("§eVotre compte FerrisKey a été délié de cette session.");
-                                lobby.refresh_single_player_ui(&player).await;
-                                lobby.sync_progression(&player).await;
-                            });
-                        } else {
-                            self.start_ferriskey_login(player);
-                        }
-                    }
-                    OptionsMenuAction::BackToGames => {
-                        let lobby = self.clone();
-                        tokio::spawn(async move {
-                            let _ = lobby.state.menus.open_games(&player).await;
-                        });
+                    OptionsMenuAction::BackToProfile => {
+                        self.open_progress_for(player, ProgressMenuKind::Profile);
                     }
                 }
             }
@@ -1255,15 +1229,10 @@ impl FerrisCraftLobby {
                 GadgetsMenuAction::UnequipGadget => {
                     self.equip_gadget_for(&player, None);
                 }
-                GadgetsMenuAction::ToggleFlight => self.toggle_flight_for(&player),
                 GadgetsMenuAction::CycleTrail => self.cycle_trail_for(&player),
-                GadgetsMenuAction::CycleSpeed => self.cycle_speed_for(&player),
-                GadgetsMenuAction::BackToGames => {
-                    let lobby = self.clone();
-                    tokio::spawn(async move {
-                        let _ = lobby.state.menus.open_games(&player).await;
-                    });
-                }
+                GadgetsMenuAction::OpenShop => self
+                    .open_progress_for(player, ProgressMenuKind::Shop(CosmeticSlot::LobbyGadget)),
+                GadgetsMenuAction::Close => player.inventory.close(),
             }
         }
     }
@@ -1848,7 +1817,7 @@ impl FerrisCraftLobby {
         prefs.apply_movement(&player);
 
         let claims = lobby.state.auth.claims_of(player.uuid);
-        apply_lobby_hotbar(&player, claims.as_ref(), &prefs);
+        apply_lobby_hotbar(&player, &prefs);
 
         player.title.send(
             Title::new("§6§lFERRISCRAFT")
@@ -1995,17 +1964,11 @@ impl FerrisCraftLobby {
                     let _ = lobby.state.menus.open_games(&player).await;
                 });
             }
-            Material::WhiteWool if !prefs.build_mode => {
-                self.join_sheepwars(player);
-            }
-            Material::Crossbow if !prefs.build_mode => {
-                self.join_towerwars(player);
-            }
-            Material::AmethystShard if !prefs.build_mode => {
-                self.start_ferriskey_login(player);
-            }
-            Material::Emerald if !prefs.build_mode => {
-                self.show_whoami(&player);
+            Material::PlayerHead if !prefs.build_mode => {
+                player
+                    .sound
+                    .play(SoundCue::new(Sound::UiButtonClick).volume(0.7));
+                self.open_progress_for(player, ProgressMenuKind::Profile);
             }
             Material::Chest if !prefs.build_mode => {
                 player
@@ -2015,21 +1978,6 @@ impl FerrisCraftLobby {
             }
             Material::LimeDye | Material::GrayDye if !prefs.build_mode => {
                 self.toggle_visibility(player);
-            }
-            Material::Comparator if !prefs.build_mode => {
-                let lobby = self.clone();
-                tokio::spawn(async move {
-                    player
-                        .sound
-                        .play(SoundCue::new(Sound::UiButtonClick).volume(0.7));
-                    let claims = lobby.state.auth.claims_of(player.uuid);
-                    let cur_prefs = lobby.state.prefs.get(player.uuid);
-                    let _ = lobby
-                        .state
-                        .menus
-                        .open_options(&player.server(), &player, &cur_prefs, claims.as_ref())
-                        .await;
-                });
             }
             other if !prefs.build_mode => {
                 if let Some(gadget) = LobbyGadget::from_material(&other)
@@ -2576,12 +2524,11 @@ impl FerrisCraftLobby {
     #[command("options")]
     async fn cmd_options(&self, ctx: Context) {
         let player = ctx.sender.clone();
-        let claims = self.state.auth.claims_of(player.uuid);
         let prefs = self.state.prefs.get(player.uuid);
         if let Err(err) = self
             .state
             .menus
-            .open_options(&player.server(), &player, &prefs, claims.as_ref())
+            .open_options(&player.server(), &player, &prefs)
             .await
         {
             ctx.reply(format!("§cImpossible d'ouvrir vos options : {err}"));
@@ -2824,8 +2771,7 @@ impl FerrisCraftLobby {
         } else {
             player.game_mode.set(GameMode::Adventure);
             updated.apply_movement(player);
-            let claims = self.state.auth.claims_of(player.uuid);
-            apply_lobby_hotbar(player, claims.as_ref(), &updated);
+            apply_lobby_hotbar(player, &updated);
             ctx.reply("§e🛠 Mode construction du Lobby DÉSACTIVÉ.");
         }
     }

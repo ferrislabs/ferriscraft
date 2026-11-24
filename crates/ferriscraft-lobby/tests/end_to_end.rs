@@ -899,7 +899,7 @@ fn lobby_spawns_pedestals_living_npcs_rich_chat_and_per_player_ferriskey_capitai
     );
     let mut opt_screen = None;
     core.run_until("Alice opens Options menu", |_| {
-        opt_screen = alice.latest_screen_after(opt_cursor, "Options");
+        opt_screen = alice.latest_screen_after(opt_cursor, "Paramètres");
         opt_screen.is_some()
     });
     let (opt_win, opt_state) = opt_screen.unwrap();
@@ -955,7 +955,7 @@ fn lobby_spawns_pedestals_living_npcs_rich_chat_and_per_player_ferriskey_capitai
         alice.abilities_after(cmd_fly_cursor, |ab| !ab.may_fly)
     });
 
-    // 10. /gadgets menu -> cycle Trail (22), equip FireworkRocket (11, free offline), fire it, then FeatherDash (10)
+    // 10. /gadgets menu -> cycle Trail (21), equip FireworkRocket (11, free offline), fire it, then FeatherDash (10)
     let gad_cursor = alice.log_cursor();
     send_input(
         &mut core.server,
@@ -964,7 +964,7 @@ fn lobby_spawns_pedestals_living_npcs_rich_chat_and_per_player_ferriskey_capitai
     );
     let mut gad_screen = None;
     core.run_until("Alice opens Gadgets menu", |_| {
-        gad_screen = alice.latest_screen_after(gad_cursor, "Gadgets");
+        gad_screen = alice.latest_screen_after(gad_cursor, "Collectibles");
         gad_screen.is_some()
     });
     let (gad_win, gad_state) = gad_screen.unwrap();
@@ -975,7 +975,7 @@ fn lobby_spawns_pedestals_living_npcs_rich_chat_and_per_player_ferriskey_capitai
         PlayerInput::ContainerClick(ContainerClick {
             container: gad_win,
             state_id: gad_state,
-            slot: 22, // GAD_SLOT_TRAIL
+            slot: 21, // GAD_SLOT_TRAIL
             button: 0,
             input: ClickInput::Pickup,
             changed: Vec::new(),
@@ -1000,9 +1000,9 @@ fn lobby_spawns_pedestals_living_npcs_rich_chat_and_per_player_ferriskey_capitai
     });
     send_input(&mut core.server, &alice, PlayerInput::ContainerClose(gad_win));
 
-    // Activate FireworkRocket from slot 6 -> spawns a rocket entity & particles
+    // Activate FireworkRocket from slot 5 -> spawns a rocket entity & particles
     let sheep_cursor = alice.log_cursor();
-    send_input(&mut core.server, &alice, PlayerInput::HeldSlot(6));
+    send_input(&mut core.server, &alice, PlayerInput::HeldSlot(5));
     send_input(
         &mut core.server,
         &alice,
@@ -1025,7 +1025,7 @@ fn lobby_spawns_pedestals_living_npcs_rich_chat_and_per_player_ferriskey_capitai
     );
     let mut gad2_screen = None;
     core.run_until("Alice re-opens Gadgets menu", |_| {
-        gad2_screen = alice.latest_screen_after(gad2_cursor, "Gadgets");
+        gad2_screen = alice.latest_screen_after(gad2_cursor, "Collectibles");
         gad2_screen.is_some()
     });
     let (gad2_win, gad2_state) = gad2_screen.unwrap();
@@ -1048,7 +1048,7 @@ fn lobby_spawns_pedestals_living_npcs_rich_chat_and_per_player_ferriskey_capitai
     send_input(&mut core.server, &alice, PlayerInput::ContainerClose(gad2_win));
 
     let dash_cursor = alice.log_cursor();
-    send_input(&mut core.server, &alice, PlayerInput::HeldSlot(6));
+    send_input(&mut core.server, &alice, PlayerInput::HeldSlot(5));
     send_input(
         &mut core.server,
         &alice,
