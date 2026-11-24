@@ -160,6 +160,7 @@ impl FerrisCraftLobby {
             max_players,
             tps_1m,
             sheepwars_queued: self.queued_counts().sheepwars,
+            towerwars_queued: self.queued_counts().towerwars,
             agents_working,
             agents_total,
         }

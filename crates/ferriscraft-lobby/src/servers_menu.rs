@@ -1,4 +1,4 @@
-use ferriscraft_protocol::{ServerPhase, ServerSummary};
+use ferriscraft_protocol::{ServerKind, ServerPhase, ServerSummary};
 use rspigot_plugin::{CustomInventory, ItemStack, Material};
 
 pub const SERVERS_ROWS: u8 = 6;
@@ -36,6 +36,14 @@ pub fn format_age(secs: u64) -> String {
         format!("{}m {:02}s", secs / 60, secs % 60)
     } else {
         format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+pub const fn game_label(kind: ServerKind) -> &'static str {
+    match kind {
+        ServerKind::Lobby => "Lobby",
+        ServerKind::SheepWars => "SheepWars",
+        ServerKind::TowerWars => "TowerWars",
     }
 }
 
@@ -128,6 +136,7 @@ fn server_item(server: &ServerSummary) -> ItemStack {
         format!("§f{}", server.server_id)
     };
     let mut lore = vec![
+        format!("§7Jeu §f{}", game_label(server.kind)),
         format!("§7{label}"),
         format!("§7Joueurs §f{}/{}", server.player_count, server.max_players),
         format!(
@@ -272,6 +281,13 @@ mod tests {
             kind: Default::default(),
             draining: false,
         }
+    }
+
+    #[test]
+    fn each_game_server_names_its_game() {
+        assert_eq!(game_label(ServerKind::SheepWars), "SheepWars");
+        assert_eq!(game_label(ServerKind::TowerWars), "TowerWars");
+        assert_eq!(game_label(ServerKind::Lobby), "Lobby");
     }
 
     #[test]

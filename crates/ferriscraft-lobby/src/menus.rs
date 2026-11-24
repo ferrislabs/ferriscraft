@@ -373,10 +373,10 @@ pub fn populate_games_menu(inv: &CustomInventory, queued: QueueCounts) {
             ItemStack::new(Material::Crossbow, 1)
                 .name("§b§l🏹 TOWERWARS §8• §a§lOUVERT")
                 .lore([
-                    "§8Tower defense en duel".to_owned(),
+                    "§8Tower defense, de 1 à 4 joueurs".to_owned(),
                     String::new(),
-                    "§7Posez des tours d'archers, envoyez des vagues".to_owned(),
-                    "§7chez l'adversaire et protégez votre cœur !".to_owned(),
+                    "§7Bâtissez vos tours sur les remparts, envoyez".to_owned(),
+                    "§7des mobs chez vos adversaires et tenez bon !".to_owned(),
                     String::new(),
                     format!("§7En file / prêts : §b{}", queued.towerwars),
                     "§a▶ Cliquez pour rejoindre !".to_owned(),
